@@ -1,0 +1,12 @@
+data/
+data_test/
+*.exe~
+*.exe
+*.log
+.git
+.idea
+.vscode
+node_modules
+vendor
+bin
+*.test

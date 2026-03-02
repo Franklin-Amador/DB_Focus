@@ -1,0 +1,43 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.iml
+
+# Go artifacts
+/bin/
+/pkg/
+/vendor/
+*.exe
+*.exe~
+*.test
+*.out
+
+# Build / distribution
+build/
+dist/
+node_modules/
+target/
+
+# Runtime / local env
+.env
+.env.local
+.env.*.local
+*.log
+*.sqlite
+*.db
+data/
+data_test/
+
+# Docker / Compose
+docker-compose.override.yml
+docker-compose.*.yml
+
+# Misc
+.cache/
+tmp/
+*.swp
+
