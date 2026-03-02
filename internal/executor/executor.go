@@ -53,8 +53,15 @@ func (e *Executor) Execute(ctx context.Context, stmt ast.Statement) (*Result, er
 	// DDL statements
 	case *ast.CreateTable:
 		return e.executeCreateTable(ctx, s)
+	case *ast.DropTable:
+		return e.executeDropTable(ctx, s)
 	case *ast.CreateDatabase:
 		return e.executeCreateDatabase(ctx, s)
+
+	case *ast.CreateSchema:
+		return e.executeCreateSchema(ctx, s)
+	case *ast.DropSchema:
+		return e.executeDropSchema(ctx, s)
 
 	// DML statements
 	case *ast.Insert:
@@ -75,6 +82,8 @@ func (e *Executor) Execute(ctx context.Context, stmt ast.Statement) (*Result, er
 		return e.executeCreateProcedure(ctx, s)
 	case *ast.CallProcedure:
 		return e.executeCallProcedure(ctx, s)
+	case *ast.DropProcedure:
+		return e.executeDropProcedure(ctx, s)
 
 	// Trigger statements
 	case *ast.CreateTrigger:

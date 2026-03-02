@@ -16,9 +16,22 @@ import (
 // Backend is the interface for storage implementations
 type Backend interface {
 	SaveTable(table *catalog.Table) error
+	// SaveTableWithSchema persists a table under a specific schema name.
+	SaveTableWithSchema(table *catalog.Table, schema string) error
+	DeleteTable(name string, schema string) error
+	SaveProcedure(proc *catalog.Procedure) error
+	DeleteProcedure(name string) error
+	SaveTrigger(trigger *catalog.Trigger) error
+	DeleteTrigger(name string) error
+	SaveJob(job *catalog.Job) error
+	DeleteJob(name string) error
 	LoadTable(cat *catalog.Catalog, name string) error
 	LoadAll(cat *catalog.Catalog) error
 	Close() error
+	// CreateSchema creates a new schema namespace in persistent storage.
+	CreateSchema(name string) error
+	// DeleteSchema removes a schema and all its tables from persistent storage.
+	DeleteSchema(name string) error
 }
 
 type TableData struct {
@@ -287,5 +300,60 @@ func (s *Storage) LoadAll(cat *catalog.Catalog) error {
 		}
 	}
 
+	return nil
+}
+
+func (s *Storage) SaveTableWithSchema(table *catalog.Table, schema string) error {
+	return s.SaveTable(table)
+}
+
+func (s *Storage) DeleteTable(name string, schema string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := filepath.Join(s.dir, name+".json")
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (s *Storage) SaveProcedure(proc *catalog.Procedure) error {
+	// Legacy file storage backend does not persist procedures.
+	return nil
+}
+
+func (s *Storage) DeleteProcedure(name string) error {
+	// Legacy file storage backend does not persist procedures.
+	return nil
+}
+
+func (s *Storage) CreateSchema(name string) error {
+	// Legacy file storage backend does not persist schemas explicitly.
+	return nil
+}
+
+func (s *Storage) DeleteSchema(name string) error {
+	// Legacy file storage backend does not persist schemas explicitly.
+	return nil
+}
+
+func (s *Storage) SaveTrigger(trigger *catalog.Trigger) error {
+	// Legacy file storage backend does not persist triggers.
+	return nil
+}
+
+func (s *Storage) DeleteTrigger(name string) error {
+	// Legacy file storage backend does not persist triggers.
+	return nil
+}
+
+func (s *Storage) SaveJob(job *catalog.Job) error {
+	// Legacy file storage backend does not persist jobs.
+	return nil
+}
+
+func (s *Storage) DeleteJob(name string) error {
+	// Legacy file storage backend does not persist jobs.
 	return nil
 }

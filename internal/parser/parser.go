@@ -56,6 +56,14 @@ func (p *Parser) ParseStatement() (ast.Statement, error) {
 	case TokenSemicolon:
 		p.next()
 		return nil, nil
+	case TokenEnd:
+		// Ignore stray END tokens at top-level (can appear with some clients after dollar-quoted bodies)
+		p.next()
+		return nil, nil
+	case TokenDollarString:
+		// Ignore stray dollar-quoted blocks at top-level (client-side chunking can leave this token alone)
+		p.next()
+		return nil, nil
 	default:
 		return nil, p.errorf("unexpected token %s", p.cur.Type)
 	}
@@ -335,6 +343,36 @@ func (p *Parser) parseCreateProcedure() (ast.Statement, error) {
 		return nil, p.errorf("expected AS after parameters")
 	}
 
+	// Support two body styles:
+	// 1) Inline: AS BEGIN ... END
+	// 2) Dollar-quoted: AS $$ BEGIN ... END; $$
+	if p.cur.Type == TokenDollarString {
+		// Parse the quoted content with an inner parser
+		content := p.cur.Literal
+		inner := NewParser(content)
+
+		// Expect BEGIN inside the dollar-quoted content
+		if !inner.expect(TokenBegin) {
+			return nil, p.errorf("expected BEGIN inside dollar-quoted procedure body")
+		}
+		body, err := inner.parseStatementsBlock()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Body = append(stmt.Body, body...)
+		if inner.cur.Type == TokenEnd {
+			inner.next()
+			if inner.cur.Type == TokenSemicolon {
+				inner.next()
+			}
+		} else if inner.cur.Type != TokenEOF {
+			return nil, p.errorf("expected END inside dollar-quoted procedure body")
+		}
+		// consume the outer dollar string token
+		p.next()
+		return stmt, nil
+	}
+
 	if !p.expect(TokenBegin) {
 		return nil, p.errorf("expected BEGIN")
 	}
@@ -442,13 +480,35 @@ func (p *Parser) parseDrop() (ast.Statement, error) {
 		return p.parseDropTable()
 	case TokenSchema:
 		return p.parseDropSchema()
+	case TokenProcedure:
+		return p.parseDropProcedure()
 	case TokenTrigger:
 		return p.parseDropTrigger()
 	case TokenJob:
 		return p.parseDropJob()
 	default:
-		return nil, p.errorf("expected TABLE, SCHEMA, TRIGGER o JOB after DROP")
+		return nil, p.errorf("expected TABLE, SCHEMA, PROCEDURE, TRIGGER o JOB after DROP")
 	}
+}
+
+// DROP PROCEDURE procedure_name[()]
+func (p *Parser) parseDropProcedure() (ast.Statement, error) {
+	p.next()
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected procedure name")
+	}
+	procName := ast.Identifier{Name: p.cur.Literal}
+	p.next()
+
+	// Optional parentheses for PostgreSQL-like syntax: DROP PROCEDURE name()
+	if p.cur.Type == TokenLParen {
+		p.next()
+		if !p.expect(TokenRParen) {
+			return nil, p.errorf("expected ) after procedure name")
+		}
+	}
+
+	return &ast.DropProcedure{Name: procName}, nil
 }
 
 // DROP TABLE [schema.]table
@@ -872,17 +932,28 @@ func (p *Parser) parseDelete() (ast.Statement, error) {
 // parseQualifiedIdent parsea un identificador calificado: schema.tabla o solo tabla
 func (p *Parser) parseQualifiedIdent() ast.Identifier {
 	var schema, name string
-	if p.cur.Type == TokenIdent && p.peek.Type == TokenDot {
-		schema = p.cur.Literal
-		p.next() // ident
-		p.next() // dot
-		if p.cur.Type == TokenIdent {
+	if p.cur.Type == TokenIdent {
+		// Handle cases where lexer returned a dotted identifier as a single token (e.g. "schema.table")
+		if strings.Contains(p.cur.Literal, ".") {
+			parts := strings.SplitN(p.cur.Literal, ".", 2)
+			schema = parts[0]
+			name = parts[1]
+			p.next()
+			return ast.Identifier{Name: name, Alias: schema}
+		}
+
+		if p.peek.Type == TokenDot {
+			schema = p.cur.Literal
+			p.next() // ident
+			p.next() // dot
+			if p.cur.Type == TokenIdent {
+				name = p.cur.Literal
+				p.next()
+			}
+		} else {
 			name = p.cur.Literal
 			p.next()
 		}
-	} else if p.cur.Type == TokenIdent {
-		name = p.cur.Literal
-		p.next()
 	}
 	return ast.Identifier{Name: name, Alias: schema}
 }
@@ -916,10 +987,20 @@ func (p *Parser) parseCreateJob() (ast.Statement, error) {
 	}
 	p.next()
 
-	if p.cur.Type != TokenIdent {
+	// Parse unit (MINUTE, HOUR, DAY as tokens or identifier)
+	var unit string
+	switch p.cur.Type {
+	case TokenMinute:
+		unit = "MINUTE"
+	case TokenHour:
+		unit = "HOUR"
+	case TokenDay:
+		unit = "DAY"
+	case TokenIdent:
+		unit = strings.ToUpper(p.cur.Literal)
+	default:
 		return nil, p.errorf("expected unit name (MINUTE, HOUR, DAY)")
 	}
-	unit := strings.ToUpper(p.cur.Literal)
 	p.next()
 
 	enabled := false

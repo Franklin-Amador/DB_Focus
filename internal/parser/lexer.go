@@ -60,7 +60,14 @@ func (l *Lexer) NextToken() Token {
 		l.readChar()
 	case '=':
 		tok.Type = TokenEq
-		tok.Literal = "="
+	case '$':
+		// Support simple dollar-quoting using $$...$$ (no tag support yet)
+		if l.peekChar() == '$' {
+			tok.Type = TokenDollarString
+			tok.Literal = l.readDollarString()
+			return tok
+		}
+		tok.Type = TokenEOF
 		l.readChar()
 	case '\'':
 		tok.Type = TokenString
@@ -167,6 +174,30 @@ func (l *Lexer) readString() string {
 		l.readChar()
 	}
 	return s
+}
+
+// readDollarString reads a $$...$$ quoted string (no tag support).
+func (l *Lexer) readDollarString() string {
+	// consume the opening $$
+	l.readChar() // consume first $
+	l.readChar() // consume second $
+	start := l.pos
+	for {
+		if l.ch == 0 {
+			// unterminated
+			break
+		}
+		if l.ch == '$' && l.peekChar() == '$' {
+			// end found
+			end := l.pos
+			// consume closing $$
+			l.readChar()
+			l.readChar()
+			return l.input[start:end]
+		}
+		l.readChar()
+	}
+	return l.input[start:l.pos]
 }
 
 func isLetter(ch byte) bool {

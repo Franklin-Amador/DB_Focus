@@ -180,6 +180,12 @@ type CallProcedure struct {
 
 func (CallProcedure) stmtNode() {}
 
+type DropProcedure struct {
+	Name Identifier
+}
+
+func (DropProcedure) stmtNode() {}
+
 type CreateTrigger struct {
 	Name       Identifier
 	Timing     string // "BEFORE", "AFTER", "INSTEAD OF"

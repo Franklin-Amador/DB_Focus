@@ -28,6 +28,15 @@ func (e *Executor) executeCreateJob(ctx context.Context, stmt *ast.CreateJob) (*
 		return nil, fmt.Errorf("failed to create job %s: %w", stmt.Name.Name, err)
 	}
 
+	// Persist job to storage
+	if e.storage != nil {
+		if job, err := e.catalog.GetJob(stmt.Name.Name); err == nil {
+			if err := e.storage.SaveJob(job); err != nil {
+				fmt.Printf("warning: failed to persist job %s: %v\n", stmt.Name.Name, err)
+			}
+		}
+	}
+
 	return &Result{Tag: constants.ResultCreateJob}, nil
 }
 
@@ -40,6 +49,13 @@ func (e *Executor) executeDropJob(ctx context.Context, stmt *ast.DropJob) (*Resu
 
 	if err := e.catalog.DropJob(stmt.Name.Name); err != nil {
 		return nil, fmt.Errorf("failed to drop job %s: %w", stmt.Name.Name, err)
+	}
+
+	// Clean up from storage
+	if e.storage != nil {
+		if err := e.storage.DeleteJob(stmt.Name.Name); err != nil {
+			fmt.Printf("warning: failed to delete persisted job %s: %v\n", stmt.Name.Name, err)
+		}
 	}
 
 	return &Result{Tag: constants.ResultDropJob}, nil

@@ -100,6 +100,36 @@ func (c *Catalog) TableExists(name string, schemaOpt ...string) bool {
 	return exists
 }
 
+// CreateSchema creates a new schema namespace in the catalog.
+func (c *Catalog) CreateSchema(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if name == "" {
+		return fmt.Errorf("schema name cannot be empty")
+	}
+	if _, ok := c.tables[name]; ok {
+		return fmt.Errorf("schema %s already exists", name)
+	}
+	c.tables[name] = make(map[string]*Table)
+	return nil
+}
+
+// DropSchema removes a schema and all its tables from the catalog.
+func (c *Catalog) DropSchema(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if name == "" {
+		return fmt.Errorf("schema name cannot be empty")
+	}
+	if _, ok := c.tables[name]; !ok {
+		return fmt.Errorf("schema %s does not exist", name)
+	}
+	delete(c.tables, name)
+	return nil
+}
+
 func (c *Catalog) GetConstraint(constraintType, tableName, colName string, schemaOpt ...string) *Constraint {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -168,4 +198,27 @@ func (c *Catalog) CheckForeignKeyReferences(tableName, pkColName string, pkValue
 	}
 
 	return nil
+}
+
+// HasForeignKeyDependents checks whether any table has a FK referencing the target table.
+func (c *Catalog) HasForeignKeyDependents(schema, tableName string) (bool, string) {
+	allTables := c.GetAllTables()
+	targetQualified := schema + "." + tableName
+
+	for srcQualified, table := range allTables {
+		if srcQualified == targetQualified {
+			continue
+		}
+		for _, constraint := range table.Constraints {
+			if constraint.Type != constants.ConstraintForeignKey {
+				continue
+			}
+			ref := constraint.ReferencedTable
+			if ref == tableName || ref == targetQualified {
+				return true, srcQualified
+			}
+		}
+	}
+
+	return false, ""
 }

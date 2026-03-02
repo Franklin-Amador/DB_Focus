@@ -19,6 +19,15 @@ func (e *Executor) executeCreateProcedure(ctx context.Context, stmt *ast.CreateP
 		return nil, fmt.Errorf("failed to create procedure %s: %w", stmt.Name.Name, err)
 	}
 
+	if e.storage != nil {
+		proc, err := e.catalog.GetProcedure(stmt.Name.Name)
+		if err == nil {
+			if err := e.storage.SaveProcedure(proc); err != nil {
+				fmt.Printf("warning: failed to persist procedure %s: %v\n", stmt.Name.Name, err)
+			}
+		}
+	}
+
 	return &Result{Tag: constants.ResultCreateProcedure}, nil
 }
 
@@ -68,6 +77,25 @@ func (e *Executor) executeCallProcedure(ctx context.Context, stmt *ast.CallProce
 		return &Result{Tag: constants.ResultCall}, nil
 	}
 	return lastResult, nil
+}
+
+// executeDropProcedure removes a stored procedure from the catalog.
+func (e *Executor) executeDropProcedure(ctx context.Context, stmt *ast.DropProcedure) (*Result, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	if err := e.catalog.DropProcedure(stmt.Name.Name); err != nil {
+		return nil, fmt.Errorf("failed to drop procedure %s: %w", stmt.Name.Name, err)
+	}
+
+	if e.storage != nil {
+		if err := e.storage.DeleteProcedure(stmt.Name.Name); err != nil {
+			fmt.Printf("warning: failed to delete persisted procedure %s: %v\n", stmt.Name.Name, err)
+		}
+	}
+
+	return &Result{Tag: constants.ResultDropProcedure}, nil
 }
 
 // substituteParameters replaces parameter references in a statement with their actual values.

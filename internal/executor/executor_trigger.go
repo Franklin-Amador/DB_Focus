@@ -26,6 +26,16 @@ func (e *Executor) executeCreateTrigger(ctx context.Context, stmt *ast.CreateTri
 		return nil, fmt.Errorf("failed to create trigger %s: %w", stmt.Name.Name, err)
 	}
 
+	// Persist trigger to storage
+	if e.storage != nil {
+		// Get trigger from catalog to persist
+		if triggers := e.catalog.GetTriggers(stmt.Table.Name, stmt.Timing, stmt.Event); len(triggers) > 0 {
+			if err := e.storage.SaveTrigger(triggers[len(triggers)-1]); err != nil {
+				fmt.Printf("warning: failed to persist trigger %s: %v\n", stmt.Name.Name, err)
+			}
+		}
+	}
+
 	return &Result{Tag: constants.ResultCreateTrigger}, nil
 }
 
@@ -38,6 +48,13 @@ func (e *Executor) executeDropTrigger(ctx context.Context, stmt *ast.DropTrigger
 
 	if err := e.catalog.DropTrigger(stmt.Name.Name, stmt.Table.Name); err != nil {
 		return nil, fmt.Errorf("failed to drop trigger %s: %w", stmt.Name.Name, err)
+	}
+
+	// Clean up from storage
+	if e.storage != nil {
+		if err := e.storage.DeleteTrigger(stmt.Name.Name); err != nil {
+			fmt.Printf("warning: failed to delete persisted trigger %s: %v\n", stmt.Name.Name, err)
+		}
 	}
 
 	return &Result{Tag: constants.ResultDropTrigger}, nil

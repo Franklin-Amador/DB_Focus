@@ -119,3 +119,31 @@ func (c *Catalog) DropTrigger(name, table string) error {
 
 	return fmt.Errorf("trigger %s not found on table %s", name, table)
 }
+
+// LoadTrigger loads a persisted trigger into the catalog (used on restart).
+// Unlike CreateTrigger, this does not re-register in pg_catalog.
+func (c *Catalog) LoadTrigger(name, timing, event, table string, forEachRow bool, body []ast.Statement) error {
+c.mu.Lock()
+defer c.mu.Unlock()
+
+// Check if trigger already exists
+if triggers, exists := c.triggers[table]; exists {
+for _, t := range triggers {
+if t.Name == name {
+return nil // Already loaded
+}
+}
+}
+
+trigger := &Trigger{
+Name:       name,
+Timing:     timing,
+Event:      event,
+Table:      table,
+ForEachRow: forEachRow,
+Body:       body,
+}
+
+c.triggers[table] = append(c.triggers[table], trigger)
+return nil
+}

@@ -11,8 +11,14 @@ import (
 
 // executeInsert handles INSERT statements
 func (e *Executor) executeInsert(ctx context.Context, stmt *ast.Insert) (*Result, error) {
+	// Determine schema
+	schema := ""
+	if stmt.Table.Alias != "" {
+		schema = stmt.Table.Alias
+	}
+
 	// Get table
-	table, err := e.catalog.GetTable(stmt.Table.Name)
+	table, err := e.catalog.GetTable(stmt.Table.Name, schema)
 	if err != nil {
 		return nil, fmt.Errorf("table not found: %w", err)
 	}
@@ -31,7 +37,11 @@ func (e *Executor) executeInsert(ctx context.Context, stmt *ast.Insert) (*Result
 
 	// Execute BEFORE INSERT triggers
 	if e.triggersEnabled {
-		if err := e.executeTriggers(ctx, stmt.Table.Name, constants.TriggerBefore, constants.TriggerInsert, nil, nil); err != nil {
+		qual := stmt.Table.Name
+		if schema != "" {
+			qual = schema + "." + stmt.Table.Name
+		}
+		if err := e.executeTriggers(ctx, qual, constants.TriggerBefore, constants.TriggerInsert, nil, nil); err != nil {
 			return nil, fmt.Errorf("BEFORE INSERT trigger failed: %w", err)
 		}
 	}
@@ -87,14 +97,22 @@ func (e *Executor) executeInsert(ctx context.Context, stmt *ast.Insert) (*Result
 
 	// Persist to storage
 	if e.storage != nil {
-		if err := e.storage.SaveTable(table); err != nil {
-			fmt.Printf("warning: failed to persist table %s: %v\n", stmt.Table.Name, err)
+		schemaToUse := "public"
+		if schema != "" {
+			schemaToUse = schema
+		}
+		if err := e.storage.SaveTableWithSchema(table, schemaToUse); err != nil {
+			fmt.Printf("warning: failed to persist table %s.%s: %v\n", schemaToUse, stmt.Table.Name, err)
 		}
 	}
 
 	// Execute AFTER INSERT triggers
 	if e.triggersEnabled {
-		if err := e.executeTriggers(ctx, stmt.Table.Name, constants.TriggerAfter, constants.TriggerInsert, nil, values); err != nil {
+		qual := stmt.Table.Name
+		if schema != "" {
+			qual = schema + "." + stmt.Table.Name
+		}
+		if err := e.executeTriggers(ctx, qual, constants.TriggerAfter, constants.TriggerInsert, nil, values); err != nil {
 			return nil, fmt.Errorf("AFTER INSERT trigger failed: %w", err)
 		}
 	}
@@ -104,8 +122,14 @@ func (e *Executor) executeInsert(ctx context.Context, stmt *ast.Insert) (*Result
 
 // executeUpdate handles UPDATE statements
 func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result, error) {
+	// Determine schema
+	schema := ""
+	if stmt.Table.Alias != "" {
+		schema = stmt.Table.Alias
+	}
+
 	// Get table
-	table, err := e.catalog.GetTable(stmt.Table.Name)
+	table, err := e.catalog.GetTable(stmt.Table.Name, schema)
 	if err != nil {
 		return nil, fmt.Errorf("table not found: %w", err)
 	}
@@ -124,7 +148,11 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 
 	// Execute BEFORE UPDATE triggers
 	if e.triggersEnabled {
-		if err := e.executeTriggers(ctx, stmt.Table.Name, constants.TriggerBefore, constants.TriggerUpdate, nil, nil); err != nil {
+		qual := stmt.Table.Name
+		if schema != "" {
+			qual = schema + "." + stmt.Table.Name
+		}
+		if err := e.executeTriggers(ctx, qual, constants.TriggerBefore, constants.TriggerUpdate, nil, nil); err != nil {
 			return nil, fmt.Errorf("BEFORE UPDATE trigger failed: %w", err)
 		}
 	}
@@ -148,14 +176,22 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 
 	// Persist to storage
 	if e.storage != nil {
-		if err := e.storage.SaveTable(table); err != nil {
-			fmt.Printf("warning: failed to persist table %s: %v\n", stmt.Table.Name, err)
+		schemaToUse := "public"
+		if schema != "" {
+			schemaToUse = schema
+		}
+		if err := e.storage.SaveTableWithSchema(table, schemaToUse); err != nil {
+			fmt.Printf("warning: failed to persist table %s.%s: %v\n", schemaToUse, stmt.Table.Name, err)
 		}
 	}
 
 	// Execute AFTER UPDATE triggers
 	if e.triggersEnabled {
-		if err := e.executeTriggers(ctx, stmt.Table.Name, constants.TriggerAfter, constants.TriggerUpdate, nil, nil); err != nil {
+		qual := stmt.Table.Name
+		if schema != "" {
+			qual = schema + "." + stmt.Table.Name
+		}
+		if err := e.executeTriggers(ctx, qual, constants.TriggerAfter, constants.TriggerUpdate, nil, nil); err != nil {
 			return nil, fmt.Errorf("AFTER UPDATE trigger failed: %w", err)
 		}
 	}
@@ -165,8 +201,14 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 
 // executeDelete handles DELETE statements
 func (e *Executor) executeDelete(ctx context.Context, stmt *ast.Delete) (*Result, error) {
+	// Determine schema
+	schema := ""
+	if stmt.Table.Alias != "" {
+		schema = stmt.Table.Alias
+	}
+
 	// Get table
-	table, err := e.catalog.GetTable(stmt.Table.Name)
+	table, err := e.catalog.GetTable(stmt.Table.Name, schema)
 	if err != nil {
 		return nil, fmt.Errorf("table not found: %w", err)
 	}
@@ -185,7 +227,11 @@ func (e *Executor) executeDelete(ctx context.Context, stmt *ast.Delete) (*Result
 
 	// Execute BEFORE DELETE triggers
 	if e.triggersEnabled {
-		if err := e.executeTriggers(ctx, stmt.Table.Name, constants.TriggerBefore, constants.TriggerDelete, nil, nil); err != nil {
+		qual := stmt.Table.Name
+		if schema != "" {
+			qual = schema + "." + stmt.Table.Name
+		}
+		if err := e.executeTriggers(ctx, qual, constants.TriggerBefore, constants.TriggerDelete, nil, nil); err != nil {
 			return nil, fmt.Errorf("BEFORE DELETE trigger failed: %w", err)
 		}
 	}
@@ -201,14 +247,22 @@ func (e *Executor) executeDelete(ctx context.Context, stmt *ast.Delete) (*Result
 
 	// Persist to storage
 	if e.storage != nil {
-		if err := e.storage.SaveTable(table); err != nil {
-			fmt.Printf("warning: failed to persist table %s: %v\n", stmt.Table.Name, err)
+		schemaToUse := "public"
+		if schema != "" {
+			schemaToUse = schema
+		}
+		if err := e.storage.SaveTableWithSchema(table, schemaToUse); err != nil {
+			fmt.Printf("warning: failed to persist table %s.%s: %v\n", schemaToUse, stmt.Table.Name, err)
 		}
 	}
 
 	// Execute AFTER DELETE triggers
 	if e.triggersEnabled {
-		if err := e.executeTriggers(ctx, stmt.Table.Name, constants.TriggerAfter, constants.TriggerDelete, nil, nil); err != nil {
+		qual := stmt.Table.Name
+		if schema != "" {
+			qual = schema + "." + stmt.Table.Name
+		}
+		if err := e.executeTriggers(ctx, qual, constants.TriggerAfter, constants.TriggerDelete, nil, nil); err != nil {
 			return nil, fmt.Errorf("AFTER DELETE trigger failed: %w", err)
 		}
 	}

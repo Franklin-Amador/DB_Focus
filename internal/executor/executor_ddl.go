@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"dbf/internal/ast"
 	"dbf/internal/catalog"
@@ -87,20 +88,26 @@ func (e *Executor) executeCreateTable(ctx context.Context, stmt *ast.CreateTable
 		}
 	}
 
-	// Create table in catalog
-	if err := e.catalog.CreateTable(stmt.Table.Name, columns, constraints); err != nil {
+	// Determine schema (may be in Table.Alias)
+	schema := ""
+	if stmt.Table.Alias != "" {
+		schema = stmt.Table.Alias
+	}
+
+	// Create table in catalog (pass schema if provided)
+	if err := e.catalog.CreateTable(stmt.Table.Name, columns, constraints, schema); err != nil {
 		return nil, fmt.Errorf("failed to create table: %w", err)
 	}
 
 	// Persist to storage
-	table, err := e.catalog.GetTable(stmt.Table.Name)
+	table, err := e.catalog.GetTable(stmt.Table.Name, schema)
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve created table: %w", err)
 	}
 
 	if e.storage != nil {
-		if err := e.storage.SaveTable(table); err != nil {
-			fmt.Printf("warning: failed to persist table %s: %v\n", stmt.Table.Name, err)
+		if err := e.storage.SaveTableWithSchema(table, schema); err != nil {
+			fmt.Printf("warning: failed to persist table %s.%s: %v\n", schema, stmt.Table.Name, err)
 		}
 	}
 
@@ -194,4 +201,95 @@ func calculateNextDatabaseOID(table *catalog.Table) int {
 	}
 
 	return maxOID + 1
+}
+
+// executeCreateSchema handles CREATE SCHEMA statements
+func (e *Executor) executeCreateSchema(ctx context.Context, stmt *ast.CreateSchema) (*Result, error) {
+	schemaName := stmt.Name
+	if schemaName == "" {
+		return nil, fmt.Errorf("schema name cannot be empty")
+	}
+
+	// Check context cancellation
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	if err := e.catalog.CreateSchema(schemaName); err != nil {
+		return nil, fmt.Errorf("failed to create schema: %w", err)
+	}
+
+	// Persist schema metadata if storage supports it
+	if e.storage != nil {
+		if err := e.storage.CreateSchema(schemaName); err != nil {
+			// If schema already exists in persistent metadata, ignore the error
+			// but surface other errors as warnings.
+			// Detect duplicate schema error by message match
+			if !strings.Contains(err.Error(), "already exists") {
+				fmt.Printf("warning: failed to persist schema %s: %v\n", schemaName, err)
+			}
+		}
+	}
+
+	return &Result{Tag: constants.ResultCreateTable}, nil
+}
+
+// executeDropTable handles DROP TABLE statements with FK dependency checks.
+func (e *Executor) executeDropTable(ctx context.Context, stmt *ast.DropTable) (*Result, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	schema := stmt.Table.Alias
+	if schema == "" {
+		schema = "public"
+	}
+	tableName := stmt.Table.Name
+
+	if hasDeps, src := e.catalog.HasForeignKeyDependents(schema, tableName); hasDeps {
+		return nil, fmt.Errorf("cannot drop table %s.%s: referenced by foreign key in table %s", schema, tableName, src)
+	}
+
+	if err := e.catalog.DropTable(tableName, schema); err != nil {
+		return nil, fmt.Errorf("failed to drop table: %w", err)
+	}
+
+	if e.storage != nil {
+		if err := e.storage.DeleteTable(tableName, schema); err != nil {
+			fmt.Printf("warning: failed to delete persisted table %s.%s: %v\n", schema, tableName, err)
+		}
+	}
+
+	return &Result{Tag: constants.ResultDropTable}, nil
+}
+
+// executeDropSchema handles DROP SCHEMA statements
+func (e *Executor) executeDropSchema(ctx context.Context, stmt *ast.DropSchema) (*Result, error) {
+select {
+case <-ctx.Done():
+return nil, ctx.Err()
+default:
+}
+
+schemaName := stmt.Name
+if schemaName == "" {
+return nil, fmt.Errorf("schema name cannot be empty")
+}
+
+if err := e.catalog.DropSchema(schemaName); err != nil {
+return nil, fmt.Errorf("failed to drop schema: %w", err)
+}
+
+// Clean up persistent storage
+if e.storage != nil {
+if err := e.storage.DeleteSchema(schemaName); err != nil {
+fmt.Printf("warning: failed to delete persisted schema %s: %v\n", schemaName, err)
+}
+}
+
+return &Result{Tag: constants.ResultDropTable}, nil
 }

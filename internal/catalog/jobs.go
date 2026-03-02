@@ -115,3 +115,24 @@ func (c *Catalog) AlterJob(name, action string) error {
 
 	return nil
 }
+
+// LoadJob loads a persisted job into the catalog (used on restart).
+// Unlike CreateJob, this does not re-register in pg_catalog.
+func (c *Catalog) LoadJob(name string, interval int, unit string, body []ast.Statement, enabled bool) error {
+c.mu.Lock()
+defer c.mu.Unlock()
+
+if _, exists := c.jobs[name]; exists {
+return nil // Already loaded
+}
+
+c.jobs[name] = &Job{
+Name:     name,
+Interval: interval,
+Unit:     unit,
+Body:     body,
+Enabled:  enabled,
+LastRun:  0,
+}
+return nil
+}

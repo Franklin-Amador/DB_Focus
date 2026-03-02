@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"bytes"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 
+	"dbf/internal/ast"
 	"dbf/internal/catalog"
 )
 
@@ -21,6 +24,110 @@ type PebbleStorage struct {
 	mu   sync.RWMutex
 	wal  *pebble.WriteOptions
 	meta *TableMetadata
+}
+
+func (ps *PebbleStorage) SaveProcedure(proc *catalog.Procedure) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	pd := ProcedureData{
+		Name:       proc.Name,
+		Parameters: proc.Parameters,
+		Body:       proc.Body,
+	}
+	if err := enc.Encode(pd); err != nil {
+		return fmt.Errorf("failed to encode procedure %s: %w", proc.Name, err)
+	}
+
+	key := []byte("proc:" + proc.Name)
+	if err := ps.db.Set(key, buf.Bytes(), ps.wal); err != nil {
+		return fmt.Errorf("failed to save procedure %s: %w", proc.Name, err)
+	}
+	return nil
+}
+
+func (ps *PebbleStorage) DeleteProcedure(name string) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	key := []byte("proc:" + name)
+	if err := ps.db.Delete(key, ps.wal); err != nil && err != pebble.ErrNotFound {
+		return fmt.Errorf("failed to delete procedure %s: %w", name, err)
+	}
+	return nil
+}
+
+func (ps *PebbleStorage) SaveTrigger(trigger *catalog.Trigger) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	td := TriggerData{
+		Name:       trigger.Name,
+		Timing:     trigger.Timing,
+		Event:      trigger.Event,
+		Table:      trigger.Table,
+		ForEachRow: trigger.ForEachRow,
+		Body:       trigger.Body,
+	}
+	if err := enc.Encode(td); err != nil {
+		return fmt.Errorf("failed to encode trigger %s: %w", trigger.Name, err)
+	}
+
+	key := []byte("trig:" + trigger.Name)
+	if err := ps.db.Set(key, buf.Bytes(), ps.wal); err != nil {
+		return fmt.Errorf("failed to save trigger %s: %w", trigger.Name, err)
+	}
+	return nil
+}
+
+func (ps *PebbleStorage) DeleteTrigger(name string) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	key := []byte("trig:" + name)
+	if err := ps.db.Delete(key, ps.wal); err != nil && err != pebble.ErrNotFound {
+		return fmt.Errorf("failed to delete trigger %s: %w", name, err)
+	}
+	return nil
+}
+
+func (ps *PebbleStorage) SaveJob(job *catalog.Job) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	jd := JobData{
+		Name:     job.Name,
+		Interval: job.Interval,
+		Unit:     job.Unit,
+		Body:     job.Body,
+		Enabled:  job.Enabled,
+	}
+	if err := enc.Encode(jd); err != nil {
+		return fmt.Errorf("failed to encode job %s: %w", job.Name, err)
+	}
+
+	key := []byte("job:" + job.Name)
+	if err := ps.db.Set(key, buf.Bytes(), ps.wal); err != nil {
+		return fmt.Errorf("failed to save job %s: %w", job.Name, err)
+	}
+	return nil
+}
+
+func (ps *PebbleStorage) DeleteJob(name string) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	key := []byte("job:" + name)
+	if err := ps.db.Delete(key, ps.wal); err != nil && err != pebble.ErrNotFound {
+		return fmt.Errorf("failed to delete job %s: %w", name, err)
+	}
+	return nil
 }
 
 // TableMetadata stores schema information
@@ -34,8 +141,58 @@ type TableSchema struct {
 	Constraints []ConstraintData `json:"constraints"`
 }
 
+type ProcedureData struct {
+	Name       string
+	Parameters []ast.Parameter
+	Body       []ast.Statement
+}
+
+type TriggerData struct {
+	Name       string
+	Timing     string
+	Event      string
+	Table      string
+	ForEachRow bool
+	Body       []ast.Statement
+}
+
+type JobData struct {
+	Name     string
+	Interval int
+	Unit     string
+	Body     []ast.Statement
+	Enabled  bool
+}
+
+func registerGobTypes() {
+	gob.Register(&ast.Insert{})
+	gob.Register(&ast.Update{})
+	gob.Register(&ast.Delete{})
+	gob.Register(&ast.Select{})
+	gob.Register(&ast.SelectFunction{})
+	gob.Register(&ast.Set{})
+	gob.Register(&ast.CallProcedure{})
+	gob.Register(&ast.CreateTable{})
+	gob.Register(&ast.CreateSchema{})
+	gob.Register(&ast.CreateDatabase{})
+	gob.Register(&ast.DropTable{})
+	gob.Register(&ast.DropSchema{})
+	gob.Register(&ast.DropProcedure{})
+	gob.Register(&ast.CreateProcedure{})
+	gob.Register(&ast.CreateTrigger{})
+	gob.Register(&ast.DropTrigger{})
+	gob.Register(&ast.CreateJob{})
+	gob.Register(&ast.DropJob{})
+	gob.Register(&ast.AlterJob{})
+	gob.Register(&ast.PrimaryKeyConstraint{})
+	gob.Register(&ast.ForeignKeyConstraint{})
+	gob.Register(&ast.UniqueConstraint{})
+	gob.Register(&ast.NotNullConstraint{})
+}
+
 // NewPebbleStorage creates a new Pebble-backed storage engine
 func NewPebbleStorage(dir string) (*PebbleStorage, error) {
+	registerGobTypes()
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
@@ -64,6 +221,75 @@ func NewPebbleStorage(dir string) (*PebbleStorage, error) {
 // SaveTable persists a table to Pebble
 func (ps *PebbleStorage) SaveTable(table *catalog.Table) error {
 	return ps.saveTableWithSchema(table, "public")
+}
+
+// SaveTableWithSchema persists a table under the provided schema name.
+func (ps *PebbleStorage) SaveTableWithSchema(table *catalog.Table, schema string) error {
+	if schema == "" {
+		schema = "public"
+	}
+	return ps.saveTableWithSchema(table, schema)
+}
+
+// DeleteTable removes a table from persistent storage and metadata.
+func (ps *PebbleStorage) DeleteTable(name string, schema string) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if schema == "" {
+		schema = "public"
+	}
+
+	key := []byte("table:" + schema + ":" + name)
+	if err := ps.db.Delete(key, ps.wal); err != nil && err != pebble.ErrNotFound {
+		return fmt.Errorf("failed to delete table %s.%s: %w", schema, name, err)
+	}
+
+	if _, ok := ps.meta.Tables[schema]; ok {
+		delete(ps.meta.Tables[schema], name)
+	}
+	return ps.saveMetadata()
+}
+
+// CreateSchema persists an empty schema namespace into metadata.
+func (ps *PebbleStorage) CreateSchema(name string) error {
+	if name == "" {
+		return fmt.Errorf("schema name cannot be empty")
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if _, ok := ps.meta.Tables[name]; ok {
+		return fmt.Errorf("schema %s already exists", name)
+	}
+	ps.meta.Tables[name] = make(map[string]*TableSchema)
+	return ps.saveMetadata()
+}
+
+// DeleteSchema removes a schema and all its tables from persistent storage.
+func (ps *PebbleStorage) DeleteSchema(name string) error {
+	if name == "" {
+		return fmt.Errorf("schema name cannot be empty")
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if _, ok := ps.meta.Tables[name]; !ok {
+		return fmt.Errorf("schema %s does not exist", name)
+	}
+
+	// Delete all tables in this schema from Pebble
+	tablesInSchema := ps.meta.Tables[name]
+	for tableName := range tablesInSchema {
+		key := []byte("table:" + name + ":" + tableName)
+		if err := ps.db.Delete(key, ps.wal); err != nil && err != pebble.ErrNotFound {
+			return fmt.Errorf("failed to delete table %s.%s from pebble: %w", name, tableName, err)
+		}
+	}
+
+	// Remove schema from metadata
+	delete(ps.meta.Tables, name)
+	return ps.saveMetadata()
 }
 
 // saveTableWithSchema persists a table with explicit schema
@@ -177,6 +403,19 @@ func (ps *PebbleStorage) LoadAll(cat *catalog.Catalog) error {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
 
+	// Recreate persisted schemas first, including empty schemas (without tables)
+	for schema := range ps.meta.Tables {
+		if schema == "" || schema == "public" {
+			continue
+		}
+		if err := cat.CreateSchema(schema); err != nil {
+			// Ignore "already exists" and continue
+			if !strings.Contains(err.Error(), "already exists") {
+				log.Printf("[storage] warning: failed to recreate schema %s: %v", schema, err)
+			}
+		}
+	}
+
 	iter, err := ps.db.NewIter(&pebble.IterOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to create iterator: %w", err)
@@ -200,6 +439,39 @@ func (ps *PebbleStorage) LoadAll(cat *catalog.Catalog) error {
 			if err := ps.loadTableInternal(cat, tableName, schema); err != nil {
 				log.Printf("[storage] warning: failed to load table %s.%s: %v", schema, tableName, err)
 			}
+		} else if strings.HasPrefix(key, "proc:") {
+			val := append([]byte(nil), iter.Value()...)
+			var pd ProcedureData
+			dec := gob.NewDecoder(bytes.NewReader(val))
+			if err := dec.Decode(&pd); err != nil {
+				log.Printf("[storage] warning: failed to decode procedure %s: %v", strings.TrimPrefix(key, "proc:"), err)
+				continue
+			}
+			if err := cat.LoadProcedure(pd.Name, pd.Parameters, pd.Body); err != nil {
+				log.Printf("[storage] warning: failed to load procedure %s: %v", pd.Name, err)
+			}
+		} else if strings.HasPrefix(key, "trig:") {
+			val := append([]byte(nil), iter.Value()...)
+			var td TriggerData
+			dec := gob.NewDecoder(bytes.NewReader(val))
+			if err := dec.Decode(&td); err != nil {
+				log.Printf("[storage] warning: failed to decode trigger %s: %v", strings.TrimPrefix(key, "trig:"), err)
+				continue
+			}
+			if err := cat.LoadTrigger(td.Name, td.Timing, td.Event, td.Table, td.ForEachRow, td.Body); err != nil {
+				log.Printf("[storage] warning: failed to load trigger %s: %v", td.Name, err)
+			}
+		} else if strings.HasPrefix(key, "job:") {
+			val := append([]byte(nil), iter.Value()...)
+			var jd JobData
+			dec := gob.NewDecoder(bytes.NewReader(val))
+			if err := dec.Decode(&jd); err != nil {
+				log.Printf("[storage] warning: failed to decode job %s: %v", strings.TrimPrefix(key, "job:"), err)
+				continue
+			}
+			if err := cat.LoadJob(jd.Name, jd.Interval, jd.Unit, jd.Body, jd.Enabled); err != nil {
+				log.Printf("[storage] warning: failed to load job %s: %v", jd.Name, err)
+			}
 		}
 	}
 
@@ -215,6 +487,13 @@ func (ps *PebbleStorage) Close() error {
 		return ps.db.Close()
 	}
 	return nil
+}
+
+// Meta returns a copy of the current metadata (for inspection).
+func (ps *PebbleStorage) Meta() *TableMetadata {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return ps.meta
 }
 
 // Helper functions

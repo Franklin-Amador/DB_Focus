@@ -82,3 +82,34 @@ func (c *Catalog) GetProcedure(name string) (*Procedure, error) {
 
 	return procCopy, nil
 }
+
+// LoadProcedure inserts a procedure into memory without registering it again in pg_catalog.
+// This is intended for persistence reload paths.
+func (c *Catalog) LoadProcedure(name string, parameters []ast.Parameter, body []ast.Statement) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exists := c.procedures[name]; exists {
+		return nil
+	}
+
+	c.procedures[name] = &Procedure{
+		Name:       name,
+		Parameters: parameters,
+		Body:       body,
+	}
+
+	return nil
+}
+
+func (c *Catalog) DropProcedure(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exists := c.procedures[name]; !exists {
+		return fmt.Errorf("procedure %s not found", name)
+	}
+
+	delete(c.procedures, name)
+	return nil
+}
