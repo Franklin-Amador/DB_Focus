@@ -51,16 +51,8 @@ var bypassPatterns = []struct {
 			Tag:     "SELECT 1",
 		},
 	},
-	{
-		pattern: "pg_encoding_to_char",
-		result: BypassResult{
-			Columns: []string{"did", "datname", "datallowconn", "serverencoding", "cancreate", "datistemplate"},
-			Rows: [][]interface{}{
-				{1, "focusdb", true, "UTF8", true, false},
-			},
-			Tag: "SELECT 1",
-		},
-	},
+	// Removed: pg_encoding_to_char bypass was returning hardcoded data
+	// Let the catalog system handle pg_database queries properly
 	{
 		pattern: "pg_show_all_settings",
 		result: BypassResult{
@@ -155,5 +147,6 @@ func handleBypass(rw *bufio.ReadWriter, result *BypassResult) {
 		writeEmptyRowDescription(rw)
 	}
 	writeCommandComplete(rw, result.Tag)
-	writeReady(rw)
+	// NO writeReady() aquí - el cliente enviará Sync después
+	rw.Flush()
 }

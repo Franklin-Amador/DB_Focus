@@ -86,6 +86,12 @@ type DropSchema struct {
 
 func (DropSchema) stmtNode() {}
 
+type DropDatabase struct {
+	Name string
+}
+
+func (DropDatabase) stmtNode() {}
+
 type Insert struct {
 	Table   Identifier
 	Columns []Identifier

@@ -433,9 +433,9 @@ func (ps *PebbleStorage) LoadAll(cat *catalog.Catalog) error {
 			}
 			schema := parts[1]
 			tableName := parts[2]
-			if strings.HasPrefix(tableName, "pg_catalog.") {
-				continue
-			}
+
+			// Load ALL tables, including system catalog tables like pg_catalog.pg_database
+			// This ensures that user-created databases persist across restarts
 			if err := ps.loadTableInternal(cat, tableName, schema); err != nil {
 				log.Printf("[storage] warning: failed to load table %s.%s: %v", schema, tableName, err)
 			}

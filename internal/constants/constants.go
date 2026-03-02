@@ -68,6 +68,7 @@ const (
 	ResultCreateTable     = "CREATE TABLE"
 	ResultDropTable       = "DROP TABLE"
 	ResultCreateDatabase  = "CREATE DATABASE"
+	ResultDropDatabase    = "DROP DATABASE"
 	ResultCreateProcedure = "CREATE PROCEDURE"
 	ResultDropProcedure   = "DROP PROCEDURE"
 	ResultCreateTrigger   = "CREATE TRIGGER"

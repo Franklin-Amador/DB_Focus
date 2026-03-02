@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"log"
 	"strings"
 
 	"dbf/internal/ast"
@@ -480,6 +481,8 @@ func (p *Parser) parseDrop() (ast.Statement, error) {
 		return p.parseDropTable()
 	case TokenSchema:
 		return p.parseDropSchema()
+	case TokenDatabase:
+		return p.parseDropDatabase()
 	case TokenProcedure:
 		return p.parseDropProcedure()
 	case TokenTrigger:
@@ -487,7 +490,7 @@ func (p *Parser) parseDrop() (ast.Statement, error) {
 	case TokenJob:
 		return p.parseDropJob()
 	default:
-		return nil, p.errorf("expected TABLE, SCHEMA, PROCEDURE, TRIGGER o JOB after DROP")
+		return nil, p.errorf("expected TABLE, SCHEMA, DATABASE, PROCEDURE, TRIGGER o JOB after DROP")
 	}
 }
 
@@ -530,6 +533,17 @@ func (p *Parser) parseDropSchema() (ast.Statement, error) {
 	schema := p.cur.Literal
 	p.next()
 	return &ast.DropSchema{Name: schema}, nil
+}
+
+// DROP DATABASE database
+func (p *Parser) parseDropDatabase() (ast.Statement, error) {
+	p.next()
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected database name")
+	}
+	database := p.cur.Literal
+	p.next()
+	return &ast.DropDatabase{Name: database}, nil
 }
 
 // DROP TRIGGER trigger_name ON table_name
@@ -824,10 +838,36 @@ func (p *Parser) errorf(format string, args ...any) error {
 }
 
 func (p *Parser) parseSet() (ast.Statement, error) {
+	// SET variable_name = value
+	// or SET variable_name TO value
+	log.Printf("[parser] parseSet called, cur=%v", p.cur.Type)
+
+	// Move past SET keyword
 	p.next()
+
+	// Expect variable name (identifier)
+	if p.cur.Type != TokenIdent {
+		return nil, fmt.Errorf("SET: expected variable name, got %v", p.cur.Type)
+	}
+	varName := p.cur.Literal
+	log.Printf("[parser] parseSet variable: %s", varName)
+	p.next()
+
+	// Expect = or TO
+	if p.cur.Type != TokenEq && !strings.EqualFold(p.cur.Literal, "TO") {
+		return nil, fmt.Errorf("SET: expected = or TO, got %v (%s)", p.cur.Type, p.cur.Literal)
+	}
+	p.next()
+
+	// Consume value and anything until ; or EOF
+	// The value could be complex (e.g., "on", "off", "3", etc.)
+	// No limit - just consume until we hit statement boundary
 	for p.cur.Type != TokenSemicolon && p.cur.Type != TokenEOF {
+		log.Printf("[parser] parseSet consuming token: %v (%s)", p.cur.Type, p.cur.Literal)
 		p.next()
 	}
+
+	log.Printf("[parser] parseSet complete, now at: %v", p.cur.Type)
 	return &ast.Set{}, nil
 }
 

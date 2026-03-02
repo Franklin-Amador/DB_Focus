@@ -128,3 +128,23 @@ func (t *Table) SelectWhere(colName string, value interface{}) ([][]interface{},
 	}
 	return result, nil
 }
+
+// DeleteWhere deletes rows matching a column value
+func (t *Table) DeleteWhere(colName string, value interface{}) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	colIdx := columnIndex(t.Columns, colName)
+	if colIdx == -1 {
+		return fmt.Errorf("column %s not found", colName)
+	}
+
+	var newRows [][]interface{}
+	for _, row := range t.Rows {
+		if row[colIdx] != value {
+			newRows = append(newRows, row)
+		}
+	}
+	t.Rows = newRows
+	return nil
+}

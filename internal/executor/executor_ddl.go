@@ -170,6 +170,48 @@ func (e *Executor) executeCreateDatabase(ctx context.Context, stmt *ast.CreateDa
 	return &Result{Tag: constants.ResultCreateDatabase}, nil
 }
 
+// executeDropDatabase handles DROP DATABASE statements
+func (e *Executor) executeDropDatabase(ctx context.Context, stmt *ast.DropDatabase) (*Result, error) {
+	dbName := stmt.Name
+	if dbName == "" {
+		return nil, fmt.Errorf("database name cannot be empty")
+	}
+
+	// Check context cancellation
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Check if database exists
+	dbTable, err := e.catalog.GetTable(constants.CatalogDatabase)
+	if err != nil {
+		return nil, fmt.Errorf("failed to access catalog: %w", err)
+	}
+
+	rows, err := dbTable.SelectWhere("datname", dbName)
+	if err != nil || len(rows) == 0 {
+		return nil, fmt.Errorf("database %s does not exist", dbName)
+	}
+
+	// Delete the database entry
+	// Note: This is a simplistic delete that only removes from pg_database catalog
+	// A real implementation would handle cascading deletes, active connections, etc.
+	if err := dbTable.DeleteWhere("datname", dbName); err != nil {
+		return nil, fmt.Errorf("failed to delete database: %w", err)
+	}
+
+	// Persist to storage
+	if e.storage != nil {
+		if err := e.storage.SaveTable(dbTable); err != nil {
+			fmt.Printf("warning: failed to persist pg_database after DELETE: %v\n", err)
+		}
+	}
+
+	return &Result{Tag: constants.ResultDropDatabase}, nil
+}
+
 // calculateNextDatabaseOID calculates the next available OID for a database
 func calculateNextDatabaseOID(table *catalog.Table) int {
 	maxOID := 0
@@ -269,27 +311,27 @@ func (e *Executor) executeDropTable(ctx context.Context, stmt *ast.DropTable) (*
 
 // executeDropSchema handles DROP SCHEMA statements
 func (e *Executor) executeDropSchema(ctx context.Context, stmt *ast.DropSchema) (*Result, error) {
-select {
-case <-ctx.Done():
-return nil, ctx.Err()
-default:
-}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
 
-schemaName := stmt.Name
-if schemaName == "" {
-return nil, fmt.Errorf("schema name cannot be empty")
-}
+	schemaName := stmt.Name
+	if schemaName == "" {
+		return nil, fmt.Errorf("schema name cannot be empty")
+	}
 
-if err := e.catalog.DropSchema(schemaName); err != nil {
-return nil, fmt.Errorf("failed to drop schema: %w", err)
-}
+	if err := e.catalog.DropSchema(schemaName); err != nil {
+		return nil, fmt.Errorf("failed to drop schema: %w", err)
+	}
 
-// Clean up persistent storage
-if e.storage != nil {
-if err := e.storage.DeleteSchema(schemaName); err != nil {
-fmt.Printf("warning: failed to delete persisted schema %s: %v\n", schemaName, err)
-}
-}
+	// Clean up persistent storage
+	if e.storage != nil {
+		if err := e.storage.DeleteSchema(schemaName); err != nil {
+			fmt.Printf("warning: failed to delete persisted schema %s: %v\n", schemaName, err)
+		}
+	}
 
-return &Result{Tag: constants.ResultDropTable}, nil
+	return &Result{Tag: constants.ResultDropTable}, nil
 }

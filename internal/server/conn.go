@@ -36,8 +36,8 @@ func handleConn(conn net.Conn, handler QueryHandler, cat *catalog.Catalog) {
 		return
 	}
 
-	// Authenticate
-	user, err := authenticate(rw)
+	// Authenticate (and validate database)
+	user, err := authenticate(rw, cat)
 	if err != nil {
 		log.Printf("[conn] authentication failed: %v", err)
 		return
@@ -72,6 +72,8 @@ func handleConn(conn net.Conn, handler QueryHandler, cat *catalog.Catalog) {
 		case 'B':
 			log.Printf("[msg B] bind")
 			writeBindComplete(rw)
+			log.Printf("[msg B] sent BindComplete")
+			rw.Flush()
 		case 'D':
 			log.Printf("[msg D] describe")
 			handleDescribe(rw, lastPrepared)
@@ -84,6 +86,8 @@ func handleConn(conn net.Conn, handler QueryHandler, cat *catalog.Catalog) {
 				log.Printf("[msg S] writeReady error: %v", err)
 				return
 			}
+			log.Printf("[msg S] sent ReadyForQuery")
+			rw.Flush()
 		case 'H':
 			log.Printf("[msg H] flush")
 			rw.Flush()
@@ -112,6 +116,7 @@ func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat *catalog.
 	if strings.TrimSpace(query) == "" {
 		writeMessage(rw, 'I', nil)
 		writeReady(rw)
+		rw.Flush()
 		return nil
 	}
 
@@ -146,6 +151,7 @@ func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat *catalog.
 			log.Printf("[msg Q] handler error: %v", err)
 			writeError(rw, err.Error())
 			writeReady(rw)
+			rw.Flush()
 			return nil
 		}
 		if result == nil {
@@ -167,6 +173,7 @@ func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat *catalog.
 	}
 
 	writeReady(rw)
+	rw.Flush()
 	return nil
 }
 
@@ -201,6 +208,7 @@ func handleSelectOne(rw *bufio.ReadWriter) error {
 	writeDataRowSelectOne(rw)
 	writeCommandComplete(rw, "SELECT 1")
 	writeReady(rw)
+	rw.Flush()
 	return nil
 }
 
@@ -210,20 +218,26 @@ func handleParse(rw *bufio.ReadWriter, payload []byte, lastPrepared *string) err
 	if err != nil {
 		log.Printf("[msg P] error: %v", err)
 		writeError(rw, err.Error())
+		rw.Flush()
 		return nil
 	}
 	log.Printf("[msg P] prepared query: %q", query)
 	*lastPrepared = query
 	writeParseComplete(rw)
+	log.Printf("[msg P] sent ParseComplete")
+	rw.Flush()
 	return nil
 }
 
 func handleDescribe(rw *bufio.ReadWriter, lastPrepared string) {
 	if isSelectOne(lastPrepared) {
 		writeRowDescriptionSelectOne(rw)
+		log.Printf("[msg D] sent RowDescription")
 	} else {
 		writeNoData(rw)
+		log.Printf("[msg D] sent NoData")
 	}
+	rw.Flush()
 }
 
 func handleExecute(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared string) {
@@ -231,27 +245,36 @@ func handleExecute(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared stri
 
 	if lastPrepared == "" {
 		writeError(rw, "no prepared query")
-		writeReady(rw)
+		// NO writeReady() aquí - esperar Sync
+		rw.Flush()
 		return
 	}
 
+	log.Printf("[msg E] checking if SELECT 1...")
 	if isSelectOne(lastPrepared) {
 		writeDataRowSelectOne(rw)
 		writeCommandComplete(rw, "SELECT 1")
+		log.Printf("[msg E] sent CommandComplete: SELECT 1")
+		rw.Flush()
 		return
 	}
 
+	log.Printf("[msg E] checking bypass...")
 	if result := checkBypass(lastPrepared); result != nil {
 		log.Printf("[msg E] bypass query")
 		handleBypass(rw, result)
+		rw.Flush()
 		return
 	}
 
+	log.Printf("[msg E] calling handler.Handle()...")
 	result, err := handler.Handle(lastPrepared)
+	log.Printf("[msg E] handler.Handle() returned")
 	if err != nil {
 		log.Printf("[msg E] handler error: %v", err)
 		writeError(rw, err.Error())
 		writeReady(rw) // ← importante para resincronizar
+		rw.Flush()
 		return
 	}
 
@@ -263,8 +286,11 @@ func handleExecute(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared stri
 	// }
 	if result == nil {
 		writeCommandComplete(rw, "OK")
+		log.Printf("[msg E] sent CommandComplete: OK")
+		rw.Flush()
 		return
 	}
+	log.Printf("[msg E] result is not nil, tag=%q, cols=%d, rows=%d", result.Tag, len(result.Columns), len(result.Rows))
 	if len(result.Columns) > 0 {
 		var sample []interface{}
 		if len(result.Rows) > 0 {
@@ -278,10 +304,14 @@ func handleExecute(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared stri
 		// Hay filas pero no columnas — problema en el executor
 		log.Printf("[msg E] WARNING: rows without columns, skipping data")
 	}
+	log.Printf("[msg E] about to send CommandComplete with tag: %q", result.Tag)
 	writeCommandComplete(rw, result.Tag)
+	log.Printf("[msg E] sent CommandComplete: %s", result.Tag)
+	rw.Flush()
+	log.Printf("[msg E] flushed buffer")
 }
 
-func authenticate(rw *bufio.ReadWriter) (string, error) {
+func authenticate(rw *bufio.ReadWriter, cat *catalog.Catalog) (string, error) {
 	params, err := readStartup(rw)
 	if err != nil {
 		return "", err
@@ -303,6 +333,17 @@ func authenticate(rw *bufio.ReadWriter) (string, error) {
 		writeError(rw, "invalid password")
 		rw.Flush()
 		return "", errors.New("invalid password")
+	}
+
+	// Validate database if specified
+	if database, ok := params["database"]; ok && database != "" {
+		if !cat.DatabaseExists(database) {
+			log.Printf("[conn] database %q does not exist", database)
+			writeError(rw, "database \""+database+"\" does not exist")
+			rw.Flush()
+			return "", errors.New("database does not exist")
+		}
+		log.Printf("[conn] database %q validated", database)
 	}
 
 	if err := writeAuthOK(rw); err != nil {

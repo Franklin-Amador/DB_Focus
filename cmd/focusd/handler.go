@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 
 	"dbf/internal/catalog"
@@ -18,9 +19,12 @@ type executeHandler struct {
 }
 
 func (h executeHandler) Handle(query string) (*server.QueryResult, error) {
+	log.Printf("[handler] Handle called with query: %q", query)
+
 	// 1. Intercept system catalog queries (pg_catalog, information_schema, etc.)
 	//    These are handled before the parser to avoid complexity.
 	if result, ok := h.catalog.HandleSystemQuery(query); ok {
+		log.Printf("[handler] handled by system catalog")
 		return &server.QueryResult{
 			Columns: result.Columns,
 			Rows:    result.Rows,
@@ -30,24 +34,32 @@ func (h executeHandler) Handle(query string) (*server.QueryResult, error) {
 
 	// 2. Rewrite system functions to literals the parser can handle
 	query = rewriteSystemFunctions(query)
+	log.Printf("[handler] after rewrite: %q", query)
 
 	// 3. Parse and execute all statements
 	p := parser.NewParser(query)
 	var lastResult *server.QueryResult
 
 	for !p.AtEOF() {
+		log.Printf("[handler] parsing statement...")
 		stmt, err := p.ParseStatement()
 		if err != nil {
+			log.Printf("[handler] parse error: %v", err)
 			return nil, err
 		}
 		if stmt == nil {
+			log.Printf("[handler] got nil statement (bare semicolon)")
 			continue // bare semicolon
 		}
+		log.Printf("[handler] parsed statement type: %T", stmt)
 
+		log.Printf("[handler] executing statement...")
 		result, err := h.executor.Execute(context.Background(), stmt)
 		if err != nil {
+			log.Printf("[handler] execute error: %v", err)
 			return nil, err
 		}
+		log.Printf("[handler] execute success, tag=%q", result.Tag)
 		lastResult = &server.QueryResult{
 			Columns: result.Columns,
 			Rows:    result.Rows,
@@ -56,8 +68,10 @@ func (h executeHandler) Handle(query string) (*server.QueryResult, error) {
 	}
 
 	if lastResult == nil {
+		log.Printf("[handler] no result, returning EMPTY")
 		return &server.QueryResult{Tag: "EMPTY"}, nil
 	}
+	log.Printf("[handler] returning result with tag=%q", lastResult.Tag)
 	return lastResult, nil
 }
 

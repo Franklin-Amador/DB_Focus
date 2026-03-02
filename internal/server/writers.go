@@ -38,6 +38,7 @@ func writeSystemResult(rw *bufio.ReadWriter, result *catalog.SystemResult) {
 	}
 	writeCommandComplete(rw, result.Tag)
 	writeReady(rw)
+	rw.Flush()
 }
 
 func writeDataRowSelectOne(rw *bufio.ReadWriter) error {

@@ -60,6 +60,8 @@ func (l *Lexer) NextToken() Token {
 		l.readChar()
 	case '=':
 		tok.Type = TokenEq
+		tok.Literal = "="
+		l.readChar()
 	case '$':
 		// Support simple dollar-quoting using $$...$$ (no tag support yet)
 		if l.peekChar() == '$' {
@@ -67,8 +69,9 @@ func (l *Lexer) NextToken() Token {
 			tok.Literal = l.readDollarString()
 			return tok
 		}
-		tok.Type = TokenEOF
+		// Single $ is not valid - skip it and get next token
 		l.readChar()
+		return l.NextToken()
 	case '\'':
 		tok.Type = TokenString
 		tok.Literal = l.readString()
@@ -84,7 +87,9 @@ func (l *Lexer) NextToken() Token {
 			l.readChar()
 			return tok
 		}
-		tok.Type = TokenEOF
+		// Single : is not valid SQL operator - skip it
+		l.readChar()
+		return l.NextToken()
 	case '<':
 		if l.pos+1 < len(l.input) && l.input[l.pos+1] == '>' {
 			l.readChar()

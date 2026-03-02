@@ -222,3 +222,29 @@ func (c *Catalog) HasForeignKeyDependents(schema, tableName string) (bool, strin
 
 	return false, ""
 }
+
+// DatabaseExists checks if a database exists in pg_catalog.pg_database
+func (c *Catalog) DatabaseExists(name string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	// Get pg_database table
+	pgDatabase, exists := c.tables["pg_catalog"]["pg_database"]
+	if !exists {
+		return false
+	}
+
+	// Find column index for datname
+	for i, col := range pgDatabase.Columns {
+		if col.Name == "datname" {
+			// Check if any row has this database name
+			for _, row := range pgDatabase.Rows {
+				if row[i] == name {
+					return true
+				}
+			}
+			break
+		}
+	}
+	return false
+}
