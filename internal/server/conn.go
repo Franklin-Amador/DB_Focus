@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"strings"
@@ -59,7 +60,11 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Cat
 	// Authenticate (and validate database)
 	user, err := authenticate(rw, cat)
 	if err != nil {
-		log.Printf("[conn] authentication failed: %v", err)
+		// Hosted platforms often probe open ports and close immediately.
+		// Treat EOF-style auth failures as expected and keep logs clean.
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			log.Printf("[conn] authentication failed: %v", err)
+		}
 		return
 	}
 	log.Printf("[conn] authenticated as user: %s", user)
@@ -74,7 +79,9 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Cat
 	for {
 		msgType, payload, err := readMessage(rw)
 		if err != nil {
-			log.Printf("[conn] message read error: %v", err)
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+				log.Printf("[conn] message read error: %v", err)
+			}
 			return
 		}
 
