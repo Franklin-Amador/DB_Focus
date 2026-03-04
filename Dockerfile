@@ -46,5 +46,5 @@ ENV GOMEMLIMIT=80MiB
 # Minimal config:
 # max-conns=2: Only 2 concurrent connections
 # buf-size=256: Smallest buffers possible (~512 bytes total for buffers)
-ENTRYPOINT ["/usr/local/bin/focusd", "-max-conns", "2", "-buf-size", "256", "-data", "/data"]
+ENTRYPOINT ["/usr/local/bin/focusd", "-max-conns", "1", "-buf-size", "128", "-data", "/data"]
 CMD []
