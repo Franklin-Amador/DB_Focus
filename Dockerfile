@@ -29,10 +29,6 @@ RUN apk add --no-cache ca-certificates && \
 COPY --from=builder /out/focusd /usr/local/bin/focusd
 RUN chmod +x /usr/local/bin/focusd
 
-# Health check for Render deployment
-HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-  CMD /usr/local/bin/focusd -help > /dev/null 2>&1 || exit 1
-
 USER focusdb
 EXPOSE 4444
 VOLUME ["/data"]

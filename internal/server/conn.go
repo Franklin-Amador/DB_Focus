@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync"
 
 	"dbf/internal/catalog"
 )
@@ -26,7 +25,6 @@ func ListenAndServeWithConfig(addr string, handler QueryHandler, cat *catalog.Ca
 	defer ln.Close()
 
 	sem := make(chan struct{}, maxConns)
-	var wg sync.WaitGroup
 
 	log.Printf("[server] listening on %s with max %d concurrent connections (buffer size: %d bytes)", addr, maxConns, bufSize)
 
@@ -36,10 +34,9 @@ func ListenAndServeWithConfig(addr string, handler QueryHandler, cat *catalog.Ca
 			return err
 		}
 
-		wg.Add(1)
+		// Acquire before spawning goroutine to keep goroutine count bounded.
+		sem <- struct{}{}
 		go func(c net.Conn) {
-			defer wg.Done()
-			sem <- struct{}{}        // acquire semaphore
 			defer func() { <-sem }() // release semaphore
 			handleConnWithBufSize(c, handler, cat, bufSize)
 		}(conn)
@@ -48,7 +45,7 @@ func ListenAndServeWithConfig(addr string, handler QueryHandler, cat *catalog.Ca
 
 func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Catalog, bufSize int) {
 	defer conn.Close()
-	log.Printf("[conn] new connection from %s (buffer size: %d)", conn.RemoteAddr(), bufSize)
+	log.Printf("[conn] new connection from %s", conn.RemoteAddr())
 	rw := bufio.NewReadWriter(
 		bufio.NewReaderSize(conn, bufSize),
 		bufio.NewWriterSize(conn, bufSize),
@@ -80,7 +77,6 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Cat
 			log.Printf("[conn] message read error: %v", err)
 			return
 		}
-		log.Printf("[conn] received message type=%c payload_len=%d", msgType, len(payload))
 
 		switch msgType {
 		case 'Q':
@@ -93,30 +89,21 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Cat
 				log.Printf("[conn] parse error: %v", err)
 			}
 		case 'B':
-			log.Printf("[msg B] bind")
 			writeBindComplete(rw)
-			log.Printf("[msg B] sent BindComplete")
 			rw.Flush()
 		case 'D':
-			log.Printf("[msg D] describe")
 			handleDescribe(rw, lastPrepared)
 		case 'E':
-			log.Printf("[msg E] execute")
 			handleExecute(rw, handler, lastPrepared)
 		case 'S':
-			log.Printf("[msg S] sync")
 			if err := writeReady(rw); err != nil {
 				log.Printf("[msg S] writeReady error: %v", err)
 				return
 			}
-			log.Printf("[msg S] sent ReadyForQuery")
 			rw.Flush()
 		case 'H':
-			log.Printf("[msg H] flush")
 			rw.Flush()
 		case 'X':
-			log.Printf("[conn] close")
-			log.Printf("[conn] close requested")
 			return
 
 		default:
@@ -134,7 +121,6 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Cat
 
 func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat *catalog.Catalog, payload []byte) error {
 	query := strings.TrimRight(string(payload), "\x00")
-	log.Printf("[msg Q] query: %q", query)
 
 	if strings.TrimSpace(query) == "" {
 		writeMessage(rw, 'I', nil)
