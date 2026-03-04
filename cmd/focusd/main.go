@@ -17,6 +17,8 @@ import (
 func main() {
 	addr := flag.String("addr", ":4444", "listen address")
 	dataDir := flag.String("data", "./data", "data directory for persistence")
+	maxConns := flag.Int("max-conns", 20, "max concurrent connections (default: 20 for 512MB systems)")
+	bufSize := flag.Int("buf-size", 4096, "buffer size per connection in bytes (default: 4096)")
 	flag.Parse()
 
 	cat := catalog.New()
@@ -51,13 +53,14 @@ func main() {
 	}()
 
 	log.Printf("focus: starting on %s (data dir: %s) [pebble backend]", *addr, *dataDir)
+	log.Printf("focus: limits - max connections: %d, buffer size: %d bytes", *maxConns, *bufSize)
 
 	handler := executeHandler{
 		executor: exe,
 		catalog:  cat,
 	}
 
-	if err := server.ListenAndServe(*addr, handler, cat); err != nil {
+	if err := server.ListenAndServeWithConfig(*addr, handler, cat, *maxConns, *bufSize); err != nil {
 		log.Fatalf("focus: %v", err)
 	}
 }

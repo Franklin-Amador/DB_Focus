@@ -6,30 +6,53 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 
 	"dbf/internal/catalog"
 )
 
+// Default max connections to prevent OOM on limited memory systems
+const defaultMaxConnections = 20
+
 func ListenAndServe(addr string, handler QueryHandler, cat *catalog.Catalog) error {
+	return ListenAndServeWithConfig(addr, handler, cat, defaultMaxConnections, 4096)
+}
+
+func ListenAndServeWithConfig(addr string, handler QueryHandler, cat *catalog.Catalog, maxConns int, bufSize int) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
 
+	sem := make(chan struct{}, maxConns)
+	var wg sync.WaitGroup
+
+	log.Printf("[server] listening on %s with max %d concurrent connections (buffer size: %d bytes)", addr, maxConns, bufSize)
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return err
 		}
-		go handleConn(conn, handler, cat)
+
+		wg.Add(1)
+		go func(c net.Conn) {
+			defer wg.Done()
+			sem <- struct{}{}        // acquire semaphore
+			defer func() { <-sem }() // release semaphore
+			handleConnWithBufSize(c, handler, cat, bufSize)
+		}(conn)
 	}
 }
 
-func handleConn(conn net.Conn, handler QueryHandler, cat *catalog.Catalog) {
-	log.Printf("[conn] new connection from %s", conn.RemoteAddr())
+func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Catalog, bufSize int) {
 	defer conn.Close()
-	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+	log.Printf("[conn] new connection from %s (buffer size: %d)", conn.RemoteAddr(), bufSize)
+	rw := bufio.NewReadWriter(
+		bufio.NewReaderSize(conn, bufSize),
+		bufio.NewWriterSize(conn, bufSize),
+	)
 
 	if err := rw.Flush(); err != nil {
 		log.Printf("[conn] flush error: %v", err)
