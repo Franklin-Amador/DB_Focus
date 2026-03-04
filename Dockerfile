@@ -41,7 +41,7 @@ VOLUME ["/data"]
 # max-conns=15: reduce goroutines on small systems
 # buf-size=2048: smaller buffers reduce per-connection overhead
 ENV FOCUSDB_MAX_CONNS=15
-ENV FOCUSDB_BUF_SIZE=2048
+ENV FOCUSDB_BUF_SIZE=200
 
 ENTRYPOINT ["/usr/local/bin/focusd", "-max-conns", "15", "-buf-size", "2048", "-data", "/data"]
 CMD []
