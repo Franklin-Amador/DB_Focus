@@ -19,11 +19,12 @@ import (
 
 // PebbleStorage wraps Pebble DB for persistent table storage with WAL
 type PebbleStorage struct {
-	db   *pebble.DB
-	dir  string
-	mu   sync.RWMutex
-	wal  *pebble.WriteOptions
-	meta *TableMetadata
+	db    *pebble.DB
+	dir   string
+	mu    sync.RWMutex
+	wal   *pebble.WriteOptions
+	meta  *TableMetadata
+	cache *pebble.Cache
 }
 
 func (ps *PebbleStorage) SaveProcedure(proc *catalog.Procedure) error {
@@ -198,16 +199,30 @@ func NewPebbleStorage(dir string) (*PebbleStorage, error) {
 	}
 
 	dbPath := filepath.Join(dir, "pebble.db")
-	db, err := pebble.Open(dbPath, &pebble.Options{})
+
+	// Ultra-low memory configuration for 512MB systems
+	cache := pebble.NewCache(4 << 20) // 4MB cache (default is 8MB)
+	opts := &pebble.Options{
+		Cache:                       cache,
+		MemTableSize:                2 << 20, // 2MB memtable (down from 4MB)
+		MemTableStopWritesThreshold: 2,       // Only 2 memtables max
+		MaxOpenFiles:                100,     // Limit file handles
+		L0CompactionThreshold:       2,       // Faster compaction
+		L0StopWritesThreshold:       8,       // Allow more L0 files
+	}
+
+	db, err := pebble.Open(dbPath, opts)
 	if err != nil {
+		cache.Unref() // Clean up cache on error
 		return nil, fmt.Errorf("failed to open pebble database: %w", err)
 	}
 
 	ps := &PebbleStorage{
-		db:   db,
-		dir:  dir,
-		wal:  &pebble.WriteOptions{Sync: true}, // WAL sync enabled
-		meta: &TableMetadata{Tables: make(map[string]map[string]*TableSchema)},
+		db:    db,
+		dir:   dir,
+		wal:   &pebble.WriteOptions{Sync: true}, // WAL sync enabled
+		meta:  &TableMetadata{Tables: make(map[string]map[string]*TableSchema)},
+		cache: cache,
 	}
 
 	// Load existing metadata
@@ -478,15 +493,19 @@ func (ps *PebbleStorage) LoadAll(cat *catalog.Catalog) error {
 	return iter.Error()
 }
 
-// Close closes the Pebble database
+// Close closes the Pebble database and releases cache
 func (ps *PebbleStorage) Close() error {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
+	var err error
 	if ps.db != nil {
-		return ps.db.Close()
+		err = ps.db.Close()
 	}
-	return nil
+	if ps.cache != nil {
+		ps.cache.Unref()
+	}
+	return err
 }
 
 // Meta returns a copy of the current metadata (for inspection).

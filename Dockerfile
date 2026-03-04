@@ -37,11 +37,13 @@ USER focusdb
 EXPOSE 4444
 VOLUME ["/data"]
 
-# Start with optimized memory settings for 512MB limit
-# max-conns=15: reduce goroutines on small systems
-# buf-size=2048: smaller buffers reduce per-connection overhead
-ENV FOCUSDB_MAX_CONNS=15
-ENV FOCUSDB_BUF_SIZE=200
+# Aggressive memory limits for ultra-low footprint (~50-100MB target)
+# GOGC=20: GC runs more frequently to keep heap small
+# GOMEMLIMIT: Hard limit to prevent OOM
+ENV GOGC=20
+ENV GOMEMLIMIT=100MiB
 
-ENTRYPOINT ["/usr/local/bin/focusd", "-max-conns", "15", "-buf-size", "2048", "-data", "/data"]
+# max-conns=5: Only 5 concurrent connections (minimal goroutines)
+# buf-size=512: Tiny buffers (512 bytes per connection = ~2.5KB total for buffers)
+ENTRYPOINT ["/usr/local/bin/focusd", "-max-conns", "5", "-buf-size", "512", "-data", "/data"]
 CMD []
