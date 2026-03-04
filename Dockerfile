@@ -37,13 +37,14 @@ USER focusdb
 EXPOSE 4444
 VOLUME ["/data"]
 
-# Aggressive memory limits for ultra-low footprint (~50-100MB target)
-# GOGC=20: GC runs more frequently to keep heap small
-# GOMEMLIMIT: Hard limit to prevent OOM
-ENV GOGC=20
-ENV GOMEMLIMIT=100MiB
+# EXTREME memory limits for 512MB Render free plan
+# GOGC=50: Garbage collection after every 50% heap growth (vs 100% default)
+# GOMEMLIMIT=80MiB: Hard limit - stops accepting connections if exceeded
+ENV GOGC=50
+ENV GOMEMLIMIT=80MiB
 
-# max-conns=5: Only 5 concurrent connections (minimal goroutines)
-# buf-size=512: Tiny buffers (512 bytes per connection = ~2.5KB total for buffers)
-ENTRYPOINT ["/usr/local/bin/focusd", "-max-conns", "5", "-buf-size", "512", "-data", "/data"]
+# Minimal config:
+# max-conns=2: Only 2 concurrent connections
+# buf-size=256: Smallest buffers possible (~512 bytes total for buffers)
+ENTRYPOINT ["/usr/local/bin/focusd", "-max-conns", "2", "-buf-size", "256", "-data", "/data"]
 CMD []

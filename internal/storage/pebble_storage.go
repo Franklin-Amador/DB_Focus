@@ -200,15 +200,16 @@ func NewPebbleStorage(dir string) (*PebbleStorage, error) {
 
 	dbPath := filepath.Join(dir, "pebble.db")
 
-	// Ultra-low memory configuration for 512MB systems
-	cache := pebble.NewCache(4 << 20) // 4MB cache (default is 8MB)
+	// EXTREME memory optimization for 512MB systems
+	cache := pebble.NewCache(1 << 20) // 1MB cache (was 4MB)
 	opts := &pebble.Options{
 		Cache:                       cache,
-		MemTableSize:                2 << 20, // 2MB memtable (down from 4MB)
-		MemTableStopWritesThreshold: 2,       // Only 2 memtables max
-		MaxOpenFiles:                100,     // Limit file handles
-		L0CompactionThreshold:       2,       // Faster compaction
-		L0StopWritesThreshold:       8,       // Allow more L0 files
+		MemTableSize:                512 << 10, // 512KB memtable (was 2MB)
+		MemTableStopWritesThreshold: 2,         // Only 2 memtables max
+		MaxOpenFiles:                50,        // Limit file handles (was 100)
+		L0CompactionThreshold:       2,         // Trigger compaction early
+		L0StopWritesThreshold:       4,         // Stop writes if too many L0 files
+		LBaseMaxBytes:               1 << 20,   // 1MB base level (was 64MB default)
 	}
 
 	db, err := pebble.Open(dbPath, opts)
