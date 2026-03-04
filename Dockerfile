@@ -22,7 +22,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 # Final image: minimal runtime image
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates && \
-    adduser -D -H -s /sbin/nologin focusdb
+    adduser -D -H -s /sbin/nologin focusdb && \
+    mkdir -p /data && \
+    chown -R focusdb:focusdb /data
 
 COPY --from=builder /out/focusd /usr/local/bin/focusd
 RUN chmod +x /usr/local/bin/focusd
