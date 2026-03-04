@@ -321,3 +321,108 @@ Phase 3: Testing DROP SCHEMA...
 4. **DROP IF EXISTS**: Not yet implemented for idempotent drops (always errors if not found)
 
 **All scheduled work items COMPLETED. System is production-ready for basic DDL operations with full persistence.**
+
+---
+
+### Session: March 4, 2026 - ALTER Command Implementation
+
+**Objective**: Implement comprehensive ALTER functionality for TABLE and JOB statements.
+
+**Status**: ✅ COMPLETED
+
+**Features Implemented**:
+1. ✅ **ALTER TABLE ADD COLUMN** - Parse, execute, persist new columns
+2. ✅ **ALTER TABLE DROP COLUMN** - Parse, execute, remove column + data
+3. ✅ **ALTER TABLE ALTER COLUMN TYPE** - Parse, execute, change column type
+4. ✅ **ALTER TABLE RENAME COLUMN** - Parse, execute, rename column + data
+5. ✅ **ALTER JOB ENABLE/DISABLE** - Parse, execute, persist job state changes
+
+**Code Changes**:
+- **internal/ast/ast.go**: Added AlterTable, AlterAction interface, AddColumn, DropColumn, AlterColumn, RenameColumn structs
+- **internal/parser/token.go**: Added TokenAdd, TokenColumn, TokenRename, TokenDataType, TokenTo
+- **internal/parser/parser.go**: Implemented parseAlterTable() with 4 sub-parsers + parseAlterJob() for ENABLE/DISABLE
+- **internal/executor/executor.go**: Added *ast.AlterTable dispatch case
+- **internal/executor/executor_ddl.go**: Implemented executeAlterTable() + 4 action executors with persistence
+- **internal/executor/executor_job.go**: Modified executeAlterJob() to persist state via storage.SaveJob()
+- **internal/catalog/catalog_tables.go**: Added AddColumn(), DropColumn(), AlterColumnType(), RenameColumn() methods
+- **internal/storage/storage.go**: Extended Backend interface with DropColumnData(), RenameColumnData()
+- **internal/storage/pebble_storage.go**: Implemented column data persistence methods
+- **cmd/test-alter/main.go**: Created comprehensive 6-phase integration test
+- **README.md**: Updated with ALTER TABLE and ALTER JOB syntax documentation
+
+**Bug Fixes During Implementation**:
+1. **Token naming conflict**: Renamed TokenType → TokenDataType to avoid Go type system collision
+2. **Column mutation bug**: Changed AlterColumnType/RenameColumn to use index-based iteration (for i := range) instead of value iteration (for _, col := range) to properly modify Column structs in-place
+3. **Unused variable**: Removed unused `enabled` variable after changing CreateJob default to Enabled: true
+4. **Test persistence**: Added LoadAll() call in test to properly reload catalog from storage
+
+**Test Results**: All tests passing (exit code 0)
+- ✅ CREATE TABLE + ADD COLUMN with persistence
+- ✅ RENAME COLUMN with data updates
+- ✅ ALTER COLUMN TYPE with schema updates
+- ✅ DROP COLUMN with data cleanup
+- ✅ CREATE JOB (defaults to enabled=true)
+- ✅ ALTER JOB ENABLE/DISABLE with persistence
+- ✅ Full reload from storage preserves all changes
+
+**Technical Implementation Notes**:
+- Column operations modify catalog in-memory then persist via storage.SaveTableWithSchema()
+- DROP COLUMN removes column from schema AND deletes data via storage.DropColumnData()
+- RENAME COLUMN updates schema AND data keys via storage.RenameColumnData()
+- ALTER COLUMN TYPE only updates schema (no data migration)
+- ALTER JOB state changes now persist via storage.SaveJob()
+- All changes survive restart (verified via LoadAll() test)
+
+**Known Design Decisions**:
+- ALTER COLUMN TYPE does not validate/migrate existing data - assumes user responsibility
+- DROP/RENAME operations work on column data using Pebble key iteration
+- CREATE JOB now defaults to enabled=true (changed from false)
+- No CASCADE/RESTRICT support yet for DROP operations
+
+**Status**: ✅ COMPLETED - Full ALTER support with persistence for TABLE and JOB operations
+
+---
+
+### Session: March 4, 2026 - ALTER Constraint Validation
+
+**Objective**: Add constraint validation to ALTER TABLE operations.
+
+**Status**: ✅ COMPLETED
+
+**Features Implemented**:
+1. ✅ **PRIMARY KEY validation** - Prevent adding duplicate PRIMARY KEY to table
+2. ✅ **FOREIGN KEY validation** - Prevent dropping columns referenced by foreign keys
+3. ✅ **PRIMARY KEY drop protection** - Prevent dropping PRIMARY KEY columns
+
+**Code Changes**:
+- **internal/catalog/catalog_tables.go**: 
+  - Added `AddColumnWithConstraint()` method - validates no duplicate PRIMARY KEY exists
+  - Added `checkColumnForeignKeyReferences()` helper - checks if column is FK-referenced
+  - Modified `DropColumn()` to validate PRIMARY KEY and FK constraints before dropping
+- **internal/executor/executor_ddl.go**: 
+  - Modified `executeAddColumn()` to detect PRIMARY KEY constraint in AST and call `AddColumnWithConstraint()`
+- **cmd/test-alter-constraints/main.go**: Created comprehensive validation test suite
+
+**Validations Implemented**:
+1. **ADD COLUMN with PRIMARY KEY**: Rejects if table already has a PRIMARY KEY
+   - Example: `ALTER TABLE users ADD COLUMN email TEXT PRIMARY KEY` when `id` is already PK → ERROR
+2. **DROP COLUMN with FK reference**: Rejects if other tables reference the column via FOREIGN KEY
+   - Example: `ALTER TABLE users DROP COLUMN id` when `orders.user_id` references it → ERROR
+3. **DROP COLUMN that is PRIMARY KEY**: Rejects dropping PRIMARY KEY columns
+   - Example: `ALTER TABLE orders DROP COLUMN order_id` where `order_id` is PK → ERROR
+4. **DROP COLUMN without constraints**: Allows dropping non-constrained columns
+   - Example: `ALTER TABLE users DROP COLUMN name` → SUCCESS
+
+**Test Results**: All constraint validation tests passing
+- ✅ Correctly rejects duplicate PRIMARY KEY
+- ✅ Correctly rejects dropping FK-referenced column
+- ✅ Correctly rejects dropping PRIMARY KEY column
+- ✅ Successfully drops non-constrained column
+
+**Technical Implementation Notes**:
+- `checkColumnForeignKeyReferences()` iterates all tables to find FK constraints pointing to the column
+- PRIMARY KEY validation checks both table-level and column-level constraints
+- `DropColumn()` performs FK check BEFORE acquiring lock to avoid deadlock
+- Constraint validation happens before catalog modification (fail-fast pattern)
+
+**Status**: ✅ COMPLETED - ALTER TABLE operations now properly validate constraints

@@ -232,3 +232,46 @@ type AlterJob struct {
 }
 
 func (AlterJob) stmtNode() {}
+
+// AlterTable representa una sentencia ALTER TABLE
+type AlterTable struct {
+	Table  Identifier
+	Action AlterAction
+}
+
+func (AlterTable) stmtNode() {}
+
+// AlterAction es la interfaz para las acciones de ALTER TABLE
+type AlterAction interface {
+	alterActionNode()
+}
+
+// AddColumn representa ADD COLUMN
+type AddColumn struct {
+	Column ColumnDef
+}
+
+func (AddColumn) alterActionNode() {}
+
+// DropColumn representa DROP COLUMN
+type DropColumn struct {
+	ColumnName string
+}
+
+func (DropColumn) alterActionNode() {}
+
+// AlterColumn representa ALTER COLUMN (cambiar tipo)
+type AlterColumn struct {
+	ColumnName string
+	NewType    string
+}
+
+func (AlterColumn) alterActionNode() {}
+
+// RenameColumn representa RENAME COLUMN
+type RenameColumn struct {
+	OldName string
+	NewName string
+}
+
+func (RenameColumn) alterActionNode() {}

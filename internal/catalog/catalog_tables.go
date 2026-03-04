@@ -223,6 +223,238 @@ func (c *Catalog) HasForeignKeyDependents(schema, tableName string) (bool, strin
 	return false, ""
 }
 
+// checkColumnForeignKeyReferences verifies if a column is referenced by any foreign key
+func (c *Catalog) checkColumnForeignKeyReferences(tableName, columnName, schema string) error {
+	allTables := c.GetAllTables()
+	targetQualified := schema + "." + tableName
+
+	// Check if any other table has a FK pointing to this column
+	for srcQualified, table := range allTables {
+		if srcQualified == targetQualified {
+			continue
+		}
+		for _, constraint := range table.Constraints {
+			if constraint.Type == constants.ConstraintForeignKey {
+				ref := constraint.ReferencedTable
+				refCol := constraint.ReferencedCol
+
+				// Check if this FK references the column we're trying to drop
+				if (ref == tableName || ref == targetQualified) && refCol == columnName {
+					return fmt.Errorf("cannot drop column %s: it is referenced by foreign key in table %s column %s",
+						columnName, srcQualified, constraint.ColumnName)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// AddColumn adds a new column to an existing table
+func (c *Catalog) AddColumn(tableName string, column *Column, schemaOpt ...string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	schema := "public"
+	if len(schemaOpt) > 0 && schemaOpt[0] != "" {
+		schema = schemaOpt[0]
+	}
+
+	table, err := c.getTableUnlocked(tableName, schema)
+	if err != nil {
+		return err
+	}
+
+	// Check if column already exists
+	for _, col := range table.Columns {
+		if col.Name == column.Name {
+			return fmt.Errorf("column %s already exists in table %s.%s", column.Name, schema, tableName)
+		}
+	}
+
+	table.Columns = append(table.Columns, *column)
+	return nil
+}
+
+// AddColumnWithConstraint adds a column and its constraint to a table
+func (c *Catalog) AddColumnWithConstraint(tableName string, column *Column, constraint *Constraint, schemaOpt ...string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	schema := "public"
+	if len(schemaOpt) > 0 && schemaOpt[0] != "" {
+		schema = schemaOpt[0]
+	}
+
+	table, err := c.getTableUnlocked(tableName, schema)
+	if err != nil {
+		return err
+	}
+
+	// Check if column already exists
+	for _, col := range table.Columns {
+		if col.Name == column.Name {
+			return fmt.Errorf("column %s already exists in table %s.%s", column.Name, schema, tableName)
+		}
+	}
+
+	// If adding PRIMARY KEY, check if one already exists
+	if constraint != nil && constraint.Type == constants.ConstraintPrimaryKey {
+		for _, existingConstraint := range table.Constraints {
+			if existingConstraint.Type == constants.ConstraintPrimaryKey {
+				return fmt.Errorf("table %s.%s already has a primary key on column %s", schema, tableName, existingConstraint.ColumnName)
+			}
+		}
+	}
+
+	table.Columns = append(table.Columns, *column)
+	if constraint != nil {
+		table.Constraints = append(table.Constraints, *constraint)
+	}
+	return nil
+}
+
+// DropColumn removes a column from an existing table
+func (c *Catalog) DropColumn(tableName string, columnName string, schemaOpt ...string) error {
+	schema := "public"
+	if len(schemaOpt) > 0 && schemaOpt[0] != "" {
+		schema = schemaOpt[0]
+	}
+
+	// Check constraints BEFORE acquiring lock to avoid deadlock
+	// Check if column is referenced by any foreign key
+	if err := c.checkColumnForeignKeyReferences(tableName, columnName, schema); err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	table, err := c.getTableUnlocked(tableName, schema)
+	if err != nil {
+		return err
+	}
+
+	// Check if column is a primary key
+	for _, constraint := range table.Constraints {
+		if constraint.Type == constants.ConstraintPrimaryKey && constraint.ColumnName == columnName {
+			return fmt.Errorf("cannot drop column %s: it is a primary key", columnName)
+		}
+	}
+
+	// Find and remove column
+	found := false
+	newColumns := make([]Column, 0, len(table.Columns))
+	for _, col := range table.Columns {
+		if col.Name == columnName {
+			found = true
+		} else {
+			newColumns = append(newColumns, col)
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("column %s does not exist in table %s.%s", columnName, schema, tableName)
+	}
+
+	table.Columns = newColumns
+
+	// Also remove the column data from all rows
+	table.Mu().Lock()
+	defer table.Mu().Unlock()
+
+	// Find column index to remove
+	colIdx := -1
+	for i, col := range table.Columns {
+		if col.Name == columnName {
+			colIdx = i
+			break
+		}
+	}
+
+	// Remove column from each row if found
+	if colIdx >= 0 && colIdx < len(table.Columns) {
+		for i := range table.Rows {
+			if colIdx < len(table.Rows[i]) {
+				table.Rows[i] = append(table.Rows[i][:colIdx], table.Rows[i][colIdx+1:]...)
+			}
+		}
+	}
+
+	return nil
+}
+
+// AlterColumnType changes the type of an existing column
+func (c *Catalog) AlterColumnType(tableName string, columnName string, newType string, schemaOpt ...string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	schema := "public"
+	if len(schemaOpt) > 0 && schemaOpt[0] != "" {
+		schema = schemaOpt[0]
+	}
+
+	table, err := c.getTableUnlocked(tableName, schema)
+	if err != nil {
+		return err
+	}
+
+	// Find and update column type
+	found := false
+	for i := range table.Columns {
+		if table.Columns[i].Name == columnName {
+			table.Columns[i].Type = newType
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("column %s does not exist in table %s.%s", columnName, schema, tableName)
+	}
+
+	return nil
+}
+
+// RenameColumn renames a column in an existing table
+func (c *Catalog) RenameColumn(tableName string, oldName string, newName string, schemaOpt ...string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	schema := "public"
+	if len(schemaOpt) > 0 && schemaOpt[0] != "" {
+		schema = schemaOpt[0]
+	}
+
+	table, err := c.getTableUnlocked(tableName, schema)
+	if err != nil {
+		return err
+	}
+
+	// Check if new name already exists
+	for _, col := range table.Columns {
+		if col.Name == newName {
+			return fmt.Errorf("column %s already exists in table %s.%s", newName, schema, tableName)
+		}
+	}
+
+	// Find and rename column
+	found := false
+	for i := range table.Columns {
+		if table.Columns[i].Name == oldName {
+			table.Columns[i].Name = newName
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("column %s does not exist in table %s.%s", oldName, schema, tableName)
+	}
+
+	return nil
+}
+
 // DatabaseExists checks if a database exists in pg_catalog.pg_database
 func (c *Catalog) DatabaseExists(name string) bool {
 	c.mu.RLock()

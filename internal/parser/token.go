@@ -101,6 +101,11 @@ const (
 	TokenUnit       TokenType = "UNIT"
 	TokenEnabled    TokenType = "ENABLED"
 	TokenInterval   TokenType = "INTERVAL"
+	TokenAdd        TokenType = "ADD"
+	TokenColumn     TokenType = "COLUMN"
+	TokenRename     TokenType = "RENAME"
+	TokenDataType   TokenType = "TYPE"
+	TokenTo         TokenType = "TO"
 )
 
 type Token struct {
@@ -191,4 +196,9 @@ var keywords = map[string]TokenType{
 	"UNIT":       TokenUnit,
 	"ENABLED":    TokenEnabled,
 	"INTERVAL":   TokenInterval,
+	"ADD":        TokenAdd,
+	"COLUMN":     TokenColumn,
+	"RENAME":     TokenRename,
+	"TYPE":       TokenDataType,
+	"TO":         TokenTo,
 }

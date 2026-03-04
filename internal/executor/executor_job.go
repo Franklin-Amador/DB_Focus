@@ -61,15 +61,29 @@ func (e *Executor) executeDropJob(ctx context.Context, stmt *ast.DropJob) (*Resu
 	return &Result{Tag: constants.ResultDropJob}, nil
 }
 
-// executeAlterJob modifies a scheduled job (enable/disable).
+// executeAlterJob modifies a scheduled job (enable/disable) and persists the change.
 func (e *Executor) executeAlterJob(ctx context.Context, stmt *ast.AlterJob) (*Result, error) {
 	// Check context cancellation
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
 
+	// Modify job state in catalog
 	if err := e.catalog.AlterJob(stmt.Name.Name, stmt.Action); err != nil {
 		return nil, fmt.Errorf("failed to alter job %s: %w", stmt.Name.Name, err)
+	}
+
+	// Get updated job to persist
+	job, err := e.catalog.GetJob(stmt.Name.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get updated job: %w", err)
+	}
+
+	// Persist change to storage
+	if e.storage != nil {
+		if err := e.storage.SaveJob(job); err != nil {
+			return nil, fmt.Errorf("failed to persist job state: %w", err)
+		}
 	}
 
 	action := strings.ToLower(stmt.Action)

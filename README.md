@@ -53,6 +53,10 @@ postgresql://postgres:4444@localhost:4444/postgres
 - `DROP TRIGGER` nombre ON tabla
 - `DROP JOB` nombre
 - `ALTER JOB` nombre [ENABLE|DISABLE]
+- `ALTER TABLE` tabla ADD COLUMN columna tipo [IDENTITY] [PRIMARY KEY]
+- `ALTER TABLE` tabla DROP COLUMN columna
+- `ALTER TABLE` tabla ALTER COLUMN columna TYPE nuevo_tipo
+- `ALTER TABLE` tabla RENAME COLUMN nombre_viejo TO nombre_nuevo
 - `INSERT INTO` tabla [(columna, ...)] VALUES (literal, ...)
 - `UPDATE` tabla SET columna = valor [WHERE columna = literal]
 - `DELETE FROM` tabla [WHERE columna = literal]
@@ -63,6 +67,13 @@ postgresql://postgres:4444@localhost:4444/postgres
 - Los triggers se ejecutan automáticamente en respuesta a eventos INSERT, UPDATE o DELETE.
 - Los triggers no se ejecutan recursivamente para evitar loops infinitos.
 - Los jobs (trabajos) se ejecutan automáticamente en intervalos programados (cada N minutos/horas/días).
+- `ALTER JOB` permite habilitar/deshabilitar jobs sin eliminarlos. Los cambios persisten entre reinicios.
+- `ALTER TABLE` permite modificar la estructura de tablas existentes: agregar/eliminar columnas, cambiar tipos, renombrar columnas.
+- **Validación de constraints en ALTER TABLE**:
+  - No permite agregar una segunda PRIMARY KEY si la tabla ya tiene una
+  - No permite eliminar columnas referenciadas por FOREIGN KEY de otras tablas
+  - No permite eliminar columnas que son PRIMARY KEY
+- Todos los cambios de schema (ALTER TABLE, ALTER JOB) persisten automáticamente en disco.
 - `ORDER BY` permite ordenar resultados por una o más columnas (ASC ascendente, DESC descendente).
 - `LIMIT` restringe el número de filas devueltas, `OFFSET` omite las primeras N filas (útil para paginación).
 
@@ -347,4 +358,23 @@ ALTER JOB backup_productos ENABLE;
 
 -- Eliminar job
 DROP JOB limpieza_auditoria;
+
+-- VALIDACIONES DE CONSTRAINTS EN ALTER TABLE
+
+-- No se permite agregar una segunda PRIMARY KEY
+ALTER TABLE users ADD COLUMN email TEXT PRIMARY KEY;
+-- ERROR: table public.users already has a primary key on column id
+
+-- No se puede eliminar columna referenciada por FOREIGN KEY
+-- Si orders.user_id tiene FK a users.id:
+ALTER TABLE users DROP COLUMN id;
+-- ERROR: cannot drop column id: it is referenced by foreign key in table public.orders column user_id
+
+-- No se puede eliminar columna PRIMARY KEY
+ALTER TABLE users DROP COLUMN id;
+-- ERROR: cannot drop column id: it is a primary key
+
+-- Sí se puede eliminar columna sin constraints
+ALTER TABLE users DROP COLUMN name;
+-- SUCCESS: columna eliminada correctamente
 

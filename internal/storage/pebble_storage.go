@@ -545,3 +545,142 @@ func convertConstraints(constraints []catalog.Constraint) []ConstraintData {
 	}
 	return result
 }
+
+// DropColumnData removes a column from all rows in a table
+func (ps *PebbleStorage) DropColumnData(tableName string, columnName string, schema string) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	// Load table data
+	key := []byte("table:" + schema + ":" + tableName)
+	val, closer, err := ps.db.Get(key)
+	if err != nil {
+		if err == pebble.ErrNotFound {
+			return nil // Table not found, nothing to do
+		}
+		return fmt.Errorf("failed to get table %s: %w", tableName, err)
+	}
+
+	valCopy := make([]byte, len(val))
+	copy(valCopy, val)
+	closer.Close()
+
+	var tableData TableData
+	if err := json.Unmarshal(valCopy, &tableData); err != nil {
+		return fmt.Errorf("failed to unmarshal table %s: %w", tableName, err)
+	}
+
+	// Find column index
+	colIdx := -1
+	for i, col := range tableData.Columns {
+		if col.Name == columnName {
+			colIdx = i
+			break
+		}
+	}
+
+	if colIdx < 0 {
+		return nil // Column not found, nothing to do
+	}
+
+	// Remove column from schema
+	newColumns := make([]ColumnData, 0, len(tableData.Columns)-1)
+	for i, col := range tableData.Columns {
+		if i != colIdx {
+			newColumns = append(newColumns, col)
+		}
+	}
+	tableData.Columns = newColumns
+
+	// Remove column data from each row
+	for i := range tableData.Rows {
+		if colIdx < len(tableData.Rows[i]) {
+			tableData.Rows[i] = append(tableData.Rows[i][:colIdx], tableData.Rows[i][colIdx+1:]...)
+		}
+	}
+
+	// Save updated table
+	data, err := json.Marshal(tableData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal table %s: %w", tableName, err)
+	}
+
+	if err := ps.db.Set(key, data, ps.wal); err != nil {
+		return fmt.Errorf("failed to save table %s: %w", tableName, err)
+	}
+
+	// Update metadata
+	if schemaMap, ok := ps.meta.Tables[schema]; ok {
+		if _, ok := schemaMap[tableName]; ok {
+			ps.meta.Tables[schema][tableName].Columns = newColumns
+			return ps.saveMetadata()
+		}
+	}
+
+	return nil
+}
+
+// RenameColumnData renames a column in all rows in a table
+// Note: Since rows are stored as arrays, not maps, we only need to update the schema
+func (ps *PebbleStorage) RenameColumnData(tableName string, oldName string, newName string, schema string) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	// Load table data
+	key := []byte("table:" + schema + ":" + tableName)
+	val, closer, err := ps.db.Get(key)
+	if err != nil {
+		if err == pebble.ErrNotFound {
+			return nil // Table not found, nothing to do
+		}
+		return fmt.Errorf("failed to get table %s: %w", tableName, err)
+	}
+
+	valCopy := make([]byte, len(val))
+	copy(valCopy, val)
+	closer.Close()
+
+	var tableData TableData
+	if err := json.Unmarshal(valCopy, &tableData); err != nil {
+		return fmt.Errorf("failed to unmarshal table %s: %w", tableName, err)
+	}
+
+	// Find and rename column in schema
+	found := false
+	for i := range tableData.Columns {
+		if tableData.Columns[i].Name == oldName {
+			tableData.Columns[i].Name = newName
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return nil // Column not found, nothing to do
+	}
+
+	// Save updated table (rows don't need to change, only schema)
+	data, err := json.Marshal(tableData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal table %s: %w", tableName, err)
+	}
+
+	if err := ps.db.Set(key, data, ps.wal); err != nil {
+		return fmt.Errorf("failed to save table %s: %w", tableName, err)
+	}
+
+	// Update metadata
+	if schemaMap, ok := ps.meta.Tables[schema]; ok {
+		if _, ok := schemaMap[tableName]; ok {
+			for i := range ps.meta.Tables[schema][tableName].Columns {
+				if ps.meta.Tables[schema][tableName].Columns[i].Name == oldName {
+					ps.meta.Tables[schema][tableName].Columns[i].Name = newName
+					break
+				}
+			}
+			return ps.saveMetadata()
+		}
+	}
+
+	return nil
+}

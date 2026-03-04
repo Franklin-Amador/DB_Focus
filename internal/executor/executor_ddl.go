@@ -335,3 +335,157 @@ func (e *Executor) executeDropSchema(ctx context.Context, stmt *ast.DropSchema) 
 
 	return &Result{Tag: constants.ResultDropTable}, nil
 }
+
+// executeAlterTable handles ALTER TABLE statements
+func (e *Executor) executeAlterTable(ctx context.Context, stmt *ast.AlterTable) (*Result, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	schema := stmt.Table.Alias
+	if schema == "" {
+		schema = "public"
+	}
+	tableName := stmt.Table.Name
+
+	// Verify table exists
+	_, err := e.catalog.GetTable(tableName, schema)
+	if err != nil {
+		return nil, fmt.Errorf("table %s.%s does not exist", schema, tableName)
+	}
+
+	// Execute action based on type
+	switch action := stmt.Action.(type) {
+	case *ast.AddColumn:
+		return e.executeAddColumn(ctx, schema, tableName, action)
+	case *ast.DropColumn:
+		return e.executeDropColumn(ctx, schema, tableName, action)
+	case *ast.AlterColumn:
+		return e.executeAlterColumn(ctx, schema, tableName, action)
+	case *ast.RenameColumn:
+		return e.executeRenameColumn(ctx, schema, tableName, action)
+	default:
+		return nil, fmt.Errorf("unsupported ALTER TABLE action: %T", action)
+	}
+}
+
+func (e *Executor) executeAddColumn(ctx context.Context, schema string, tableName string, action *ast.AddColumn) (*Result, error) {
+	// Create new column from AST definition
+	newCol := catalog.Column{
+		Name:     action.Column.Name.Name,
+		Type:     action.Column.Type,
+		NotNull:  action.Column.NotNull,
+		Identity: action.Column.Identity,
+	}
+
+	// Check if column has PRIMARY KEY constraint
+	var pkConstraint *catalog.Constraint
+	for _, astConstraint := range action.Column.Constraints {
+		if pk, ok := astConstraint.(*ast.PrimaryKeyConstraint); ok {
+			pkConstraint = &catalog.Constraint{
+				Type:       constants.ConstraintPrimaryKey,
+				ColumnName: pk.ColumnName,
+			}
+			break
+		}
+	}
+
+	// Add column to catalog (with constraint validation if applicable)
+	var err error
+	if pkConstraint != nil {
+		err = e.catalog.AddColumnWithConstraint(tableName, &newCol, pkConstraint, schema)
+	} else {
+		err = e.catalog.AddColumn(tableName, &newCol, schema)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to add column: %w", err)
+	}
+
+	// Persist change in storage
+	table, err := e.catalog.GetTable(tableName, schema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get table for persistence: %w", err)
+	}
+
+	if e.storage != nil {
+		if err := e.storage.SaveTableWithSchema(table, schema); err != nil {
+			return nil, fmt.Errorf("failed to persist table schema: %w", err)
+		}
+	}
+
+	return &Result{Tag: "ALTER TABLE (ADD COLUMN)"}, nil
+}
+
+func (e *Executor) executeDropColumn(ctx context.Context, schema string, tableName string, action *ast.DropColumn) (*Result, error) {
+	// Drop column from catalog
+	if err := e.catalog.DropColumn(tableName, action.ColumnName, schema); err != nil {
+		return nil, fmt.Errorf("failed to drop column: %w", err)
+	}
+
+	// Persist change in storage
+	table, err := e.catalog.GetTable(tableName, schema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get table for persistence: %w", err)
+	}
+
+	if e.storage != nil {
+		if err := e.storage.SaveTableWithSchema(table, schema); err != nil {
+			return nil, fmt.Errorf("failed to persist table schema: %w", err)
+		}
+
+		// Also remove column data from all rows
+		if err := e.storage.DropColumnData(tableName, action.ColumnName, schema); err != nil {
+			fmt.Printf("warning: failed to drop column data: %v\n", err)
+		}
+	}
+
+	return &Result{Tag: "ALTER TABLE (DROP COLUMN)"}, nil
+}
+
+func (e *Executor) executeAlterColumn(ctx context.Context, schema string, tableName string, action *ast.AlterColumn) (*Result, error) {
+	// Modify column type in catalog
+	if err := e.catalog.AlterColumnType(tableName, action.ColumnName, action.NewType, schema); err != nil {
+		return nil, fmt.Errorf("failed to alter column: %w", err)
+	}
+
+	// Persist change in storage
+	table, err := e.catalog.GetTable(tableName, schema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get table for persistence: %w", err)
+	}
+
+	if e.storage != nil {
+		if err := e.storage.SaveTableWithSchema(table, schema); err != nil {
+			return nil, fmt.Errorf("failed to persist table schema: %w", err)
+		}
+	}
+
+	return &Result{Tag: "ALTER TABLE (ALTER COLUMN)"}, nil
+}
+
+func (e *Executor) executeRenameColumn(ctx context.Context, schema string, tableName string, action *ast.RenameColumn) (*Result, error) {
+	// Rename column in catalog
+	if err := e.catalog.RenameColumn(tableName, action.OldName, action.NewName, schema); err != nil {
+		return nil, fmt.Errorf("failed to rename column: %w", err)
+	}
+
+	// Persist change in storage
+	table, err := e.catalog.GetTable(tableName, schema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get table for persistence: %w", err)
+	}
+
+	if e.storage != nil {
+		if err := e.storage.SaveTableWithSchema(table, schema); err != nil {
+			return nil, fmt.Errorf("failed to persist table schema: %w", err)
+		}
+
+		// Also rename column in data
+		if err := e.storage.RenameColumnData(tableName, action.OldName, action.NewName, schema); err != nil {
+			fmt.Printf("warning: failed to rename column data: %v\n", err)
+		}
+	}
+
+	return &Result{Tag: "ALTER TABLE (RENAME COLUMN)"}, nil
+}

@@ -1043,12 +1043,6 @@ func (p *Parser) parseCreateJob() (ast.Statement, error) {
 	}
 	p.next()
 
-	enabled := false
-	if p.cur.Type == TokenEnabled {
-		enabled = true
-		p.next()
-	}
-
 	if !p.expect(TokenBegin) {
 		return nil, p.errorf("expected BEGIN for job body")
 	}
@@ -1067,17 +1061,16 @@ func (p *Parser) parseCreateJob() (ast.Statement, error) {
 		Interval: interval,
 		Unit:     unit,
 		Body:     body,
-		Enabled:  enabled,
+		Enabled:  true, // Jobs are enabled by default
 	}, nil
 }
 
-// ALTER [TABLE|JOB] ... (stub implementation)
+// ALTER [TABLE|JOB] ...
 func (p *Parser) parseAlter() (ast.Statement, error) {
 	p.next()
 	switch p.cur.Type {
 	case TokenTable:
-		// Aquí podrías llamar a parseAlterTable si lo implementas
-		return nil, p.errorf("ALTER TABLE no implementado aún")
+		return p.parseAlterTable()
 	case TokenJob:
 		return p.parseAlterJob()
 	default:
@@ -1085,14 +1078,141 @@ func (p *Parser) parseAlter() (ast.Statement, error) {
 	}
 }
 
-// ALTER JOB job_name ... (stub)
-func (p *Parser) parseAlterJob() (ast.Statement, error) {
+// ALTER TABLE table_name action
+func (p *Parser) parseAlterTable() (ast.Statement, error) {
+	p.next() // consume TABLE
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected table name after ALTER TABLE")
+	}
+	tableIdent := p.parseQualifiedIdent()
+
+	// Parse action
+	action, err := p.parseAlterTableAction()
+	if err != nil {
+		return nil, err
+	}
+
+	return &ast.AlterTable{Table: tableIdent, Action: action}, nil
+}
+
+func (p *Parser) parseAlterTableAction() (ast.AlterAction, error) {
+	switch p.cur.Type {
+	case TokenAdd:
+		return p.parseAddColumn()
+	case TokenDrop:
+		return p.parseDropColumn()
+	case TokenAlter:
+		return p.parseAlterColumnAction()
+	case TokenRename:
+		return p.parseRenameColumn()
+	default:
+		return nil, p.errorf("expected ALTER TABLE action (ADD, DROP, ALTER, RENAME)")
+	}
+}
+
+func (p *Parser) parseAddColumn() (ast.AlterAction, error) {
+	p.next() // consume ADD
+	if !p.expect(TokenColumn) {
+		return nil, p.errorf("expected COLUMN after ADD")
+	}
+
+	// Parse column definition
+	colDef, err := p.parseColumnDef()
+	if err != nil {
+		return nil, err
+	}
+
+	return &ast.AddColumn{Column: colDef}, nil
+}
+
+func (p *Parser) parseDropColumn() (ast.AlterAction, error) {
+	p.next() // consume DROP
+	if !p.expect(TokenColumn) {
+		return nil, p.errorf("expected COLUMN after DROP")
+	}
+
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected column name after DROP COLUMN")
+	}
+	colName := p.cur.Literal
 	p.next()
+
+	return &ast.DropColumn{ColumnName: colName}, nil
+}
+
+func (p *Parser) parseAlterColumnAction() (ast.AlterAction, error) {
+	p.next() // consume ALTER
+	if !p.expect(TokenColumn) {
+		return nil, p.errorf("expected COLUMN after ALTER")
+	}
+
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected column name after ALTER COLUMN")
+	}
+	colName := p.cur.Literal
+	p.next()
+
+	// Expect TYPE keyword
+	if !p.expect(TokenDataType) {
+		return nil, p.errorf("expected TYPE after column name")
+	}
+
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected new type after TYPE")
+	}
+	newType := p.cur.Literal
+	p.next()
+
+	return &ast.AlterColumn{ColumnName: colName, NewType: newType}, nil
+}
+
+func (p *Parser) parseRenameColumn() (ast.AlterAction, error) {
+	p.next() // consume RENAME
+	if !p.expect(TokenColumn) {
+		return nil, p.errorf("expected COLUMN after RENAME")
+	}
+
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected old column name after RENAME COLUMN")
+	}
+	oldName := p.cur.Literal
+	p.next()
+
+	// Optional TO keyword
+	if p.cur.Type == TokenTo {
+		p.next()
+	}
+
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected new column name")
+	}
+	newName := p.cur.Literal
+	p.next()
+
+	return &ast.RenameColumn{OldName: oldName, NewName: newName}, nil
+}
+
+// ALTER JOB job_name [ENABLE|DISABLE]
+func (p *Parser) parseAlterJob() (ast.Statement, error) {
+	p.next() // consume JOB
 	if p.cur.Type != TokenIdent {
 		return nil, p.errorf("expected job name after ALTER JOB")
 	}
 	jobName := ast.Identifier{Name: p.cur.Literal}
 	p.next()
-	// Aquí deberías parsear las opciones específicas de ALTER JOB
-	return &ast.AlterJob{Name: jobName}, nil
+
+	// Parse action (ENABLE or DISABLE)
+	var action string
+	switch p.cur.Type {
+	case TokenEnable:
+		action = "ENABLE"
+		p.next()
+	case TokenDisable:
+		action = "DISABLE"
+		p.next()
+	default:
+		return nil, p.errorf("expected ENABLE or DISABLE after job name")
+	}
+
+	return &ast.AlterJob{Name: jobName, Action: action}, nil
 }

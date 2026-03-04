@@ -55,6 +55,8 @@ func (e *Executor) Execute(ctx context.Context, stmt ast.Statement) (*Result, er
 		return e.executeCreateTable(ctx, s)
 	case *ast.DropTable:
 		return e.executeDropTable(ctx, s)
+	case *ast.AlterTable:
+		return e.executeAlterTable(ctx, s)
 	case *ast.CreateDatabase:
 		return e.executeCreateDatabase(ctx, s)
 	case *ast.DropDatabase:

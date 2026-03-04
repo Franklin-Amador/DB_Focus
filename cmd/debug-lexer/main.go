@@ -11,8 +11,8 @@ func main() {
 	p := parser.NewParser(sql)
 
 	for i := 0; i < 20; i++ {
-		fmt.Printf("Token %d: Type=%v\n", i, p.CurType())
-		if p.CurType() == parser.TokenEOF {
+		fmt.Printf("Token %d: Type=%v\n", i, p.CurToken().Type)
+		if p.CurToken().Type == parser.TokenEOF {
 			break
 		}
 		p.Next()

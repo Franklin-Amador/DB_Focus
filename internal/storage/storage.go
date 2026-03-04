@@ -32,6 +32,10 @@ type Backend interface {
 	CreateSchema(name string) error
 	// DeleteSchema removes a schema and all its tables from persistent storage.
 	DeleteSchema(name string) error
+	// DropColumnData removes a column from all rows in a table
+	DropColumnData(tableName string, columnName string, schema string) error
+	// RenameColumnData renames a column in all rows in a table
+	RenameColumnData(tableName string, oldName string, newName string, schema string) error
 }
 
 type TableData struct {
