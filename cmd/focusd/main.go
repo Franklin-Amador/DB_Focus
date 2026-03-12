@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -54,6 +56,25 @@ func main() {
 
 	log.Printf("focus: starting on %s (data dir: %s) [pebble backend]", *addr, *dataDir)
 	log.Printf("focus: limits - max connections: %d, buffer size: %d bytes", *maxConns, *bufSize)
+
+	// Render (and similar platforms) require an HTTP server for health checks.
+	// The $PORT env var points to the HTTP port they scan; we respond with 200 OK
+	// so Render marks the service healthy, while the real PG wire protocol stays on :4444.
+	if httpPort := os.Getenv("PORT"); httpPort != "" {
+		httpAddr := "0.0.0.0:" + httpPort
+		mux := http.NewServeMux()
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, "FocusDB is running. Connect via psql on port 4444.")
+		})
+		go func() {
+			log.Printf("focus: HTTP health-check server on %s", httpAddr)
+			if err := http.ListenAndServe(httpAddr, mux); err != nil {
+				log.Printf("focus: HTTP health-check server error: %v", err)
+			}
+		}()
+	}
 
 	handler := executeHandler{
 		executor: exe,

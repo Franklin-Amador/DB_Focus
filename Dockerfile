@@ -32,7 +32,9 @@ COPY --from=builder /out/focusd /usr/local/bin/focusd
 RUN chmod +x /usr/local/bin/focusd
 
 USER focusdb
-EXPOSE 4444
+# 4444 = PostgreSQL wire protocol (clients psql/pgAdmin)
+# 10000 = HTTP health check (Render scans this via $PORT)
+EXPOSE 4444 10000
 VOLUME ["/data"]
 
 # GOGC=50: Garbage collection after every 50% heap growth (vs 100% default)
