@@ -27,12 +27,21 @@ type PebbleStorage struct {
 	cache *pebble.Cache
 }
 
+// gobBufPool reuses bytes.Buffer instances across gob encode/decode calls
+// to reduce GC pressure during DDL operations (procedures, triggers, jobs).
+var gobBufPool = sync.Pool{
+	New: func() interface{} { return &bytes.Buffer{} },
+}
+
 func (ps *PebbleStorage) SaveProcedure(proc *catalog.Procedure) error {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
+	buf := gobBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer gobBufPool.Put(buf)
+
+	enc := gob.NewEncoder(buf)
 	pd := ProcedureData{
 		Name:       proc.Name,
 		Parameters: proc.Parameters,
@@ -64,8 +73,11 @@ func (ps *PebbleStorage) SaveTrigger(trigger *catalog.Trigger) error {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
+	buf := gobBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer gobBufPool.Put(buf)
+
+	enc := gob.NewEncoder(buf)
 	td := TriggerData{
 		Name:       trigger.Name,
 		Timing:     trigger.Timing,
@@ -100,8 +112,11 @@ func (ps *PebbleStorage) SaveJob(job *catalog.Job) error {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
+	buf := gobBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer gobBufPool.Put(buf)
+
+	enc := gob.NewEncoder(buf)
 	jd := JobData{
 		Name:     job.Name,
 		Interval: job.Interval,
@@ -204,7 +219,7 @@ func NewPebbleStorage(dir string) (*PebbleStorage, error) {
 	cache := pebble.NewCache(1 << 20) // 1MB cache (was 4MB)
 	opts := &pebble.Options{
 		Cache:                       cache,
-		MemTableSize:                512 << 10, // 512KB memtable (was 2MB)
+		MemTableSize:                256 << 10, // 256KB memtable
 		MemTableStopWritesThreshold: 2,         // Only 2 memtables max
 		MaxOpenFiles:                50,        // Limit file handles (was 100)
 		L0CompactionThreshold:       2,         // Trigger compaction early
@@ -313,16 +328,23 @@ func (ps *PebbleStorage) saveTableWithSchema(table *catalog.Table, schema string
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
-	// Serialize table data with key: "table:<schema>:<name>"
 	key := []byte("table:" + schema + ":" + table.Name)
-	data, err := json.Marshal(TableData{
-		Name:        table.Name,
-		Columns:     convertColumns(table.Columns),
-		Constraints: convertConstraints(table.Constraints),
-		Rows:        table.SelectAll(),
+
+	// Encode rows inside the table's read lock to avoid copying all rows into
+	// a separate slice. json.Marshal runs while the lock is held, preventing
+	// concurrent mutations from racing with the serializer.
+	var data []byte
+	var marshalErr error
+	table.UseRows(func(rows [][]interface{}) {
+		data, marshalErr = json.Marshal(TableData{
+			Name:        table.Name,
+			Columns:     convertColumns(table.Columns),
+			Constraints: convertConstraints(table.Constraints),
+			Rows:        rows,
+		})
 	})
-	if err != nil {
-		return fmt.Errorf("failed to marshal table %s: %w", table.Name, err)
+	if marshalErr != nil {
+		return fmt.Errorf("failed to marshal table %s: %w", table.Name, marshalErr)
 	}
 
 	// Write with WAL sync
@@ -405,8 +427,11 @@ func (ps *PebbleStorage) loadTableInternal(cat *catalog.Catalog, name string, sc
 
 	// Load rows
 	if table, err := cat.GetTable(td.Name, schema); err == nil {
-		for _, row := range td.Rows {
-			_ = table.InsertRowUnsafe(row)
+		// Assign decoded rows directly instead of inserting one-by-one.
+		// InsertRowUnsafe would repeatedly append, causing multiple backing-array
+		// reallocations. SetRows reuses the slice JSON already allocated.
+		if len(td.Rows) > 0 {
+			table.SetRows(td.Rows)
 		}
 		syncIdentityValues(table)
 	}

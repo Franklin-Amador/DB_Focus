@@ -1,12 +1,17 @@
 package server
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
+)
 
-	"bufio"
+const (
+	// Keep protocol frame sizes bounded to avoid memory pressure/OOM from malformed probes.
+	maxMessagePayloadSize = 1 << 20 // 1 MiB
 )
 
 func readMessage(rw *bufio.ReadWriter) (byte, []byte, error) {
@@ -21,7 +26,11 @@ func readMessage(rw *bufio.ReadWriter) (byte, []byte, error) {
 	if length < 4 {
 		return 0, nil, errors.New("invalid message length")
 	}
-	payload := make([]byte, length-4)
+	payloadLen := int(length - 4)
+	if payloadLen > maxMessagePayloadSize {
+		return 0, nil, fmt.Errorf("message too large: %d bytes", payloadLen)
+	}
+	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(rw, payload); err != nil {
 		return 0, nil, err
 	}
@@ -129,7 +138,11 @@ func readStartup(rw *bufio.ReadWriter) (map[string]string, error) {
 		if length < 8 {
 			return nil, errors.New("invalid startup length")
 		}
-		payload := make([]byte, length-4)
+		payloadLen := int(length - 4)
+		if payloadLen > maxMessagePayloadSize {
+			return nil, fmt.Errorf("startup message too large: %d bytes", payloadLen)
+		}
+		payload := make([]byte, payloadLen)
 		if _, err := io.ReadFull(rw, payload); err != nil {
 			return nil, err
 		}

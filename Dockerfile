@@ -35,14 +35,15 @@ USER focusdb
 EXPOSE 4444
 VOLUME ["/data"]
 
-# EXTREME memory limits for 512MB Render free plan
 # GOGC=50: Garbage collection after every 50% heap growth (vs 100% default)
-# GOMEMLIMIT=80MiB: Hard limit - stops accepting connections if exceeded
+# GOMEMLIMIT=256MiB: soft limit - triggers GC before OOM; keeps 256MB for
+# Go heap leaving the remaining ~250MB for OS, Pebble indices, and buffers.
+# 80MiB was too tight for LoadAll() peaks; 256MiB fits real workloads.
 ENV GOGC=50
-ENV GOMEMLIMIT=80MiB
+ENV GOMEMLIMIT=256MiB
 
 # Minimal config:
-# max-conns=2: Only 2 concurrent connections
-# buf-size=256: Smallest buffers possible (~512 bytes total for buffers)
-ENTRYPOINT ["/usr/local/bin/focusd", "-max-conns", "1", "-buf-size", "128", "-data", "/data"]
+# max-conns=1: Only 1 concurrent connection
+# buf-size=512: Small read/write buffers per connection
+ENTRYPOINT ["/usr/local/bin/focusd", "-max-conns", "1", "-buf-size", "512", "-data", "/data"]
 CMD []

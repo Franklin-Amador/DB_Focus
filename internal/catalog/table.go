@@ -109,6 +109,24 @@ func (t *Table) SelectAll() [][]interface{} {
 	return copyRows(t.Rows)
 }
 
+// UseRows calls fn with the table's raw row slice held under a read lock.
+// The fn MUST NOT modify the slice or any individual row element.
+// Use this for zero-copy read access (e.g., serialization).
+func (t *Table) UseRows(fn func([][]interface{})) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	fn(t.Rows)
+}
+
+// SetRows replaces the table's row slice directly, bypassing row-by-row
+// insertion. Used only during initial load from storage to avoid repeated
+// append-and-grow allocations.
+func (t *Table) SetRows(rows [][]interface{}) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Rows = rows
+}
+
 func (t *Table) SelectWhere(colName string, value interface{}) ([][]interface{}, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

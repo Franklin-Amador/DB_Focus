@@ -32,6 +32,10 @@ func ListenAndServeWithConfig(addr string, handler QueryHandler, cat *catalog.Ca
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				log.Printf("[server] temporary accept error: %v", err)
+				continue
+			}
 			return err
 		}
 
@@ -46,7 +50,7 @@ func ListenAndServeWithConfig(addr string, handler QueryHandler, cat *catalog.Ca
 
 func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Catalog, bufSize int) {
 	defer conn.Close()
-	log.Printf("[conn] new connection from %s", conn.RemoteAddr())
+	remoteAddr := conn.RemoteAddr().String()
 	rw := bufio.NewReadWriter(
 		bufio.NewReaderSize(conn, bufSize),
 		bufio.NewWriterSize(conn, bufSize),
@@ -60,14 +64,12 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Cat
 	// Authenticate (and validate database)
 	user, err := authenticate(rw, cat)
 	if err != nil {
-		// Hosted platforms often probe open ports and close immediately.
-		// Treat EOF-style auth failures as expected and keep logs clean.
-		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-			log.Printf("[conn] authentication failed: %v", err)
+		if !isExpectedConnError(err) {
+			log.Printf("[conn] authentication failed from %s: %v", remoteAddr, err)
 		}
 		return
 	}
-	log.Printf("[conn] authenticated as user: %s", user)
+	log.Printf("[conn] authenticated from %s as user: %s", remoteAddr, user)
 
 	// Register user in catalog
 	if err := cat.RegisterUser(user, true); err != nil {
@@ -79,8 +81,8 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Cat
 	for {
 		msgType, payload, err := readMessage(rw)
 		if err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-				log.Printf("[conn] message read error: %v", err)
+			if !isExpectedConnError(err) {
+				log.Printf("[conn] message read error from %s: %v", remoteAddr, err)
 			}
 			return
 		}
@@ -408,5 +410,24 @@ func writeStartupResponse(rw *bufio.ReadWriter, user string) error {
 	return writeReady(rw)
 }
 
-// fmtError is a tiny local helper to avoid importing fmt in this file.
-// end of file
+func isExpectedConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "invalid startup length") ||
+		strings.Contains(msg, "expected password message") ||
+		strings.Contains(msg, "startup message too large") ||
+		strings.Contains(msg, "message too large") ||
+		strings.Contains(msg, "invalid message length") {
+		return true
+	}
+	return false
+}
