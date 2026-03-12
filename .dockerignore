@@ -1,12 +1,34 @@
+# Runtime and test data directories
 data/
 data_test/
-*.exe~
+data_test_alter/
+data_test_constraints/
+
+# VCS/editor metadata
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Build/test artifacts
 *.exe
-*.log
-.git
-.idea
-.vscode
-node_modules
-vendor
-bin
+*.exe~
 *.test
+bin/
+vendor/
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Documentation and development-only files
+*.md
+AGENTS.md
+cleanup_refactor.ps1
+test_joins.sql
+
+# Exclude test/debug entrypoints from build context
+cmd/test-*/
+cmd/debug-lexer/
+cmd/focusd/capture-proxy/
+cmd/focusd/data/

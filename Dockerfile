@@ -10,13 +10,15 @@ RUN apk add --no-cache git ca-certificates
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source and build with aggressive optimizations for memory efficiency
-COPY . .
+# Copy only required source files for the server binary.
+# This avoids sending tests/docs/dev artifacts into the builder stage.
+COPY cmd/focusd ./cmd/focusd
+COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build \
     -trimpath \
     -ldflags="-s -w" \
-    -gcflags="all=-l=4" \
+    -buildvcs=false \
     -o /out/focusd ./cmd/focusd
 
 # Final image: minimal runtime image
