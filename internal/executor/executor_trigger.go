@@ -8,6 +8,8 @@ import (
 	"dbf/internal/constants"
 )
 
+const maxTriggerRecursionDepth = 16
+
 // executeCreateTrigger creates a new trigger in the catalog.
 func (e *Executor) executeCreateTrigger(ctx context.Context, stmt *ast.CreateTrigger) (*Result, error) {
 	// Check context cancellation
@@ -61,7 +63,7 @@ func (e *Executor) executeDropTrigger(ctx context.Context, stmt *ast.DropTrigger
 }
 
 // executeTriggers executes all triggers matching the given table, timing, and event.
-// This function prevents recursive trigger execution by temporarily disabling triggers.
+// Recursive trigger chains are supported with a bounded depth to avoid infinite loops.
 //
 // Parameters:
 //   - table: table name
@@ -72,9 +74,12 @@ func (e *Executor) executeDropTrigger(ctx context.Context, stmt *ast.DropTrigger
 //
 // Returns an error if any trigger execution fails.
 func (e *Executor) executeTriggers(ctx context.Context, table, timing, event string, oldRow, newRow []interface{}) error {
-	// Prevent recursive trigger execution
 	if !e.triggersEnabled {
 		return nil
+	}
+
+	if e.triggerDepth >= maxTriggerRecursionDepth {
+		return fmt.Errorf("trigger recursion depth exceeded (%d) while executing %s %s on %s", maxTriggerRecursionDepth, timing, event, table)
 	}
 
 	// Check context cancellation
@@ -82,29 +87,26 @@ func (e *Executor) executeTriggers(ctx context.Context, table, timing, event str
 		return ctx.Err()
 	}
 
+	e.triggerDepth++
+	defer func() {
+		e.triggerDepth--
+	}()
+
 	triggers := e.catalog.GetTriggers(table, timing, event)
 	for _, trigger := range triggers {
-		// Disable triggers while executing trigger body to prevent recursion
-		e.triggersEnabled = false
-
 		// Execute each statement in the trigger body
 		for _, stmt := range trigger.Body {
 			// Check context before each statement
 			if ctx.Err() != nil {
-				e.triggersEnabled = true
 				return ctx.Err()
 			}
 
 			// TODO: Support OLD and NEW row references
 			// For now, execute statements as-is
 			if _, err := e.Execute(ctx, stmt); err != nil {
-				e.triggersEnabled = true
-				return fmt.Errorf("trigger %s failed: %w", trigger.Name, err)
+				return fmt.Errorf("trigger %s failed at depth %d: %w", trigger.Name, e.triggerDepth, err)
 			}
 		}
-
-		// Re-enable triggers after trigger body completes
-		e.triggersEnabled = true
 	}
 
 	return nil

@@ -81,10 +81,32 @@ func (e *Executor) executeSelectMain(ctx context.Context, stmt *ast.Select) (*Re
 		return e.executeJoinSelect(ctx, stmt)
 	}
 
-	// Simple SELECT from single table
-	table, err := e.catalog.GetTable(stmt.Table.Name)
+	schema := stmt.Table.Alias
+	table, err := e.catalog.GetTable(stmt.Table.Name, schema)
 	if err != nil {
-		return nil, fmt.Errorf("table %s not found: %w", stmt.Table.Name, err)
+		view, vErr := e.catalog.GetView(stmt.Table.Name, schema)
+		if vErr != nil {
+			return nil, fmt.Errorf("table %s not found: %w", stmt.Table.Name, err)
+		}
+
+		viewResult, execErr := e.executeSelect(ctx, view.Query)
+		if execErr != nil {
+			return nil, fmt.Errorf("failed to resolve view %s: %w", view.Name, execErr)
+		}
+
+		// Use view.Columns which contains explicit column names if defined
+		virtualCols := make([]catalog.Column, len(view.Columns))
+		copy(virtualCols, view.Columns)
+		table = &catalog.Table{Name: view.Name, Columns: virtualCols, Rows: viewResult.Rows}
+	}
+
+	return e.executeSelectFromTable(ctx, stmt, table)
+}
+
+func (e *Executor) executeSelectFromTable(ctx context.Context, stmt *ast.Select, table *catalog.Table) (*Result, error) {
+	// Check context cancellation
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 
 	// Fetch rows

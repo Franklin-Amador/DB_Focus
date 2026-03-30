@@ -42,7 +42,13 @@ const (
 	TokenGroup      TokenType = "GROUP"
 	TokenBy         TokenType = "BY"
 	TokenCreate     TokenType = "CREATE"
+	TokenOr         TokenType = "OR"
+	TokenReplace    TokenType = "REPLACE"
+	TokenIf         TokenType = "IF"
+	TokenExists     TokenType = "EXISTS"
 	TokenTable      TokenType = "TABLE"
+	TokenView       TokenType = "VIEW"
+	TokenIndex      TokenType = "INDEX"
 	TokenDatabase   TokenType = "DATABASE"
 	TokenInsert     TokenType = "INSERT"
 	TokenInto       TokenType = "INTO"
@@ -106,6 +112,8 @@ const (
 	TokenRename     TokenType = "RENAME"
 	TokenDataType   TokenType = "TYPE"
 	TokenTo         TokenType = "TO"
+	TokenCascade    TokenType = "CASCADE"
+	TokenRestrict   TokenType = "RESTRICT"
 )
 
 type Token struct {
@@ -122,7 +130,13 @@ var keywords = map[string]TokenType{
 	"GROUP":      TokenGroup,
 	"BY":         TokenBy,
 	"CREATE":     TokenCreate,
+	"OR":         TokenOr,
+	"REPLACE":    TokenReplace,
+	"IF":         TokenIf,
+	"EXISTS":     TokenExists,
 	"TABLE":      TokenTable,
+	"VIEW":       TokenView,
+	"INDEX":      TokenIndex,
 	"DATABASE":   TokenDatabase,
 	"INSERT":     TokenInsert,
 	"INTO":       TokenInto,
@@ -201,4 +215,6 @@ var keywords = map[string]TokenType{
 	"RENAME":     TokenRename,
 	"TYPE":       TokenDataType,
 	"TO":         TokenTo,
+	"CASCADE":    TokenCascade,
+	"RESTRICT":   TokenRestrict,
 }

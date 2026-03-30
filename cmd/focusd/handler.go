@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"dbf/internal/ast"
 	"dbf/internal/catalog"
 	"dbf/internal/executor"
 	"dbf/internal/parser"
@@ -18,9 +19,17 @@ type executeHandler struct {
 }
 
 func (h executeHandler) Handle(query string) (*server.QueryResult, error) {
+	return h.HandleWithDatabase(query, "postgres")
+}
+
+func (h executeHandler) HandleWithDatabase(query string, currentDatabase string) (*server.QueryResult, error) {
+	if currentDatabase == "" {
+		currentDatabase = "postgres"
+	}
+
 	// 1. Intercept system catalog queries (pg_catalog, information_schema, etc.)
 	//    These are handled before the parser to avoid complexity.
-	if result, ok := h.catalog.HandleSystemQuery(query); ok {
+	if result, ok := h.catalog.HandleSystemQueryForDatabase(query, currentDatabase); ok {
 		return &server.QueryResult{
 			Columns: result.Columns,
 			Rows:    result.Rows,
@@ -29,7 +38,7 @@ func (h executeHandler) Handle(query string) (*server.QueryResult, error) {
 	}
 
 	// 2. Rewrite system functions to literals the parser can handle
-	query = rewriteSystemFunctions(query)
+	query = rewriteSystemFunctions(query, currentDatabase)
 
 	// 3. Parse and execute all statements
 	p := parser.NewParser(query)
@@ -43,6 +52,8 @@ func (h executeHandler) Handle(query string) (*server.QueryResult, error) {
 		if stmt == nil {
 			continue // bare semicolon
 		}
+
+		applyDatabaseContext(stmt, currentDatabase)
 
 		result, err := h.executor.Execute(context.Background(), stmt)
 		if err != nil {
@@ -64,14 +75,18 @@ func (h executeHandler) Handle(query string) (*server.QueryResult, error) {
 // rewriteSystemFunctions replaces PostgreSQL built-in functions/keywords
 // that the parser doesn't support with literal equivalents.
 var systemFunctionRewrites = map[string]string{
-	"current_user":       "'postgres'",
-	"current_database()": "'postgres'",
-	"pg_backend_pid()":   "0",
+	"current_user":     "'postgres'",
+	"pg_backend_pid()": "0",
 }
 
-func rewriteSystemFunctions(query string) string {
+func rewriteSystemFunctions(query string, currentDatabase string) string {
 	result := query
 	upper := strings.ToUpper(query)
+	if currentDatabase == "" {
+		currentDatabase = "postgres"
+	}
+	result = replaceAllCaseInsensitive(result, "current_database()", fmt.Sprintf("'%s'", currentDatabase))
+	upper = strings.ToUpper(result)
 	for pattern, replacement := range systemFunctionRewrites {
 		if !strings.Contains(upper, strings.ToUpper(pattern)) {
 			continue
@@ -80,6 +95,60 @@ func rewriteSystemFunctions(query string) string {
 		upper = strings.ToUpper(result)
 	}
 	return result
+}
+
+func applyDatabaseContext(stmt ast.Statement, currentDatabase string) {
+	if currentDatabase == "" || currentDatabase == "postgres" {
+		return
+	}
+
+	setDefaultSchema := func(id *ast.Identifier) {
+		if id != nil && id.Name != "" && id.Alias == "" {
+			id.Alias = currentDatabase
+		}
+	}
+
+	var applyToSelect func(sel *ast.Select)
+	applyToSelect = func(sel *ast.Select) {
+		if sel == nil {
+			return
+		}
+		setDefaultSchema(&sel.Table)
+		if sel.Join != nil {
+			setDefaultSchema(&sel.Join.Table)
+		}
+		for i := range sel.With {
+			applyToSelect(sel.With[i].Select)
+		}
+	}
+
+	switch s := stmt.(type) {
+	case *ast.Select:
+		applyToSelect(s)
+	case *ast.Insert:
+		setDefaultSchema(&s.Table)
+	case *ast.Update:
+		setDefaultSchema(&s.Table)
+	case *ast.Delete:
+		setDefaultSchema(&s.Table)
+	case *ast.CreateTable:
+		setDefaultSchema(&s.Table)
+	case *ast.DropTable:
+		setDefaultSchema(&s.Table)
+	case *ast.AlterTable:
+		setDefaultSchema(&s.Table)
+	case *ast.CreateIndex:
+		setDefaultSchema(&s.Table)
+	case *ast.CreateView:
+		setDefaultSchema(&s.Name)
+		applyToSelect(s.Query)
+	case *ast.DropView:
+		setDefaultSchema(&s.Name)
+	case *ast.CreateTrigger:
+		setDefaultSchema(&s.Table)
+	case *ast.DropTrigger:
+		setDefaultSchema(&s.Table)
+	}
 }
 
 func replaceAllCaseInsensitive(input, pattern, replacement string) string {

@@ -21,6 +21,8 @@ type Backend interface {
 	DeleteTable(name string, schema string) error
 	SaveProcedure(proc *catalog.Procedure) error
 	DeleteProcedure(name string) error
+	SaveView(view *catalog.View, schema string) error
+	DeleteView(name string, schema string) error
 	SaveTrigger(trigger *catalog.Trigger) error
 	DeleteTrigger(name string) error
 	SaveJob(job *catalog.Job) error
@@ -42,7 +44,25 @@ type TableData struct {
 	Name        string           `json:"name"`
 	Columns     []ColumnData     `json:"columns"`
 	Constraints []ConstraintData `json:"constraints"`
+	Indexes     []IndexData      `json:"indexes,omitempty"`
 	Rows        [][]interface{}  `json:"rows"`
+}
+
+type IndexData struct {
+	Name        string   `json:"name"`
+	ColumnNames []string `json:"column_names,omitempty"`
+	// ColumnName is kept for backward compatibility with previous persisted format.
+	ColumnName string `json:"column_name,omitempty"`
+}
+
+func indexColumnsFromData(idx IndexData) []string {
+	if len(idx.ColumnNames) > 0 {
+		return append([]string(nil), idx.ColumnNames...)
+	}
+	if idx.ColumnName != "" {
+		return []string{idx.ColumnName}
+	}
+	return nil
 }
 
 type ColumnData struct {
@@ -80,6 +100,7 @@ func (s *Storage) SaveTable(table *catalog.Table) error {
 		Name:        table.Name,
 		Columns:     make([]ColumnData, len(table.Columns)),
 		Constraints: make([]ConstraintData, len(table.Constraints)),
+		Indexes:     make([]IndexData, 0, len(table.Indexes)),
 		Rows:        table.SelectAll(),
 	}
 
@@ -100,6 +121,10 @@ func (s *Storage) SaveTable(table *catalog.Table) error {
 			ReferencedTable: constraint.ReferencedTable,
 			ReferencedCol:   constraint.ReferencedCol,
 		}
+	}
+
+	for _, idx := range table.Indexes {
+		td.Indexes = append(td.Indexes, IndexData{Name: idx.Name, ColumnNames: append([]string(nil), idx.ColumnNames...)})
 	}
 
 	data, err := json.MarshalIndent(td, "", "  ")
@@ -159,6 +184,12 @@ func (s *Storage) LoadTable(cat *catalog.Catalog, name string) error {
 	table, err := cat.GetTable(td.Name)
 	if err != nil {
 		return err
+	}
+
+	for _, idx := range td.Indexes {
+		if err := table.CreateIndex(idx.Name, indexColumnsFromData(idx)); err != nil {
+			return err
+		}
 	}
 
 	for _, row := range td.Rows {
@@ -286,6 +317,19 @@ func (s *Storage) LoadAll(cat *catalog.Catalog) error {
 
 		if err := cat.CreateTable(td.Name, cols, constraints); err != nil {
 			fmt.Printf("warning: failed to create table %s: %v\n", tableName, err)
+			continue
+		}
+
+		table, err := cat.GetTable(td.Name)
+		if err != nil {
+			fmt.Printf("warning: failed to get table %s: %v\n", tableName, err)
+			continue
+		}
+
+		for _, idx := range td.Indexes {
+			if err := table.CreateIndex(idx.Name, indexColumnsFromData(idx)); err != nil {
+				fmt.Printf("warning: failed to create index %s on %s: %v\n", idx.Name, tableName, err)
+			}
 		}
 	}
 
@@ -329,6 +373,16 @@ func (s *Storage) SaveProcedure(proc *catalog.Procedure) error {
 
 func (s *Storage) DeleteProcedure(name string) error {
 	// Legacy file storage backend does not persist procedures.
+	return nil
+}
+
+func (s *Storage) SaveView(view *catalog.View, schema string) error {
+	// Legacy file storage backend does not persist views.
+	return nil
+}
+
+func (s *Storage) DeleteView(name string, schema string) error {
+	// Legacy file storage backend does not persist views.
 	return nil
 }
 

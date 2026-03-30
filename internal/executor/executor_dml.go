@@ -173,6 +173,7 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 	if err != nil {
 		return nil, err
 	}
+	table.RebuildIndexes()
 
 	// Persist to storage
 	if e.storage != nil {
@@ -244,6 +245,7 @@ func (e *Executor) executeDelete(ctx context.Context, stmt *ast.Delete) (*Result
 	if err != nil {
 		return nil, err
 	}
+	table.RebuildIndexes()
 
 	// Persist to storage
 	if e.storage != nil {

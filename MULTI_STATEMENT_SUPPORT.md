@@ -113,6 +113,44 @@ Esta implementación sigue el comportamiento estándar de PostgreSQL:
 ✅ **Tests:** 7 tests pasando (3 unit + 4 integration)  
 ✅ **Build:** Compila sin errores  
 
+---
+
+## Actualización Marzo 2026 - Estabilidad de protocolo
+
+Durante pruebas de regresión se detectó un cuelgue en cliente de protocolo extendido al ejecutar `SELECT 1`.
+
+### Causa raíz
+
+- El flujo de prueba en cliente esperaba `ReadyForQuery (Z)` antes de enviar `Sync`.
+- En protocolo extendido, `Z` se recibe después de `Sync`.
+- Adicionalmente, para consultas de sistema se enviaba `ReadyForQuery` duplicado desde el servidor, causando posible desincronización del stream de mensajes.
+
+### Correcciones aplicadas
+
+1. **Cliente de prueba (`cmd/test-client/main.go`)**
+    - Ajuste del read loop para terminar en `CommandComplete`/`ErrorResponse` tras `Execute`.
+    - Envío de `Sync` antes de esperar `ReadyForQuery`.
+
+2. **Servidor (`internal/server/writers.go`)**
+    - Eliminado `writeReady()` duplicado en `writeSystemResult()`.
+    - Se mantiene un único `ReadyForQuery` por ciclo de query simple.
+
+3. **Prueba de information schema (`cmd/test-information-schema/main.go`)**
+    - Limpieza de manejo de `rows` para evitar reutilización conflictiva de resultsets.
+    - Validación más robusta del contenido esperado.
+
+### Resultado de regresión
+
+Escenarios cliente que inicialmente fallaban y luego pasaron (exit code `0`):
+
+- `test-client`
+- `test-information-schema`
+- `test-multi-advanced`
+- `test-multi-client`
+- `test-persistence`
+- `test-simple-query`
+- `test-users`
+
 ## Próximos Pasos (Opcional)
 
 1. Añadir soporte para `IF NOT EXISTS` / `IF EXISTS` en CREATE/DROP.

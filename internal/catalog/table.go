@@ -3,8 +3,26 @@ package catalog
 import (
 	"dbf/internal/constants"
 	"fmt"
+	"strings"
 	"sync"
 )
+
+const compositeIndexSeparator = "\x1f"
+
+func normalizeIndexValue(value interface{}) string {
+	if value == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%v", value)
+}
+
+func makeCompositeIndexKey(values []interface{}) string {
+	parts := make([]string, len(values))
+	for i, v := range values {
+		parts[i] = normalizeIndexValue(v)
+	}
+	return strings.Join(parts, compositeIndexSeparator)
+}
 
 func (t *Table) Mu() *sync.RWMutex {
 	return &t.mu
@@ -23,6 +41,7 @@ func (t *Table) InsertRowUnsafe(values []interface{}) error {
 	}
 
 	t.Rows = append(t.Rows, values)
+	t.indexRowLocked(len(t.Rows) - 1)
 	return nil
 }
 
@@ -99,6 +118,115 @@ func (t *Table) insertRowWithValidation(values []interface{}, catalog *Catalog, 
 	}
 
 	t.Rows = append(t.Rows, values)
+	t.indexRowLocked(len(t.Rows) - 1)
+	return nil
+}
+
+func (t *Table) indexRowLocked(rowIdx int) {
+	if len(t.Indexes) == 0 || rowIdx < 0 || rowIdx >= len(t.Rows) {
+		return
+	}
+	row := t.Rows[rowIdx]
+	for _, idx := range t.Indexes {
+		if len(idx.ColumnNames) == 0 {
+			continue
+		}
+
+		vals := make([]interface{}, 0, len(idx.ColumnNames))
+		valid := true
+		for _, colName := range idx.ColumnNames {
+			colIdx := columnIndex(t.Columns, colName)
+			if colIdx == -1 || colIdx >= len(row) {
+				valid = false
+				break
+			}
+			vals = append(vals, row[colIdx])
+		}
+		if !valid {
+			continue
+		}
+
+		key := makeCompositeIndexKey(vals)
+		idx.Values[key] = append(idx.Values[key], rowIdx)
+	}
+}
+
+func (t *Table) rebuildIndexesLocked() {
+	if len(t.Indexes) == 0 {
+		return
+	}
+
+	for _, idx := range t.Indexes {
+		idx.Values = make(map[string][]int)
+	}
+
+	for rowIdx := range t.Rows {
+		t.indexRowLocked(rowIdx)
+	}
+}
+
+func (t *Table) RebuildIndexes() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.rebuildIndexesLocked()
+}
+
+func (t *Table) CreateIndex(name string, columnNames []string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if name == "" {
+		return fmt.Errorf("index name cannot be empty")
+	}
+	if len(columnNames) == 0 {
+		return fmt.Errorf("index must include at least one column")
+	}
+	if _, exists := t.Indexes[name]; exists {
+		return fmt.Errorf("index %s already exists", name)
+	}
+
+	seen := make(map[string]struct{}, len(columnNames))
+	for _, columnName := range columnNames {
+		if columnName == "" {
+			return fmt.Errorf("index column cannot be empty")
+		}
+		if _, ok := seen[columnName]; ok {
+			return fmt.Errorf("duplicate column %s in index definition", columnName)
+		}
+		seen[columnName] = struct{}{}
+		if columnIndex(t.Columns, columnName) == -1 {
+			return fmt.Errorf("column %s not found", columnName)
+		}
+	}
+
+	if t.Indexes == nil {
+		t.Indexes = make(map[string]*Index)
+	}
+
+	t.Indexes[name] = &Index{
+		Name:        name,
+		ColumnNames: append([]string(nil), columnNames...),
+		Values:      make(map[string][]int),
+	}
+	t.rebuildIndexesLocked()
+	return nil
+}
+
+func (t *Table) DropIndex(name string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if name == "" {
+		return fmt.Errorf("index name cannot be empty")
+	}
+	if t.Indexes == nil {
+		return fmt.Errorf("index %s does not exist", name)
+	}
+	if _, exists := t.Indexes[name]; !exists {
+		return fmt.Errorf("index %s does not exist", name)
+	}
+
+	delete(t.Indexes, name)
 	return nil
 }
 
@@ -125,6 +253,7 @@ func (t *Table) SetRows(rows [][]interface{}) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.Rows = rows
+	t.rebuildIndexesLocked()
 }
 
 func (t *Table) SelectWhere(colName string, value interface{}) ([][]interface{}, error) {
@@ -134,6 +263,35 @@ func (t *Table) SelectWhere(colName string, value interface{}) ([][]interface{},
 	colIdx := columnIndex(t.Columns, colName)
 	if colIdx == -1 {
 		return nil, fmt.Errorf("column %s not found", colName)
+	}
+
+	for _, idx := range t.Indexes {
+		if len(idx.ColumnNames) == 0 || idx.ColumnNames[0] != colName {
+			continue
+		}
+
+		var positions []int
+		if len(idx.ColumnNames) == 1 {
+			positions = idx.Values[normalizeIndexValue(value)]
+		} else {
+			prefix := normalizeIndexValue(value) + compositeIndexSeparator
+			for key, rows := range idx.Values {
+				if strings.HasPrefix(key, prefix) {
+					positions = append(positions, rows...)
+				}
+			}
+		}
+
+		result := make([][]interface{}, 0, len(positions))
+		for _, pos := range positions {
+			if pos < 0 || pos >= len(t.Rows) {
+				continue
+			}
+			rowCopy := make([]interface{}, len(t.Rows[pos]))
+			copy(rowCopy, t.Rows[pos])
+			result = append(result, rowCopy)
+		}
+		return result, nil
 	}
 
 	var result [][]interface{}
@@ -164,5 +322,6 @@ func (t *Table) DeleteWhere(colName string, value interface{}) error {
 		}
 	}
 	t.Rows = newRows
+	t.rebuildIndexesLocked()
 	return nil
 }

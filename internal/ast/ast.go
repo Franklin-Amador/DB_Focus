@@ -62,6 +62,39 @@ type CreateTable struct {
 
 func (CreateTable) stmtNode() {}
 
+type CreateIndex struct {
+	Name    Identifier
+	Table   Identifier
+	Columns []Identifier
+}
+
+func (CreateIndex) stmtNode() {}
+
+type CreateView struct {
+	Name        Identifier
+	ColumnNames []string // Optional: explicit column names for view
+	Query       *Select
+	Replace     bool
+	IfNotExists bool
+}
+
+func (CreateView) stmtNode() {}
+
+type DropView struct {
+	Name     Identifier
+	IfExists bool
+	Behavior string // "CASCADE", "RESTRICT", or "" (default)
+}
+
+func (DropView) stmtNode() {}
+
+type DropIndex struct {
+	Name  Identifier
+	Table Identifier
+}
+
+func (DropIndex) stmtNode() {}
+
 type CreateDatabase struct {
 	Name Identifier
 }
@@ -75,13 +108,17 @@ type CreateSchema struct {
 func (CreateSchema) stmtNode() {}
 
 type DropTable struct {
-	Table Identifier
+	Table    Identifier
+	IfExists bool
+	Behavior string // "CASCADE", "RESTRICT", or "" (default)
 }
 
 func (DropTable) stmtNode() {}
 
 type DropSchema struct {
-	Name string
+	Name     string
+	IfExists bool
+	Behavior string // "CASCADE", "RESTRICT", or "" (default)
 }
 
 func (DropSchema) stmtNode() {}

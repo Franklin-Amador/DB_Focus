@@ -130,6 +130,11 @@ func main() {
 		log.Printf("Response %d: type=%c payload_len=%d", i, msg.Type, len(msg.Payload))
 		if msg.Type == 'C' || msg.Type == 'I' {
 			log.Printf("  Command: %s", string(msg.Payload))
+			break
+		}
+		if msg.Type == 'E' {
+			log.Printf("  ErrorResponse: %s", string(msg.Payload))
+			break
 		}
 		if msg.Type == 'Z' {
 			break
@@ -146,12 +151,17 @@ func main() {
 		log.Fatalf("sync flush error: %v", err)
 	}
 
-	// Read ready
-	msg, err = readMessage(rw)
-	if err != nil {
-		log.Fatalf("read error: %v", err)
+	// Read until ReadyForQuery after Sync
+	for {
+		msg, err = readMessage(rw)
+		if err != nil {
+			log.Fatalf("read error: %v", err)
+		}
+		log.Printf("Post-Sync: type=%c payload_len=%d", msg.Type, len(msg.Payload))
+		if msg.Type == 'Z' {
+			break
+		}
 	}
-	log.Printf("Final: type=%c", msg.Type)
 
 	log.Println("Done!")
 }

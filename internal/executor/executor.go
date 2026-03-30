@@ -24,6 +24,7 @@ type Executor struct {
 	storage         storage.Backend
 	validator       *validator.Validator
 	triggersEnabled bool
+	triggerDepth    int
 }
 
 // New creates a new Executor instance
@@ -53,6 +54,14 @@ func (e *Executor) Execute(ctx context.Context, stmt ast.Statement) (*Result, er
 	// DDL statements
 	case *ast.CreateTable:
 		return e.executeCreateTable(ctx, s)
+	case *ast.CreateView:
+		return e.executeCreateView(ctx, s)
+	case *ast.CreateIndex:
+		return e.executeCreateIndex(ctx, s)
+	case *ast.DropIndex:
+		return e.executeDropIndex(ctx, s)
+	case *ast.DropView:
+		return e.executeDropView(ctx, s)
 	case *ast.DropTable:
 		return e.executeDropTable(ctx, s)
 	case *ast.AlterTable:

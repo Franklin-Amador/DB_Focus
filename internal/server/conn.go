@@ -62,14 +62,14 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Cat
 	}
 
 	// Authenticate (and validate database)
-	user, err := authenticate(rw, cat)
+	user, currentDatabase, err := authenticate(rw, cat)
 	if err != nil {
 		if !isExpectedConnError(err) {
 			log.Printf("[conn] authentication failed from %s: %v", remoteAddr, err)
 		}
 		return
 	}
-	log.Printf("[conn] authenticated from %s as user: %s", remoteAddr, user)
+	log.Printf("[conn] authenticated from %s as user: %s (db=%s)", remoteAddr, user, currentDatabase)
 
 	// Register user in catalog
 	if err := cat.RegisterUser(user, true); err != nil {
@@ -89,7 +89,7 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Cat
 
 		switch msgType {
 		case 'Q':
-			if err := handleSimpleQuery(rw, handler, cat, payload); err != nil {
+			if err := handleSimpleQuery(rw, handler, cat, payload, currentDatabase); err != nil {
 				log.Printf("[conn] query handler error: %v", err)
 				return
 			}
@@ -103,7 +103,7 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Cat
 		case 'D':
 			handleDescribe(rw, lastPrepared)
 		case 'E':
-			handleExecute(rw, handler, lastPrepared)
+			handleExecute(rw, handler, lastPrepared, currentDatabase)
 		case 'S':
 			if err := writeReady(rw); err != nil {
 				log.Printf("[msg S] writeReady error: %v", err)
@@ -128,7 +128,7 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Cat
 	}
 }
 
-func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat *catalog.Catalog, payload []byte) error {
+func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat *catalog.Catalog, payload []byte, currentDatabase string) error {
 	query := strings.TrimRight(string(payload), "\x00")
 
 	if strings.TrimSpace(query) == "" {
@@ -158,13 +158,13 @@ func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat *catalog.
 			continue
 		}
 
-		if sysResult, ok := cat.HandleSystemQuery(stmt); ok {
+		if sysResult, ok := cat.HandleSystemQueryForDatabase(stmt, currentDatabase); ok {
 			log.Printf("[msg Q] system query handled")
 			writeSystemResult(rw, sysResult)
 			continue
 		}
 
-		result, err := handler.Handle(stmt)
+		result, err := executeQuery(handler, stmt, currentDatabase)
 		if err != nil {
 			log.Printf("[msg Q] handler error: %v", err)
 			writeError(rw, err.Error())
@@ -258,7 +258,7 @@ func handleDescribe(rw *bufio.ReadWriter, lastPrepared string) {
 	rw.Flush()
 }
 
-func handleExecute(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared string) {
+func handleExecuteWithDatabase(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared string, currentDatabase string) {
 	log.Printf("[msg E] executing: %q", lastPrepared) // agrega esto
 
 	if lastPrepared == "" {
@@ -286,7 +286,7 @@ func handleExecute(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared stri
 	}
 
 	log.Printf("[msg E] calling handler.Handle()...")
-	result, err := handler.Handle(lastPrepared)
+	result, err := executeQuery(handler, lastPrepared, currentDatabase)
 	log.Printf("[msg E] handler.Handle() returned")
 	if err != nil {
 		log.Printf("[msg E] handler error: %v", err)
@@ -329,28 +329,44 @@ func handleExecute(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared stri
 	log.Printf("[msg E] flushed buffer")
 }
 
-func authenticate(rw *bufio.ReadWriter, cat *catalog.Catalog) (string, error) {
+func handleExecute(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared string, currentDatabase string) {
+	handleExecuteWithDatabase(rw, handler, lastPrepared, currentDatabase)
+}
+
+func executeQuery(handler QueryHandler, query string, currentDatabase string) (*QueryResult, error) {
+	if dbHandler, ok := handler.(DatabaseQueryHandler); ok {
+		return dbHandler.HandleWithDatabase(query, currentDatabase)
+	}
+	return handler.Handle(query)
+}
+
+func authenticate(rw *bufio.ReadWriter, cat *catalog.Catalog) (string, string, error) {
 	params, err := readStartup(rw)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	if err := writeAuthRequestCleartext(rw); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := rw.Flush(); err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	password, err := readPassword(rw)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	if password != "4444" {
 		writeError(rw, "invalid password")
 		rw.Flush()
-		return "", errors.New("invalid password")
+		return "", "", errors.New("invalid password")
+	}
+
+	currentDatabase := "postgres"
+	if database, ok := params["database"]; ok && database != "" {
+		currentDatabase = database
 	}
 
 	// Validate database if specified
@@ -359,13 +375,13 @@ func authenticate(rw *bufio.ReadWriter, cat *catalog.Catalog) (string, error) {
 			log.Printf("[conn] database %q does not exist", database)
 			writeError(rw, "database \""+database+"\" does not exist")
 			rw.Flush()
-			return "", errors.New("database does not exist")
+			return "", "", errors.New("database does not exist")
 		}
 		log.Printf("[conn] database %q validated", database)
 	}
 
 	if err := writeAuthOK(rw); err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	user := params["user"]
@@ -374,13 +390,13 @@ func authenticate(rw *bufio.ReadWriter, cat *catalog.Catalog) (string, error) {
 	}
 
 	if err := writeStartupResponse(rw, user); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := rw.Flush(); err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	return user, nil
+	return user, currentDatabase, nil
 }
 
 func writeStartupResponse(rw *bufio.ReadWriter, user string) error {

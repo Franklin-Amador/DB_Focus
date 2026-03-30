@@ -426,3 +426,398 @@ Phase 3: Testing DROP SCHEMA...
 - Constraint validation happens before catalog modification (fail-fast pattern)
 
 **Status**: ✅ COMPLETED - ALTER TABLE operations now properly validate constraints
+
+---
+
+### Session: March 29, 2026 - Trigger Recursion, Self-FK, and Wire Protocol Stability
+
+**Objective**: Add controlled trigger recursion, validate self-referential foreign keys, and fix extended protocol hangs in integration clients.
+
+**Status**: ✅ COMPLETED
+
+**Features Implemented**:
+1. ✅ **Controlled trigger recursion** with max depth guard
+2. ✅ **Self-referencing foreign key integration test** (`categorias.parent_id -> categorias.id`)
+3. ✅ **Extended protocol fix for `SELECT 1`** in test client flow
+4. ✅ **System query response synchronization fix** (removed duplicate `ReadyForQuery`)
+
+**Code Changes**:
+- **internal/executor/executor.go**:
+  - Added `triggerDepth int` field in `Executor`
+- **internal/executor/executor_trigger.go**:
+  - Added `maxTriggerRecursionDepth = 16`
+  - Enabled recursive trigger execution (removed temporary trigger disable during body execution)
+  - Added explicit recursion depth error message with context
+- **cmd/test-trigger-recursion/main.go**:
+  - Added integration scenario to verify recursive execution + recursion guard stop
+- **cmd/test-self-fk/main.go**:
+  - Added integration scenario for self-FK creation, valid parent-child insert, and orphan rejection
+- **cmd/test-client/main.go**:
+  - Fixed extended protocol read loop to stop on `CommandComplete/ErrorResponse`
+  - Ensured `Sync` is sent before waiting for `ReadyForQuery`
+- **internal/server/writers.go**:
+  - Removed duplicate `writeReady()` in `writeSystemResult()` to prevent protocol desynchronization
+- **cmd/test-information-schema/main.go**:
+  - Fixed result-set handling and scanning logic for robust validation of `information_schema`
+- **README.md**:
+  - Updated behavior notes and added regression command sets
+
+**Regression Results**:
+- ✅ `go run ./cmd/test-trigger-recursion`
+- ✅ `go run ./cmd/test-self-fk`
+- ✅ Retried previously failing client scenarios after server startup:
+  - `test-client`, `test-information-schema`, `test-multi-advanced`, `test-multi-client`, `test-persistence`, `test-simple-query`, `test-users`
+  - All passed with exit code `0`
+
+**Technical Notes**:
+- Trigger recursion is now supported but bounded for safety.
+- The current recursion ceiling is a constant (`16`), not yet runtime-configurable.
+- Self-FK insertion rules are enforced (orphan insert rejected).
+- The protocol fix addressed a real stream-order issue, not only test code behavior.
+
+**Known Remaining Limitations**:
+1. `OLD`/`NEW` row bindings in trigger body statements are still TODO.
+2. Trigger recursion limit is static (no config flag/env yet).
+3. Some `cmd/test-*` programs are stateful against persisted data directories and may require cleanup for fully idempotent reruns.
+
+**Status**: ✅ COMPLETED - System stable for recursive triggers, self-FK insertion validation, and extended protocol query flow
+
+---
+
+### Session: March 29, 2026 - Indexing Support and Persistence
+
+**Objective**: Add basic indexing support to improve equality-filter performance on large tables.
+
+**Status**: ✅ COMPLETED
+
+**Features Implemented**:
+1. ✅ **CREATE INDEX** parser/AST/executor support
+2. ✅ **Index-aware SELECT WHERE** path for equality filters
+3. ✅ **Index consistency maintenance** on INSERT/UPDATE/DELETE and ALTER TABLE rename/drop column
+4. ✅ **Index metadata persistence** across Pebble and JSON storage backends
+5. ✅ **Index integration test** with reload validation
+
+**Code Changes**:
+- **internal/ast/ast.go**: Added `CreateIndex` statement node
+- **internal/parser/token.go**: Added `TokenIndex` keyword support
+- **internal/parser/parser.go**: Added `parseCreateIndex()` and CREATE dispatcher integration
+- **internal/executor/executor.go**: Added `*ast.CreateIndex` dispatch
+- **internal/executor/executor_ddl.go**: Implemented `executeCreateIndex()` + persistence call
+- **internal/catalog/types.go**: Added `Index` type and `Table.Indexes` map
+- **internal/catalog/table.go**:
+  - Added index creation/rebuild helpers
+  - Added index lookup path in `SelectWhere()`
+  - Rebuild indexes after row replacement/deletion paths
+- **internal/catalog/catalog_tables.go**:
+  - Added `Catalog.CreateIndex()`
+  - Fixed `DropColumn()` row-removal index calculation bug
+  - Keep index metadata coherent on drop/rename column
+- **internal/storage/storage.go** + **internal/storage/pebble_storage.go**:
+  - Added index definition serialization/deserialization in `TableData`/`TableSchema`
+  - Reload index definitions on startup
+  - Keep persisted index metadata coherent in column rename/drop helpers
+- **cmd/test-index/main.go**: New end-to-end index behavior + persistence test
+- **internal/parser/parser_test.go**: Added `TestCreateIndex`
+
+**Regression Results**:
+- ✅ `go test -vet=off ./internal/...`
+- ✅ `go test -vet=off ./...`
+- ✅ `go run ./cmd/test-index`
+- ✅ `go run ./cmd/test-alter`
+- ✅ `go run ./cmd/test-persistence-integration`
+- ✅ `go run ./cmd/test-trigger-recursion`
+- ✅ `go run ./cmd/test-self-fk`
+
+**Technical Notes**:
+- Current index implementation is single-column and optimized for equality predicates (`col = value`).
+- Index values are rebuilt when row positions can shift (e.g., delete/update bulk effects).
+- Persisted index definitions are reconstructed at load time, then populated from rows.
+
+**Known Limits**:
+1. No composite indexes yet.
+2. No range-scan index optimization (`>`, `<`, `BETWEEN`) yet.
+3. No `DROP INDEX` syntax yet.
+
+**Status**: ✅ COMPLETED - Basic index lifecycle is supported with persistence and regression coverage.
+
+---
+
+### Session: March 30, 2026 - View Features: Explicit Column List and CASCADE/RESTRICT
+
+**Objective**: Extend view functionality with explicit column renaming and PostgreSQL-standard dependency handling.
+
+**Status**: ✅ COMPLETED
+
+**Features Implemented**:
+1. ✅ **CREATE VIEW with explicit column list** - Rename output columns without SELECT aliases
+2. ✅ **CREATE OR REPLACE VIEW with explicit column list** - Maintain columns on replacement
+3. ✅ **DROP VIEW CASCADE** - Delete view + all dependent views atomically
+4. ✅ **DROP VIEW RESTRICT** (default) - Prevent drop if other views depend on it
+5. ✅ **Dependency tracking and validation** - Multi-level view chain support
+
+**Code Changes**:
+- **internal/ast/ast.go**:
+  - Added ColumnNames []string field to CreateView struct
+  - Added Behavior string field to DropView struct ("CASCADE", "RESTRICT", or "")
+
+- **internal/parser/token.go**:
+  - Added TokenCascade keyword token
+  - Added TokenRestrict keyword token
+
+- **internal/parser/parser.go**:
+  - Extended parseCreateView() to parse optional (col1, col2, ...) syntax with validation
+  - Extended parseDropView() to parse CASCADE/RESTRICT modifiers
+  - Added column list validation: parenthesis matching, non-empty identifiers, no trailing commas, uniqueness check
+
+- **internal/catalog/views.go**:
+  - Added FindDependentViews(viewName, schema string) []string - detects views that depend on given view
+  - Added DropViewWithBehavior(name, behavior, schema) error - handles RESTRICT/CASCADE logic
+  - Supports multi-level dependency chains (v1 -> v2 -> v3)
+
+- **internal/executor/executor_ddl.go**:
+  - Enhanced executeCreateView():
+    - Validates explicit column list count matches SELECT result columns
+    - Detects duplicate column names (case-insensitive)
+    - Stores explicit names in View.Columns for projection
+    - Persists to storage
+  - Enhanced executeDropView():
+    - Calls FindDependentViews() to detect dependencies
+    - Calls DropViewWithBehavior() with CASCADE/RESTRICT behavior
+    - ON CASCADE: Deletes dependent views from catalog and storage
+    - ON RESTRICT + dependencies: Returns error with clear dependency list messaging
+
+- **internal/executor/executor_select.go**:
+  - Fixed view column resolution: Changed from recreating columns from query results to using `view.Columns` directly
+  - Enables explicit column names to appear in SELECT output
+
+- **internal/parser/parser_test.go**:
+  - Added TestCreateViewWithColumnList() - Verify parsing of column list syntax
+  - Added TestCreateViewWithColumnListAndReplace() - Verify OR REPLACE with columns
+  - Added TestDropViewCascade() - Verify CASCADE keyword parsing
+  - Added TestDropViewRestrict() - Verify RESTRICT keyword parsing
+  - Added TestDropViewIfExistsCascade() - Verify IF EXISTS with CASCADE
+
+- **cmd/test-views-columnlist/main.go**:
+  - 8-phase integration test validating explicit column list feature
+  - Tests: create table, insert rows, CREATE VIEW with column names, multirow results, column count validation, duplicate detection, CREATE OR REPLACE, persistence
+
+- **cmd/test-views-cascade/main.go**:
+  - 9-phase integration test validating CASCADE/RESTRICT feature
+  - Tests: view hierarchy creation, RESTRICT rejection, CASCADE success, dependent view verification, IF EXISTS CASCADE, default behavior tests
+
+**Test Results**: ✅ All tests passing
+- Parser tests: 5 new tests (2 column list, 3 cascade/restrict)
+  - `go test -v ./internal/parser -run TestCreateView` → 3 tests pass
+  - `go test -v ./internal/parser -run TestDropView` → 5 tests pass
+- Integration test-views-columnlist: 8/8 phases ✅
+- Integration test-views-cascade: 9/9 phases ✅
+- E2E psql validation: All syntaxes confirmed working
+- Zero regressions: All existing tests passing
+
+**E2E Wire Protocol Validation**:
+- ✅ CREATE VIEW v (col1, col2, col3) AS SELECT ... syntax
+- ✅ \dv shows column names in view definition
+- ✅ Column count mismatch properly rejected
+- ✅ DROP VIEW CASCADE removes dependent views
+- ✅ DROP VIEW RESTRICT shows dependency list in error message
+
+**Technical Implementation Notes**:
+- View columns stored directly in catalog, not derived from query results
+- Dependency detection scans all schemas for views with matching references
+- CASCADE deletion removes views from both catalog maps and Pebble storage
+- Column validation: count matching + uniqueness (case-insensitive)
+- RESTRICT is default behavior when no modifier specified
+
+**Known Limitations**:
+1. No ALTER VIEW ... RENAME support yet
+2. No CREATE VIEW IF NOT EXISTS yet (only CREATE OR REPLACE)
+3. No materialized views (MATERIALIZED VIEW, REFRESH)
+4. No view-level permissions/security policies
+5. No system catalog views (pg_views, view_definitions)
+
+**Status**: ✅ COMPLETED - Full view lifecycle support with explicit columns and dependency management
+
+---
+
+### Session: March 30, 2026 - DROP INDEX (Priority 1)
+
+**Objective**: Implement the missing DROP INDEX operation to complete index lifecycle support.
+
+**Status**: ✅ COMPLETED
+
+**Features Implemented**:
+1. ✅ **DROP INDEX parser support** - Added syntax `DROP INDEX index_name ON [schema.]table`
+2. ✅ **Catalog/Table index removal** - Index metadata can be removed safely from table definitions
+3. ✅ **Executor support with persistence** - DROP INDEX updates in-memory catalog and persists table metadata
+4. ✅ **Parser tests and integration test** - Added validation coverage for syntax and persistence behavior
+
+**Code Changes**:
+- **internal/ast/ast.go**:
+  - Added `DropIndex` statement node with `Name` and `Table`
+
+- **internal/parser/parser.go**:
+  - Added DROP dispatcher support for `INDEX`
+  - Implemented `parseDropIndex()` for `DROP INDEX idx ON table`
+  - Updated DROP error message to include INDEX
+
+- **internal/catalog/table.go**:
+  - Added `DropIndex(name string) error`
+
+- **internal/catalog/catalog_tables.go**:
+  - Added `Catalog.DropIndex(tableName, indexName, schema...)`
+
+- **internal/executor/executor.go**:
+  - Added `*ast.DropIndex` dispatch case
+
+- **internal/executor/executor_ddl.go**:
+  - Implemented `executeDropIndex()`
+  - Persists table metadata via `SaveTableWithSchema()` after drop
+
+- **internal/constants/constants.go**:
+  - Added result tag `ResultDropIndex = "DROP INDEX"`
+
+- **internal/parser/parser_test.go**:
+  - Added `TestDropIndex()`
+  - Added `TestDropIndexQualifiedTable()`
+
+- **cmd/test-drop-index/main.go**:
+  - Added end-to-end integration test for create/drop/reload behavior of indexes
+
+- **README.md**:
+  - Added syntax line: `DROP INDEX indice ON tabla`
+  - Added note explaining DROP INDEX persistence behavior
+
+**Status**: ✅ COMPLETED - Index lifecycle now supports both CREATE INDEX and DROP INDEX with persistence
+
+---
+
+### Session: March 30, 2026 - DROP TABLE CASCADE/RESTRICT (Priority 2)
+
+**Objective**: Extend DROP TABLE with dependency-aware behavior (`RESTRICT` default and `CASCADE`) plus idempotent `IF EXISTS`.
+
+**Status**: ✅ COMPLETED
+
+**Features Implemented**:
+1. ✅ **DROP TABLE parser support** for `IF EXISTS`, `CASCADE`, and `RESTRICT`
+2. ✅ **RESTRICT mode (default)** blocks drop when FK or view dependencies exist
+3. ✅ **CASCADE mode** cleans FK dependencies and drops dependent views before dropping table
+4. ✅ **IF EXISTS mode** returns success when target table does not exist
+
+**Code Changes**:
+- **internal/ast/ast.go**:
+  - Extended `DropTable` with `IfExists bool` and `Behavior string`
+
+- **internal/parser/parser.go**:
+  - Extended `parseDropTable()` to handle `DROP TABLE IF EXISTS ... [CASCADE|RESTRICT]`
+
+- **internal/catalog/catalog_tables.go**:
+  - Added `FindForeignKeyDependents(schema, tableName) []string`
+  - Added `RemoveForeignKeyReferencesToTable(schema, tableName) ([]string, error)`
+
+- **internal/catalog/views.go**:
+  - Added `FindViewsUsingSource(sourceName, schema) []string` for DROP TABLE dependency checks
+
+- **internal/executor/executor_ddl.go**:
+  - Enhanced `executeDropTable()` with:
+    - RESTRICT dependency checks
+    - CASCADE cleanup of FK constraints + dependent views
+    - IF EXISTS idempotence handling
+    - Storage persistence of modified dependent tables/views
+
+- **internal/parser/parser_test.go**:
+  - Added `TestDropTableCascade()`
+  - Added `TestDropTableIfExistsRestrict()`
+
+- **cmd/test-drop-table-fk/main.go**:
+  - Extended integration test to validate:
+    - RESTRICT failure on FK dependency
+    - CASCADE success and FK cleanup on child table constraints
+
+- **README.md**:
+  - Added syntax: `DROP TABLE [IF EXISTS] tabla [CASCADE | RESTRICT]`
+  - Added behavior notes and examples
+
+**Status**: ✅ COMPLETED - DROP TABLE now supports dependency-aware lifecycle management with RESTRICT/CASCADE
+
+---
+
+### Session: March 30, 2026 - DROP SCHEMA CASCADE/RESTRICT (Priority 3)
+
+**Objective**: Extend DROP SCHEMA with `RESTRICT`/`CASCADE` behavior and idempotent `IF EXISTS`.
+
+**Status**: ✅ COMPLETED
+
+**Features Implemented**:
+1. ✅ **DROP SCHEMA parser support** for `IF EXISTS`, `CASCADE`, and `RESTRICT`
+2. ✅ **RESTRICT mode (default)** blocks schema drop when schema is not empty
+3. ✅ **CASCADE mode** drops non-empty schemas (tables/views) safely
+4. ✅ **IF EXISTS mode** allows idempotent schema drops
+
+**Code Changes**:
+- **internal/ast/ast.go**:
+  - Extended `DropSchema` with `IfExists bool` and `Behavior string`
+
+- **internal/parser/parser.go**:
+  - Extended `parseDropSchema()` to support `DROP SCHEMA IF EXISTS ... [CASCADE|RESTRICT]`
+
+- **internal/catalog/catalog_tables.go**:
+  - Added `SchemaIsEmpty(name) (bool, error)` helper for RESTRICT semantics
+
+- **internal/executor/executor_ddl.go**:
+  - Enhanced `executeDropSchema()` with:
+    - default `RESTRICT` behavior
+    - explicit CASCADE handling
+    - IF EXISTS idempotence
+
+- **internal/parser/parser_test.go**:
+  - Added `TestDropSchemaCascade()`
+  - Added `TestDropSchemaIfExistsRestrict()`
+
+- **cmd/test-drop-schema/main.go**:
+  - Added integration test for:
+    - RESTRICT failure on non-empty schema
+    - CASCADE success on non-empty schema
+    - IF EXISTS idempotent behavior
+
+- **README.md**:
+  - Added syntax and examples for `DROP SCHEMA [IF EXISTS] ... [CASCADE|RESTRICT]`
+
+**Status**: ✅ COMPLETED - DROP SCHEMA now supports explicit lifecycle behavior with RESTRICT/CASCADE
+
+---
+
+### Session: March 30, 2026 - CREATE VIEW IF NOT EXISTS (Priority 4)
+
+**Objective**: Add idempotent view creation support with `CREATE VIEW IF NOT EXISTS`.
+
+**Status**: ✅ COMPLETED
+
+**Features Implemented**:
+1. ✅ **Parser support** for `CREATE VIEW IF NOT EXISTS`
+2. ✅ **Executor idempotence**: returns success when view already exists
+3. ✅ **Validation rule**: rejects invalid `CREATE OR REPLACE VIEW IF NOT EXISTS`
+4. ✅ **Parser + integration tests** for creation and idempotent behavior
+
+**Code Changes**:
+- **internal/ast/ast.go**:
+  - Extended `CreateView` with `IfNotExists bool`
+
+- **internal/parser/parser.go**:
+  - Extended `parseCreateView()` to parse `IF NOT EXISTS`
+  - Added guard: `CREATE OR REPLACE VIEW` cannot be combined with `IF NOT EXISTS`
+
+- **internal/executor/executor_ddl.go**:
+  - Enhanced `executeCreateView()` to return success when target view already exists and `IfNotExists` is set
+
+- **internal/parser/parser_test.go**:
+  - Added `TestCreateViewIfNotExists()`
+
+- **cmd/test-view-if-not-exists/main.go**:
+  - Added integration test validating:
+    - no-error behavior when view exists
+    - successful creation when view does not exist
+
+- **README.md**:
+  - Added syntax and examples for `CREATE VIEW IF NOT EXISTS`
+
+**Status**: ✅ COMPLETED - View creation now supports idempotent `IF NOT EXISTS` behavior

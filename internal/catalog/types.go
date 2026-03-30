@@ -20,12 +20,25 @@ type Constraint struct {
 	ReferencedCol   string
 }
 
+type Index struct {
+	Name        string
+	ColumnNames []string
+	Values      map[string][]int
+}
+
 type Table struct {
 	Name        string
 	Columns     []Column
 	Constraints []Constraint
+	Indexes     map[string]*Index
 	Rows        [][]interface{}
 	mu          sync.RWMutex
+}
+
+type View struct {
+	Name    string
+	Columns []Column
+	Query   *ast.Select
 }
 
 type Procedure struct {
@@ -56,6 +69,7 @@ type Job struct {
 
 type Catalog struct {
 	tables     map[string]map[string]*Table // schema -> table -> *Table
+	views      map[string]map[string]*View  // schema -> view -> *View
 	procedures map[string]*Procedure
 	triggers   map[string][]*Trigger // key: table name, value: triggers for that table
 	jobs       map[string]*Job

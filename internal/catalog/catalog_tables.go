@@ -31,6 +31,7 @@ func (c *Catalog) CreateTable(name string, columns []Column, constraints []Const
 		Name:        tableName,
 		Columns:     columns,
 		Constraints: constraints,
+		Indexes:     make(map[string]*Index),
 		Rows:        [][]interface{}{},
 	}
 	return nil
@@ -112,6 +113,7 @@ func (c *Catalog) CreateSchema(name string) error {
 		return fmt.Errorf("schema %s already exists", name)
 	}
 	c.tables[name] = make(map[string]*Table)
+	c.views[name] = make(map[string]*View)
 	return nil
 }
 
@@ -127,7 +129,22 @@ func (c *Catalog) DropSchema(name string) error {
 		return fmt.Errorf("schema %s does not exist", name)
 	}
 	delete(c.tables, name)
+	delete(c.views, name)
 	return nil
+}
+
+// SchemaIsEmpty reports whether a schema has no tables and no views.
+func (c *Catalog) SchemaIsEmpty(name string) (bool, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	tablesInSchema, ok := c.tables[name]
+	if !ok {
+		return false, fmt.Errorf("schema %s does not exist", name)
+	}
+	viewsInSchema := c.views[name]
+
+	return len(tablesInSchema) == 0 && len(viewsInSchema) == 0, nil
 }
 
 func (c *Catalog) GetConstraint(constraintType, tableName, colName string, schemaOpt ...string) *Constraint {
@@ -223,6 +240,69 @@ func (c *Catalog) HasForeignKeyDependents(schema, tableName string) (bool, strin
 	return false, ""
 }
 
+// FindForeignKeyDependents returns qualified table names that reference schema.tableName.
+func (c *Catalog) FindForeignKeyDependents(schema, tableName string) []string {
+	allTables := c.GetAllTables()
+	targetQualified := schema + "." + tableName
+	dependents := make([]string, 0)
+
+	for srcQualified, table := range allTables {
+		if srcQualified == targetQualified {
+			continue
+		}
+		for _, constraint := range table.Constraints {
+			if constraint.Type != constants.ConstraintForeignKey {
+				continue
+			}
+			ref := constraint.ReferencedTable
+			if ref == tableName || ref == targetQualified {
+				dependents = append(dependents, srcQualified)
+				break
+			}
+		}
+	}
+
+	return dependents
+}
+
+// RemoveForeignKeyReferencesToTable removes FK constraints from other tables that reference schema.tableName.
+// Returns the qualified names of tables modified.
+func (c *Catalog) RemoveForeignKeyReferencesToTable(schema, tableName string) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	targetQualified := schema + "." + tableName
+	updated := make([]string, 0)
+
+	for srcSchema, tablesInSchema := range c.tables {
+		for srcName, table := range tablesInSchema {
+			if srcSchema == schema && srcName == tableName {
+				continue
+			}
+
+			newConstraints := make([]Constraint, 0, len(table.Constraints))
+			removed := false
+			for _, constraint := range table.Constraints {
+				if constraint.Type == constants.ConstraintForeignKey {
+					ref := constraint.ReferencedTable
+					if ref == tableName || ref == targetQualified {
+						removed = true
+						continue
+					}
+				}
+				newConstraints = append(newConstraints, constraint)
+			}
+
+			if removed {
+				table.Constraints = newConstraints
+				updated = append(updated, srcSchema+"."+srcName)
+			}
+		}
+	}
+
+	return updated, nil
+}
+
 // checkColumnForeignKeyReferences verifies if a column is referenced by any foreign key
 func (c *Catalog) checkColumnForeignKeyReferences(tableName, columnName, schema string) error {
 	allTables := c.GetAllTables()
@@ -314,6 +394,40 @@ func (c *Catalog) AddColumnWithConstraint(tableName string, column *Column, cons
 	return nil
 }
 
+func (c *Catalog) CreateIndex(tableName string, indexName string, columnNames []string, schemaOpt ...string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	schema := "public"
+	if len(schemaOpt) > 0 && schemaOpt[0] != "" {
+		schema = schemaOpt[0]
+	}
+
+	table, err := c.getTableUnlocked(tableName, schema)
+	if err != nil {
+		return err
+	}
+
+	return table.CreateIndex(indexName, columnNames)
+}
+
+func (c *Catalog) DropIndex(tableName string, indexName string, schemaOpt ...string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	schema := "public"
+	if len(schemaOpt) > 0 && schemaOpt[0] != "" {
+		schema = schemaOpt[0]
+	}
+
+	table, err := c.getTableUnlocked(tableName, schema)
+	if err != nil {
+		return err
+	}
+
+	return table.DropIndex(indexName)
+}
+
 // DropColumn removes a column from an existing table
 func (c *Catalog) DropColumn(tableName string, columnName string, schemaOpt ...string) error {
 	schema := "public"
@@ -335,35 +449,7 @@ func (c *Catalog) DropColumn(tableName string, columnName string, schemaOpt ...s
 		return err
 	}
 
-	// Check if column is a primary key
-	for _, constraint := range table.Constraints {
-		if constraint.Type == constants.ConstraintPrimaryKey && constraint.ColumnName == columnName {
-			return fmt.Errorf("cannot drop column %s: it is a primary key", columnName)
-		}
-	}
-
-	// Find and remove column
-	found := false
-	newColumns := make([]Column, 0, len(table.Columns))
-	for _, col := range table.Columns {
-		if col.Name == columnName {
-			found = true
-		} else {
-			newColumns = append(newColumns, col)
-		}
-	}
-
-	if !found {
-		return fmt.Errorf("column %s does not exist in table %s.%s", columnName, schema, tableName)
-	}
-
-	table.Columns = newColumns
-
-	// Also remove the column data from all rows
-	table.Mu().Lock()
-	defer table.Mu().Unlock()
-
-	// Find column index to remove
+	// Find column index before mutating schema.
 	colIdx := -1
 	for i, col := range table.Columns {
 		if col.Name == columnName {
@@ -371,15 +457,46 @@ func (c *Catalog) DropColumn(tableName string, columnName string, schemaOpt ...s
 			break
 		}
 	}
+	if colIdx == -1 {
+		return fmt.Errorf("column %s does not exist in table %s.%s", columnName, schema, tableName)
+	}
 
-	// Remove column from each row if found
-	if colIdx >= 0 && colIdx < len(table.Columns) {
-		for i := range table.Rows {
-			if colIdx < len(table.Rows[i]) {
-				table.Rows[i] = append(table.Rows[i][:colIdx], table.Rows[i][colIdx+1:]...)
+	// Check if column is a primary key
+	for _, constraint := range table.Constraints {
+		if constraint.Type == constants.ConstraintPrimaryKey && constraint.ColumnName == columnName {
+			return fmt.Errorf("cannot drop column %s: it is a primary key", columnName)
+		}
+	}
+
+	newColumns := make([]Column, 0, len(table.Columns))
+	for _, col := range table.Columns {
+		if col.Name != columnName {
+			newColumns = append(newColumns, col)
+		}
+	}
+
+	table.Columns = newColumns
+
+	// Remove indexes defined over the dropped column.
+	for name, idx := range table.Indexes {
+		for _, idxCol := range idx.ColumnNames {
+			if idxCol == columnName {
+				delete(table.Indexes, name)
+				break
 			}
 		}
 	}
+
+	// Also remove the column data from all rows
+	table.Mu().Lock()
+	defer table.Mu().Unlock()
+
+	for i := range table.Rows {
+		if colIdx < len(table.Rows[i]) {
+			table.Rows[i] = append(table.Rows[i][:colIdx], table.Rows[i][colIdx+1:]...)
+		}
+	}
+	table.rebuildIndexesLocked()
 
 	return nil
 }
@@ -452,6 +569,15 @@ func (c *Catalog) RenameColumn(tableName string, oldName string, newName string,
 		return fmt.Errorf("column %s does not exist in table %s.%s", oldName, schema, tableName)
 	}
 
+	for _, idx := range table.Indexes {
+		for i := range idx.ColumnNames {
+			if idx.ColumnNames[i] == oldName {
+				idx.ColumnNames[i] = newName
+			}
+		}
+	}
+	table.RebuildIndexes()
+
 	return nil
 }
 
@@ -459,6 +585,20 @@ func (c *Catalog) RenameColumn(tableName string, oldName string, newName string,
 func (c *Catalog) DatabaseExists(name string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
+	if name == "" {
+		return false
+	}
+	if name == "postgres" {
+		return true
+	}
+
+	// In FocusDB, non-system schemas represent database namespaces.
+	if _, exists := c.tables[name]; exists {
+		if name != "pg_catalog" && name != "information_schema" && name != "pg_toast" {
+			return true
+		}
+	}
 
 	// Get pg_database table
 	pgDatabase, exists := c.tables["pg_catalog"]["pg_database"]

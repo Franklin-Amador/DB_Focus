@@ -69,6 +69,50 @@ func (ps *PebbleStorage) DeleteProcedure(name string) error {
 	return nil
 }
 
+func (ps *PebbleStorage) SaveView(view *catalog.View, schema string) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if schema == "" {
+		schema = "public"
+	}
+
+	buf := gobBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer gobBufPool.Put(buf)
+
+	enc := gob.NewEncoder(buf)
+	vd := ViewData{Name: view.Name, Schema: schema, Query: view.Query}
+	vd.Columns = make([]ColumnData, len(view.Columns))
+	for i, col := range view.Columns {
+		vd.Columns[i] = ColumnData{Name: col.Name, Type: col.Type, NotNull: col.NotNull, Identity: col.Identity, IdentityValue: col.IdentityValue}
+	}
+	if err := enc.Encode(vd); err != nil {
+		return fmt.Errorf("failed to encode view %s.%s: %w", schema, view.Name, err)
+	}
+
+	key := []byte("view:" + schema + ":" + view.Name)
+	if err := ps.db.Set(key, buf.Bytes(), ps.wal); err != nil {
+		return fmt.Errorf("failed to save view %s.%s: %w", schema, view.Name, err)
+	}
+	return nil
+}
+
+func (ps *PebbleStorage) DeleteView(name string, schema string) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if schema == "" {
+		schema = "public"
+	}
+
+	key := []byte("view:" + schema + ":" + name)
+	if err := ps.db.Delete(key, ps.wal); err != nil && err != pebble.ErrNotFound {
+		return fmt.Errorf("failed to delete view %s.%s: %w", schema, name, err)
+	}
+	return nil
+}
+
 func (ps *PebbleStorage) SaveTrigger(trigger *catalog.Trigger) error {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -155,12 +199,20 @@ type TableSchema struct {
 	Name        string           `json:"name"`
 	Columns     []ColumnData     `json:"columns"`
 	Constraints []ConstraintData `json:"constraints"`
+	Indexes     []IndexData      `json:"indexes,omitempty"`
 }
 
 type ProcedureData struct {
 	Name       string
 	Parameters []ast.Parameter
 	Body       []ast.Statement
+}
+
+type ViewData struct {
+	Name    string
+	Schema  string
+	Columns []ColumnData
+	Query   *ast.Select
 }
 
 type TriggerData struct {
@@ -189,6 +241,8 @@ func registerGobTypes() {
 	gob.Register(&ast.Set{})
 	gob.Register(&ast.CallProcedure{})
 	gob.Register(&ast.CreateTable{})
+	gob.Register(&ast.CreateView{})
+	gob.Register(&ast.CreateIndex{})
 	gob.Register(&ast.CreateSchema{})
 	gob.Register(&ast.CreateDatabase{})
 	gob.Register(&ast.DropTable{})
@@ -340,6 +394,7 @@ func (ps *PebbleStorage) saveTableWithSchema(table *catalog.Table, schema string
 			Name:        table.Name,
 			Columns:     convertColumns(table.Columns),
 			Constraints: convertConstraints(table.Constraints),
+			Indexes:     convertIndexes(table.Indexes),
 			Rows:        rows,
 		})
 	})
@@ -360,6 +415,7 @@ func (ps *PebbleStorage) saveTableWithSchema(table *catalog.Table, schema string
 		Name:        table.Name,
 		Columns:     convertColumns(table.Columns),
 		Constraints: convertConstraints(table.Constraints),
+		Indexes:     convertIndexes(table.Indexes),
 	}
 
 	// Persist metadata
@@ -427,6 +483,12 @@ func (ps *PebbleStorage) loadTableInternal(cat *catalog.Catalog, name string, sc
 
 	// Load rows
 	if table, err := cat.GetTable(td.Name, schema); err == nil {
+		for _, idx := range td.Indexes {
+			if err := table.CreateIndex(idx.Name, indexColumnsFromData(idx)); err != nil {
+				return fmt.Errorf("failed to create index %s on table %s.%s: %w", idx.Name, schema, td.Name, err)
+			}
+		}
+
 		// Assign decoded rows directly instead of inserting one-by-one.
 		// InsertRowUnsafe would repeatedly append, causing multiple backing-array
 		// reallocations. SetRows reuses the slice JSON already allocated.
@@ -513,6 +575,21 @@ func (ps *PebbleStorage) LoadAll(cat *catalog.Catalog) error {
 			if err := cat.LoadJob(jd.Name, jd.Interval, jd.Unit, jd.Body, jd.Enabled); err != nil {
 				log.Printf("[storage] warning: failed to load job %s: %v", jd.Name, err)
 			}
+		} else if strings.HasPrefix(key, "view:") {
+			val := append([]byte(nil), iter.Value()...)
+			var vd ViewData
+			dec := gob.NewDecoder(bytes.NewReader(val))
+			if err := dec.Decode(&vd); err != nil {
+				log.Printf("[storage] warning: failed to decode view %s: %v", strings.TrimPrefix(key, "view:"), err)
+				continue
+			}
+			cols := make([]catalog.Column, len(vd.Columns))
+			for i, col := range vd.Columns {
+				cols[i] = catalog.Column{Name: col.Name, Type: col.Type, NotNull: col.NotNull, Identity: col.Identity, IdentityValue: col.IdentityValue}
+			}
+			if err := cat.LoadView(vd.Name, cols, vd.Query, vd.Schema); err != nil {
+				log.Printf("[storage] warning: failed to load view %s.%s: %v", vd.Schema, vd.Name, err)
+			}
 		}
 	}
 
@@ -591,6 +668,20 @@ func convertConstraints(constraints []catalog.Constraint) []ConstraintData {
 	return result
 }
 
+func convertIndexes(indexes map[string]*catalog.Index) []IndexData {
+	if len(indexes) == 0 {
+		return nil
+	}
+	result := make([]IndexData, 0, len(indexes))
+	for _, idx := range indexes {
+		result = append(result, IndexData{
+			Name:        idx.Name,
+			ColumnNames: append([]string(nil), idx.ColumnNames...),
+		})
+	}
+	return result
+}
+
 // DropColumnData removes a column from all rows in a table
 func (ps *PebbleStorage) DropColumnData(tableName string, columnName string, schema string) error {
 	ps.mu.Lock()
@@ -637,6 +728,25 @@ func (ps *PebbleStorage) DropColumnData(tableName string, columnName string, sch
 	}
 	tableData.Columns = newColumns
 
+	// Remove indexes that target dropped column.
+	if len(tableData.Indexes) > 0 {
+		newIndexes := make([]IndexData, 0, len(tableData.Indexes))
+		for _, idx := range tableData.Indexes {
+			idxCols := indexColumnsFromData(idx)
+			drop := false
+			for _, c := range idxCols {
+				if c == columnName {
+					drop = true
+					break
+				}
+			}
+			if !drop {
+				newIndexes = append(newIndexes, idx)
+			}
+		}
+		tableData.Indexes = newIndexes
+	}
+
 	// Remove column data from each row
 	for i := range tableData.Rows {
 		if colIdx < len(tableData.Rows[i]) {
@@ -658,6 +768,23 @@ func (ps *PebbleStorage) DropColumnData(tableName string, columnName string, sch
 	if schemaMap, ok := ps.meta.Tables[schema]; ok {
 		if _, ok := schemaMap[tableName]; ok {
 			ps.meta.Tables[schema][tableName].Columns = newColumns
+			if len(ps.meta.Tables[schema][tableName].Indexes) > 0 {
+				newIndexes := make([]IndexData, 0, len(ps.meta.Tables[schema][tableName].Indexes))
+				for _, idx := range ps.meta.Tables[schema][tableName].Indexes {
+					idxCols := indexColumnsFromData(idx)
+					drop := false
+					for _, c := range idxCols {
+						if c == columnName {
+							drop = true
+							break
+						}
+					}
+					if !drop {
+						newIndexes = append(newIndexes, idx)
+					}
+				}
+				ps.meta.Tables[schema][tableName].Indexes = newIndexes
+			}
 			return ps.saveMetadata()
 		}
 	}
@@ -704,6 +831,17 @@ func (ps *PebbleStorage) RenameColumnData(tableName string, oldName string, newN
 		return nil // Column not found, nothing to do
 	}
 
+	for i := range tableData.Indexes {
+		cols := indexColumnsFromData(tableData.Indexes[i])
+		for j := range cols {
+			if cols[j] == oldName {
+				cols[j] = newName
+			}
+		}
+		tableData.Indexes[i].ColumnNames = cols
+		tableData.Indexes[i].ColumnName = ""
+	}
+
 	// Save updated table (rows don't need to change, only schema)
 	data, err := json.Marshal(tableData)
 	if err != nil {
@@ -722,6 +860,16 @@ func (ps *PebbleStorage) RenameColumnData(tableName string, oldName string, newN
 					ps.meta.Tables[schema][tableName].Columns[i].Name = newName
 					break
 				}
+			}
+			for i := range ps.meta.Tables[schema][tableName].Indexes {
+				cols := indexColumnsFromData(ps.meta.Tables[schema][tableName].Indexes[i])
+				for j := range cols {
+					if cols[j] == oldName {
+						cols[j] = newName
+					}
+				}
+				ps.meta.Tables[schema][tableName].Indexes[i].ColumnNames = cols
+				ps.meta.Tables[schema][tableName].Indexes[i].ColumnName = ""
 			}
 			return ps.saveMetadata()
 		}

@@ -403,6 +403,7 @@ package catalog
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -415,10 +416,17 @@ type SystemResult struct {
 
 // HandleSystemQuery intercepts system catalog queries — generated from real PostgreSQL 17 responses
 func (c *Catalog) HandleSystemQuery(query string) (*SystemResult, bool) {
+	return c.HandleSystemQueryForDatabase(query, "postgres")
+}
+
+func (c *Catalog) HandleSystemQueryForDatabase(query string, currentDatabase string) (*SystemResult, bool) {
+	if currentDatabase == "" {
+		currentDatabase = "postgres"
+	}
 	upper := strings.ToUpper(strings.TrimSpace(query))
 	switch {
 	case strings.Contains(upper, "CURRENT_SCHEMA()"):
-		return c.getCurrentSchema(), true
+		return c.getCurrentSchema(currentDatabase), true
 
 	case strings.Contains(upper, "SHOW SEARCH_PATH"):
 		return c.getSearchPath(), true
@@ -432,20 +440,24 @@ func (c *Catalog) HandleSystemQuery(query string) (*SystemResult, bool) {
 	case strings.Contains(upper, "PG_GET_KEYWORDS"):
 		return c.getPgKeywords(), true
 
-	case strings.Contains(upper, "PG_CATALOG.PG_DATABASE"):
+	case strings.Contains(upper, "PG_CATALOG.PG_DATABASE") || strings.Contains(upper, "FROM PG_DATABASE"):
 		return c.getPgDatabase(), true
 
 	case strings.Contains(upper, "PG_CATALOG.PG_SETTINGS"):
 		return c.getPgSettings(), true
 
-	case strings.Contains(upper, "PG_CATALOG.PG_NAMESPACE"):
+	case isPsqlDtQuery(upper):
+		includeTables, includeViews := relationKindsFromQuery(upper)
+		return c.getDtRelations(currentDatabase, includeTables, includeViews), true
+
+	case strings.Contains(upper, "FROM PG_CATALOG.PG_NAMESPACE") && !strings.Contains(upper, "PG_CATALOG.PG_CLASS"):
 		return c.getPgNamespace(), true
 
 	case strings.Contains(upper, "PG_CATALOG.PG_ENUM"):
 		return c.getPgEnum(), true
 
 	case strings.Contains(upper, "PG_CATALOG.PG_CLASS"):
-		return c.getPgClass(), true
+		return c.getPgClass(currentDatabase), true
 
 	case strings.Contains(upper, "PG_CATALOG.PG_ATTRIBUTE"):
 		return c.getPgAttribute(), true
@@ -483,10 +495,10 @@ func (c *Catalog) HandleSystemQuery(query string) (*SystemResult, bool) {
 		}, true
 
 	case strings.Contains(upper, "INFORMATION_SCHEMA.TABLES"):
-		return c.getISchemaTables(), true
+		return c.getISchemaTables(currentDatabase), true
 
 	case strings.Contains(upper, "INFORMATION_SCHEMA.COLUMNS"):
-		return c.getISchemaColumns(), true
+		return c.getISchemaColumns(currentDatabase), true
 
 	case strings.Contains(upper, "INFORMATION_SCHEMA."):
 		return emptyResult("SELECT 0"), true
@@ -500,13 +512,88 @@ func (c *Catalog) HandleSystemQuery(query string) (*SystemResult, bool) {
 	return nil, false
 }
 
-func (c *Catalog) getCurrentSchema() *SystemResult {
+func isPsqlDtQuery(upperQuery string) bool {
+	if strings.Contains(upperQuery, "PG_TABLE_IS_VISIBLE") &&
+		strings.Contains(upperQuery, "PG_CATALOG.PG_CLASS") &&
+		strings.Contains(upperQuery, "PG_CATALOG.PG_NAMESPACE") {
+		return true
+	}
+
+	// Fallback for alternate psql formulations where aliases/order differ.
+	return strings.Contains(upperQuery, "RELKIND") &&
+		strings.Contains(upperQuery, "PG_CATALOG.PG_CLASS") &&
+		strings.Contains(upperQuery, "PG_CATALOG.PG_NAMESPACE")
+}
+
+func relationKindsFromQuery(upperQuery string) (bool, bool) {
+	filterSegment := upperQuery
+	if idx := strings.Index(upperQuery, "RELKIND IN ("); idx >= 0 {
+		segment := upperQuery[idx:]
+		if end := strings.Index(segment, ")"); end > 0 {
+			filterSegment = segment[:end+1]
+		}
+	}
+
+	includeTables := strings.Contains(filterSegment, "'R'") || strings.Contains(filterSegment, "'P'")
+	includeViews := strings.Contains(filterSegment, "'V'")
+
+	if !includeTables && !includeViews {
+		// Default defensivo para queries de relaciones no estándar.
+		includeTables = true
+	}
+
+	return includeTables, includeViews
+}
+
+func (c *Catalog) getCurrentSchema(currentDatabase string) *SystemResult {
+	schema := resolveDatabaseSchema(currentDatabase)
 	return &SystemResult{
 		Columns: []string{"current_schema", "session_user"},
 		Rows: [][]interface{}{
-			{"public", "postgres"},
+			{schema, "postgres"},
 		},
 		Tag: "SELECT 1",
+	}
+}
+
+func (c *Catalog) getDtRelations(currentDatabase string, includeTables bool, includeViews bool) *SystemResult {
+	targetSchema := resolveDatabaseSchema(currentDatabase)
+
+	c.mu.RLock()
+	tables := c.tables[targetSchema]
+	views := c.views[targetSchema]
+	c.mu.RUnlock()
+
+	rows := make([][]interface{}, 0, len(tables)+len(views))
+	if includeTables {
+		for name := range tables {
+			if strings.HasPrefix(name, "pg_catalog.") || strings.HasPrefix(name, "pg_") {
+				continue
+			}
+			rows = append(rows, []interface{}{targetSchema, name, "table", "postgres"})
+		}
+	}
+	if includeViews {
+		for name := range views {
+			rows = append(rows, []interface{}{targetSchema, name, "view", "postgres"})
+		}
+	}
+
+	sort.Slice(rows, func(i, j int) bool {
+		leftSchema := fmt.Sprintf("%v", rows[i][0])
+		rightSchema := fmt.Sprintf("%v", rows[j][0])
+		if leftSchema != rightSchema {
+			return leftSchema < rightSchema
+		}
+		leftName := fmt.Sprintf("%v", rows[i][1])
+		rightName := fmt.Sprintf("%v", rows[j][1])
+		return leftName < rightName
+	})
+
+	return &SystemResult{
+		Columns: []string{"Schema", "Name", "Type", "Owner"},
+		Rows:    rows,
+		Tag:     fmt.Sprintf("SELECT %d", len(rows)),
 	}
 }
 
@@ -534,25 +621,62 @@ func (c *Catalog) getSearchPath() *SystemResult {
 }
 
 func (c *Catalog) getPgDatabase() *SystemResult {
-	// Try to get real data from pg_catalog.pg_database
-	table, err := c.GetTable("pg_catalog.pg_database")
-	if err != nil {
-		// Fallback to static data
-		return &SystemResult{
-			Columns: []string{"oid", "datname", "datdba", "encoding", "datcollate", "datctype", "datlocprovider", "daticulocale", "daticurules", "datacl", "datcollversion", "datallowconn", "datistemplate"},
-			Rows: [][]interface{}{
-				{1, "postgres", 10, 6, "C", "C", "c", "", "", "", "", true, false},
-			},
-			Tag: "SELECT 1",
+	columns := []string{"oid", "datname", "datdba", "encoding", "datcollate", "datctype", "datlocprovider", "daticulocale", "daticurules", "datacl", "datcollversion", "datallowconn", "datistemplate"}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	rows := make([][]interface{}, 0)
+	seen := make(map[string]struct{})
+	maxOID := 1
+
+	if pgCatalog, ok := c.tables["pg_catalog"]; ok {
+		if table, ok := pgCatalog["pg_database"]; ok && table != nil {
+			rawRows := table.SelectAll()
+			for _, row := range rawRows {
+				normalized := make([]interface{}, len(columns))
+				copy(normalized, row)
+				rows = append(rows, normalized)
+
+				if len(row) > 0 {
+					switch v := row[0].(type) {
+					case int:
+						if v > maxOID {
+							maxOID = v
+						}
+					case int64:
+						if int(v) > maxOID {
+							maxOID = int(v)
+						}
+					}
+				}
+				if len(row) > 1 {
+					if name, ok := row[1].(string); ok && name != "" {
+						seen[name] = struct{}{}
+					}
+				}
+			}
 		}
 	}
 
-	rows := table.SelectAll()
-	return &SystemResult{
-		Columns: []string{"oid", "datname", "datdba", "encoding", "datcollate", "datctype", "datlocprovider", "daticulocale", "daticurules", "datacl", "datcollversion", "datallowconn", "datistemplate"},
-		Rows:    rows,
-		Tag:     fmt.Sprintf("SELECT %d", len(rows)),
+	// Keep \l resilient: any non-system schema behaves like a user database namespace.
+	for schemaName := range c.tables {
+		if schemaName == "pg_catalog" || schemaName == "public" || schemaName == "information_schema" || schemaName == "pg_toast" {
+			continue
+		}
+		if _, exists := seen[schemaName]; exists {
+			continue
+		}
+		maxOID++
+		rows = append(rows, []interface{}{maxOID, schemaName, 10, 6, "C", "C", "c", "", "", "", "", true, false})
+		seen[schemaName] = struct{}{}
 	}
+
+	if len(rows) == 0 {
+		rows = append(rows, []interface{}{1, "postgres", 10, 6, "C", "C", "c", "", "", "", "", true, false})
+	}
+
+	return &SystemResult{Columns: columns, Rows: rows, Tag: fmt.Sprintf("SELECT %d", len(rows))}
 }
 
 func (c *Catalog) getPgSettings() *SystemResult {
@@ -797,8 +921,8 @@ func (c *Catalog) getPgTypeFull() *SystemResult {
 	}
 }
 
-func (c *Catalog) getISchemaTables() *SystemResult {
-	rows := c.GetInformationSchemaTables()
+func (c *Catalog) getISchemaTables(currentDatabase string) *SystemResult {
+	rows := c.GetInformationSchemaTablesForDatabase(currentDatabase)
 	return &SystemResult{
 		Columns: []string{"table_catalog", "table_schema", "table_name", "table_type"},
 		Rows:    rows,
@@ -806,8 +930,8 @@ func (c *Catalog) getISchemaTables() *SystemResult {
 	}
 }
 
-func (c *Catalog) getISchemaColumns() *SystemResult {
-	rows := c.GetInformationSchemaColumns()
+func (c *Catalog) getISchemaColumns(currentDatabase string) *SystemResult {
+	rows := c.GetInformationSchemaColumnsForDatabase(currentDatabase)
 	return &SystemResult{
 		Columns: []string{"table_catalog", "table_schema", "table_name", "column_name", "ordinal_position", "data_type"},
 		Rows:    rows,
@@ -815,15 +939,25 @@ func (c *Catalog) getISchemaColumns() *SystemResult {
 	}
 }
 
-func (c *Catalog) getPgClass() *SystemResult {
-	tables := c.GetAllTables()
+func (c *Catalog) getPgClass(currentDatabase string) *SystemResult {
+	targetSchema := resolveDatabaseSchema(currentDatabase)
+
+	c.mu.RLock()
+	tables := c.tables[targetSchema]
+	views := c.views[targetSchema]
+	c.mu.RUnlock()
+
 	var rows [][]interface{}
 	oid := int32(1000)
 	for name := range tables {
-		if strings.HasPrefix(name, "pg_catalog.") {
+		if strings.HasPrefix(name, "pg_catalog.") || strings.HasPrefix(name, "pg_") {
 			continue
 		}
 		rows = append(rows, []interface{}{oid, oid, name, int32(2200), "r", int32(10), int32(0)})
+		oid++
+	}
+	for name := range views {
+		rows = append(rows, []interface{}{oid, oid, name, int32(2200), "v", int32(10), int32(0)})
 		oid++
 	}
 	return &SystemResult{

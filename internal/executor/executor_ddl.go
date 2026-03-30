@@ -114,6 +114,214 @@ func (e *Executor) executeCreateTable(ctx context.Context, stmt *ast.CreateTable
 	return &Result{Tag: constants.ResultCreateTable}, nil
 }
 
+func (e *Executor) executeCreateIndex(ctx context.Context, stmt *ast.CreateIndex) (*Result, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	schema := stmt.Table.Alias
+	if schema == "" {
+		schema = "public"
+	}
+
+	columnNames := make([]string, 0, len(stmt.Columns))
+	for _, col := range stmt.Columns {
+		columnNames = append(columnNames, col.Name)
+	}
+
+	if err := e.catalog.CreateIndex(stmt.Table.Name, stmt.Name.Name, columnNames, schema); err != nil {
+		return nil, fmt.Errorf("failed to create index: %w", err)
+	}
+
+	if e.storage != nil {
+		table, err := e.catalog.GetTable(stmt.Table.Name, schema)
+		if err == nil {
+			if err := e.storage.SaveTableWithSchema(table, schema); err != nil {
+				fmt.Printf("warning: failed to persist table %s.%s after CREATE INDEX: %v\n", schema, stmt.Table.Name, err)
+			}
+		}
+	}
+
+	return &Result{Tag: constants.ResultCreateIndex}, nil
+}
+
+func (e *Executor) executeDropIndex(ctx context.Context, stmt *ast.DropIndex) (*Result, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	schema := stmt.Table.Alias
+	if schema == "" {
+		schema = "public"
+	}
+
+	if err := e.catalog.DropIndex(stmt.Table.Name, stmt.Name.Name, schema); err != nil {
+		return nil, fmt.Errorf("failed to drop index: %w", err)
+	}
+
+	if e.storage != nil {
+		table, err := e.catalog.GetTable(stmt.Table.Name, schema)
+		if err == nil {
+			if err := e.storage.SaveTableWithSchema(table, schema); err != nil {
+				fmt.Printf("warning: failed to persist table %s.%s after DROP INDEX: %v\n", schema, stmt.Table.Name, err)
+			}
+		}
+	}
+
+	return &Result{Tag: constants.ResultDropIndex}, nil
+}
+
+func (e *Executor) executeCreateView(ctx context.Context, stmt *ast.CreateView) (*Result, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	if stmt.Query == nil {
+		return nil, fmt.Errorf("CREATE VIEW requires a SELECT query")
+	}
+
+	result, err := e.executeSelect(ctx, stmt.Query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate view query: %w", err)
+	}
+
+	// Validate explicit column list if provided
+	if len(stmt.ColumnNames) > 0 {
+		if len(stmt.ColumnNames) != len(result.Columns) {
+			return nil, fmt.Errorf("column list has %d columns but SELECT query returns %d columns",
+				len(stmt.ColumnNames), len(result.Columns))
+		}
+		// Validate uniqueness of explicit column names
+		seenNames := make(map[string]struct{})
+		for _, colName := range stmt.ColumnNames {
+			normalized := strings.ToLower(strings.TrimSpace(colName))
+			if normalized == "" {
+				return nil, fmt.Errorf("view column name cannot be empty")
+			}
+			if _, exists := seenNames[normalized]; exists {
+				return nil, fmt.Errorf("duplicate column name in view column list: %s", colName)
+			}
+			seenNames[normalized] = struct{}{}
+		}
+	}
+
+	// Validate implicit column list (from SELECT)
+	seenCols := make(map[string]struct{}, len(result.Columns))
+	for _, colName := range result.Columns {
+		normalized := strings.ToLower(strings.TrimSpace(colName))
+		if normalized == "" {
+			return nil, fmt.Errorf("view query produced an empty column name")
+		}
+		if _, exists := seenCols[normalized]; exists {
+			return nil, fmt.Errorf("view query has duplicate output column: %s", colName)
+		}
+		seenCols[normalized] = struct{}{}
+	}
+
+	schema := stmt.Name.Alias
+	if schema == "" {
+		schema = "public"
+	}
+
+	if stmt.IfNotExists && !stmt.Replace {
+		if _, err := e.catalog.GetView(stmt.Name.Name, schema); err == nil {
+			return &Result{Tag: constants.ResultCreateView}, nil
+		}
+	}
+
+	if stmt.Replace {
+		if err := e.catalog.DropView(stmt.Name.Name, schema); err != nil {
+			if !strings.Contains(err.Error(), "does not exist") {
+				return nil, fmt.Errorf("failed to replace view: %w", err)
+			}
+		}
+		if e.storage != nil {
+			if err := e.storage.DeleteView(stmt.Name.Name, schema); err != nil {
+				fmt.Printf("warning: failed to delete old view %s.%s during replace: %v\n", schema, stmt.Name.Name, err)
+			}
+		}
+	}
+
+	// Use explicit column names if provided, otherwise use queried column names
+	columnNames := result.Columns
+	if len(stmt.ColumnNames) > 0 {
+		columnNames = stmt.ColumnNames
+	}
+
+	cols := make([]catalog.Column, len(columnNames))
+	for i, name := range columnNames {
+		cols[i] = catalog.Column{Name: name, Type: "TEXT"}
+	}
+
+	if err := e.catalog.CreateView(stmt.Name.Name, cols, stmt.Query, schema); err != nil {
+		return nil, fmt.Errorf("failed to create view: %w", err)
+	}
+
+	if e.storage != nil {
+		if err := e.storage.SaveView(&catalog.View{Name: stmt.Name.Name, Columns: cols, Query: stmt.Query}, schema); err != nil {
+			fmt.Printf("warning: failed to persist view %s.%s: %v\n", schema, stmt.Name.Name, err)
+		}
+	}
+
+	return &Result{Tag: constants.ResultCreateView}, nil
+}
+
+func (e *Executor) executeDropView(ctx context.Context, stmt *ast.DropView) (*Result, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	schema := stmt.Name.Alias
+	if schema == "" {
+		schema = "public"
+	}
+
+	// Find dependent views before dropping
+	dependentViews := e.catalog.FindDependentViews(stmt.Name.Name, schema)
+
+	// Use DropViewWithBehavior for CASCADE/RESTRICT handling
+	if err := e.catalog.DropViewWithBehavior(stmt.Name.Name, stmt.Behavior, schema); err != nil {
+		if stmt.IfExists && strings.Contains(err.Error(), "does not exist") {
+			return &Result{Tag: constants.ResultDropView}, nil
+		}
+		// If error is about dependencies and we're not using CASCADE, pass it through
+		if strings.Contains(err.Error(), "cannot drop view") {
+			return nil, err
+		}
+		return nil, fmt.Errorf("failed to drop view: %w", err)
+	}
+
+	// Delete persisted view and dependent views from storage
+	if e.storage != nil {
+		if err := e.storage.DeleteView(stmt.Name.Name, schema); err != nil {
+			fmt.Printf("warning: failed to delete persisted view %s.%s: %v\n", schema, stmt.Name.Name, err)
+		}
+
+		// If CASCADE, also delete dependent views from storage
+		if stmt.Behavior == "CASCADE" {
+			for _, depName := range dependentViews {
+				parts := strings.Split(depName, ".")
+				if len(parts) == 2 {
+					depSchema := parts[0]
+					depViewName := parts[1]
+					if err := e.storage.DeleteView(depViewName, depSchema); err != nil {
+						fmt.Printf("warning: failed to delete dependent view %s from storage: %v\n", depName, err)
+					}
+				}
+			}
+		}
+	}
+
+	return &Result{Tag: constants.ResultDropView}, nil
+}
+
 // executeCreateDatabase handles CREATE DATABASE statements
 func (e *Executor) executeCreateDatabase(ctx context.Context, stmt *ast.CreateDatabase) (*Result, error) {
 	dbName := stmt.Name.Name
@@ -158,6 +366,20 @@ func (e *Executor) executeCreateDatabase(ctx context.Context, stmt *ast.CreateDa
 
 	if err := dbTable.InsertRowUnsafe(row); err != nil {
 		return nil, fmt.Errorf("failed to insert database: %w", err)
+	}
+
+	// Keep user objects isolated per database by mapping each DB to its own schema namespace.
+	if dbName != "postgres" {
+		if err := e.catalog.CreateSchema(dbName); err != nil {
+			if !strings.Contains(err.Error(), "already exists") {
+				return nil, fmt.Errorf("failed to create schema for database %s: %w", dbName, err)
+			}
+		}
+		if e.storage != nil {
+			if err := e.storage.CreateSchema(dbName); err != nil && !strings.Contains(err.Error(), "already exists") {
+				fmt.Printf("warning: failed to persist schema for database %s: %v\n", dbName, err)
+			}
+		}
 	}
 
 	// Persist to storage
@@ -291,12 +513,74 @@ func (e *Executor) executeDropTable(ctx context.Context, stmt *ast.DropTable) (*
 		schema = "public"
 	}
 	tableName := stmt.Table.Name
+	behavior := stmt.Behavior
+	if behavior == "" {
+		behavior = "RESTRICT"
+	}
 
-	if hasDeps, src := e.catalog.HasForeignKeyDependents(schema, tableName); hasDeps {
-		return nil, fmt.Errorf("cannot drop table %s.%s: referenced by foreign key in table %s", schema, tableName, src)
+	if !e.catalog.TableExists(tableName, schema) {
+		if stmt.IfExists {
+			return &Result{Tag: constants.ResultDropTable}, nil
+		}
+		return nil, fmt.Errorf("failed to drop table: table %s.%s does not exist", schema, tableName)
+	}
+
+	fkDependents := e.catalog.FindForeignKeyDependents(schema, tableName)
+	viewDependents := e.catalog.FindViewsUsingSource(tableName, schema)
+
+	if behavior != "CASCADE" && (len(fkDependents) > 0 || len(viewDependents) > 0) {
+		if len(fkDependents) > 0 {
+			return nil, fmt.Errorf("cannot drop table %s.%s: referenced by foreign key in table(s) %v", schema, tableName, fkDependents)
+		}
+		return nil, fmt.Errorf("cannot drop table %s.%s: dependent view(s) exist %v", schema, tableName, viewDependents)
+	}
+
+	if behavior == "CASCADE" {
+		updatedTables, err := e.catalog.RemoveForeignKeyReferencesToTable(schema, tableName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to drop table: %w", err)
+		}
+
+		for _, depView := range viewDependents {
+			parts := strings.Split(depView, ".")
+			if len(parts) != 2 {
+				continue
+			}
+			depSchema := parts[0]
+			depName := parts[1]
+			if err := e.catalog.DropView(depName, depSchema); err != nil {
+				return nil, fmt.Errorf("failed to drop dependent view %s during CASCADE: %w", depView, err)
+			}
+			if e.storage != nil {
+				if err := e.storage.DeleteView(depName, depSchema); err != nil {
+					fmt.Printf("warning: failed to delete dependent view %s from storage: %v\n", depView, err)
+				}
+			}
+		}
+
+		if e.storage != nil {
+			for _, depTable := range updatedTables {
+				parts := strings.Split(depTable, ".")
+				if len(parts) != 2 {
+					continue
+				}
+				depSchema := parts[0]
+				depName := parts[1]
+				tbl, err := e.catalog.GetTable(depName, depSchema)
+				if err != nil {
+					continue
+				}
+				if err := e.storage.SaveTableWithSchema(tbl, depSchema); err != nil {
+					fmt.Printf("warning: failed to persist dependent table %s after CASCADE DROP TABLE: %v\n", depTable, err)
+				}
+			}
+		}
 	}
 
 	if err := e.catalog.DropTable(tableName, schema); err != nil {
+		if stmt.IfExists && strings.Contains(err.Error(), "does not exist") {
+			return &Result{Tag: constants.ResultDropTable}, nil
+		}
 		return nil, fmt.Errorf("failed to drop table: %w", err)
 	}
 
@@ -321,8 +605,27 @@ func (e *Executor) executeDropSchema(ctx context.Context, stmt *ast.DropSchema) 
 	if schemaName == "" {
 		return nil, fmt.Errorf("schema name cannot be empty")
 	}
+	behavior := stmt.Behavior
+	if behavior == "" {
+		behavior = "RESTRICT"
+	}
+
+	isEmpty, err := e.catalog.SchemaIsEmpty(schemaName)
+	if err != nil {
+		if stmt.IfExists {
+			return &Result{Tag: constants.ResultDropTable}, nil
+		}
+		return nil, fmt.Errorf("failed to drop schema: %w", err)
+	}
+
+	if behavior != "CASCADE" && !isEmpty {
+		return nil, fmt.Errorf("cannot drop schema %s: schema is not empty (use CASCADE)", schemaName)
+	}
 
 	if err := e.catalog.DropSchema(schemaName); err != nil {
+		if stmt.IfExists && strings.Contains(err.Error(), "does not exist") {
+			return &Result{Tag: constants.ResultDropTable}, nil
+		}
 		return nil, fmt.Errorf("failed to drop schema: %w", err)
 	}
 

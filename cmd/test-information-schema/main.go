@@ -42,7 +42,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("❌ Failed to query INFORMATION_SCHEMA.TABLES: %v", err)
 	}
-	defer rows.Close()
 
 	var tableNames []string
 	for rows.Next() {
@@ -59,6 +58,20 @@ func main() {
 	} else {
 		fmt.Println("❌ No tables found")
 	}
+	if err := rows.Close(); err != nil {
+		log.Fatalf("Failed to close rows: %v", err)
+	}
+
+	foundTestTable := false
+	for _, name := range tableNames {
+		if name == testTableName {
+			foundTestTable = true
+			break
+		}
+	}
+	if !foundTestTable {
+		log.Fatalf("❌ Test table %s not found in INFORMATION_SCHEMA.TABLES", testTableName)
+	}
 
 	// Test 2: Query INFORMATION_SCHEMA.COLUMNS for our test table
 	fmt.Printf("Test 2: Querying INFORMATION_SCHEMA.COLUMNS for %s\n", testTableName)
@@ -68,7 +81,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("❌ Failed to query INFORMATION_SCHEMA.COLUMNS: %v", err)
 	}
-	defer rows.Close()
 
 	var columnCount int
 	for rows.Next() {
@@ -78,8 +90,13 @@ func main() {
 		if err := rows.Scan(&catalog, &schema, &tableName, &colName, &ordinal, &dataType); err != nil {
 			log.Fatalf("Failed to scan: %v", err)
 		}
-		columnCount++
-		fmt.Printf("  - Column: %s (Type: %s)\n", colName, dataType)
+		if tableName == testTableName {
+			columnCount++
+			fmt.Printf("  - Column: %s (Type: %s)\n", colName, dataType)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		log.Fatalf("Failed to close rows: %v", err)
 	}
 
 	if columnCount == 3 {
@@ -91,11 +108,10 @@ func main() {
 	// Test 3: Full INFORMATION_SCHEMA.TABLES query with all columns
 	fmt.Println("Test 3: Full INFORMATION_SCHEMA.TABLES query")
 	fmt.Println(strings.Repeat("=", 50))
-	rows, err = db.Query("SELECT table_catalog, table_schema, table_name, table_type FROM information_schema.tables WHERE table_name LIKE 'information_schema%'")
+	rows, err = db.Query("SELECT table_catalog, table_schema, table_name, table_type FROM information_schema.tables")
 	if err != nil {
 		log.Fatalf("❌ Failed: %v", err)
 	}
-	defer rows.Close()
 
 	for rows.Next() {
 		var catalog, schema, tableName, tableType string
@@ -103,6 +119,9 @@ func main() {
 			log.Fatalf("Failed to scan: %v", err)
 		}
 		fmt.Printf("  Catalog: %s | Schema: %s | Table: %s | Type: %s\n", catalog, schema, tableName, tableType)
+	}
+	if err := rows.Close(); err != nil {
+		log.Fatalf("Failed to close rows: %v", err)
 	}
 	fmt.Println("✅ Query executed successfully")
 

@@ -5,6 +5,12 @@ type QueryHandler interface {
 	Handle(query string) (*QueryResult, error)
 }
 
+// DatabaseQueryHandler is an optional extension for handlers that need
+// connection-level database context.
+type DatabaseQueryHandler interface {
+	HandleWithDatabase(query string, database string) (*QueryResult, error)
+}
+
 // QueryResult is a minimal representation of query results used by pgwire.
 type QueryResult struct {
 	Columns []string
