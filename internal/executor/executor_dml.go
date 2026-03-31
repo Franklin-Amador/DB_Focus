@@ -79,14 +79,34 @@ func (e *Executor) executeInsert(ctx context.Context, stmt *ast.Insert) (*Result
 			}
 		}
 	} else {
-		// No columns specified - values should match table columns in order
-		for i, lit := range stmt.Values {
-			if table.Columns[i].Identity {
-				table.Columns[i].IdentityValue++
-				values[i] = table.Columns[i].IdentityValue
-			} else {
+		// No columns specified.
+		// Supported modes:
+		// 1) Full positional VALUES matching all columns.
+		// 2) VALUES matching only non-IDENTITY columns (IDENTITY auto-generated).
+		nonIdentityCount := 0
+		for _, col := range table.Columns {
+			if !col.Identity {
+				nonIdentityCount++
+			}
+		}
+
+		if len(stmt.Values) == len(table.Columns) {
+			for i, lit := range stmt.Values {
 				values[i] = lit.Value
 			}
+		} else if len(stmt.Values) == nonIdentityCount {
+			valueIdx := 0
+			for i, col := range table.Columns {
+				if col.Identity {
+					table.Columns[i].IdentityValue++
+					values[i] = table.Columns[i].IdentityValue
+					continue
+				}
+				values[i] = stmt.Values[valueIdx].Value
+				valueIdx++
+			}
+		} else {
+			return nil, fmt.Errorf("number of values does not match table schema")
 		}
 	}
 

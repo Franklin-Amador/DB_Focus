@@ -821,3 +821,43 @@ Phase 3: Testing DROP SCHEMA...
   - Added syntax and examples for `CREATE VIEW IF NOT EXISTS`
 
 **Status**: ✅ COMPLETED - View creation now supports idempotent `IF NOT EXISTS` behavior
+
+---
+
+### Session: March 30, 2026 - IDENTITY INSERT Positional Mapping Fix
+
+**Objective**: Fix incorrect value mapping when inserting into tables with `IDENTITY` columns using `INSERT ... VALUES (...)` without explicit column list.
+
+**Status**: ✅ COMPLETED
+
+**Issue**:
+- In tables like `(id IDENTITY, name TEXT)`, statements such as `INSERT INTO test VALUES ('Oscar')` returned success but failed to persist `name` correctly.
+- Root cause: positional mapping used the first provided value against table index `0`, then IDENTITY generation overwrote/shifted expected semantics.
+
+**Fix Implemented**:
+1. ✅ **Executor INSERT mapping corrected**:
+   - Supports full positional insert when values count equals total columns.
+   - Supports "non-IDENTITY-only" positional insert when values count equals non-IDENTITY columns.
+   - Auto-generates IDENTITY values while preserving provided non-IDENTITY values in correct columns.
+2. ✅ **Validation path kept consistent** with existing insert validator expectations.
+3. ✅ **Integration regression test added** for real scenario.
+
+**Code Changes**:
+- **internal/executor/executor_dml.go**:
+  - Updated `executeInsert()` positional mapping logic for IDENTITY-aware inserts without explicit column list.
+
+- **cmd/test-identity-insert/main.go**:
+  - Added integration test validating:
+    - auto-incremented IDs
+    - correct persistence of `name` values
+    - stable row ordering and values
+
+- **README.md**:
+  - Added behavior note and examples for `INSERT` without column list in IDENTITY tables.
+
+**Validation Results**:
+- ✅ `go run ./cmd/test-identity-insert`
+- ✅ `go build ./cmd/focusd`
+- ✅ `go test -vet=off ./internal/...`
+
+**Status**: ✅ COMPLETED - IDENTITY positional INSERT now preserves non-IDENTITY values correctly

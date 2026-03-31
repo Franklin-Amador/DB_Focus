@@ -75,6 +75,7 @@ postgresql://postgres:4444@localhost:4444/postgres
 
 **Notas:**
 - Columnas con `IDENTITY` se auto-incrementan automáticamente en cada INSERT.
+- `INSERT` sin lista de columnas ahora soporta correctamente tablas con `IDENTITY`: si envías solo los valores de columnas no-IDENTITY, el motor autogenera el ID y preserva el resto de valores en su columna correcta.
 - Los procedimientos almacenados pueden tener parámetros y ejecutar múltiples sentencias.
 - Los triggers se ejecutan automáticamente en respuesta a eventos INSERT, UPDATE o DELETE.
 - Los triggers pueden ejecutarse recursivamente, con límite de profundidad para evitar loops infinitos (profundidad máxima actual: 16).
@@ -311,6 +312,11 @@ CREATE TABLE productos (id INTEGER IDENTITY PRIMARY KEY, nombre TEXT, precio INT
 INSERT INTO productos (nombre, precio) VALUES ('Laptop', 1000);
 INSERT INTO productos (nombre, precio) VALUES ('Mouse', 25);
 INSERT INTO productos (nombre, precio) VALUES ('Teclado', 50);
+
+-- También funciona sin lista de columnas cuando solo falta la columna IDENTITY
+CREATE TABLE test (id INTEGER IDENTITY PRIMARY KEY, name TEXT);
+INSERT INTO test VALUES ('Estiven');
+INSERT INTO test VALUES ('Oscar');
 
 -- Ver resultados con IDs auto-generados
 SELECT * FROM productos;
