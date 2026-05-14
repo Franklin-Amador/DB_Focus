@@ -9,6 +9,7 @@ data_test_constraints/
 .gitignore
 .idea/
 .vscode/
+.claude/
 
 # Build/test artifacts
 *.exe
