@@ -1,6 +1,5 @@
 package catalog
 
-import "strings"
 
 func New() *Catalog {
 	c := &Catalog{
@@ -44,8 +43,7 @@ func (c *Catalog) GetInformationSchemaTablesForDatabase(currentDatabase string) 
 			continue
 		}
 		for name := range tables {
-			// Skip pg_catalog tables
-			if strings.HasPrefix(name, "pg_catalog.") {
+			if isSystemTable(name) {
 				continue
 			}
 			rows = append(rows, []interface{}{
@@ -90,8 +88,7 @@ func (c *Catalog) GetInformationSchemaColumnsForDatabase(currentDatabase string)
 			continue
 		}
 		for tName, table := range tables {
-			// Skip pg_catalog tables
-			if strings.HasPrefix(tName, "pg_catalog.") {
+			if isSystemTable(tName) {
 				continue
 			}
 			for i, col := range table.Columns {

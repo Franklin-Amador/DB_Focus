@@ -1,0 +1,1581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FocusDB Studio</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/dracula.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/show-hint.min.css">
+<style>
+:root {
+  --bg:      #1e1e2e;
+  --bg2:     #181825;
+  --bg3:     #313244;
+  --surface: #45475a;
+  --accent:  #cba6f7;
+  --green:   #a6e3a1;
+  --red:     #f38ba8;
+  --yellow:  #f9e2af;
+  --blue:    #89b4fa;
+  --cyan:    #94e2d5;
+  --text:    #cdd6f4;
+  --dim:     #6c7086;
+  --border:  #313244;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;flex-direction:column}
+
+/* ── Header ── */
+header{
+  background:var(--bg2);border-bottom:1px solid var(--border);
+  height:44px;padding:0 16px;display:flex;align-items:center;gap:10px;flex-shrink:0;
+}
+.logo{font-size:15px;font-weight:700;color:var(--accent);letter-spacing:-.3px}
+.logo-port{font-size:11px;color:var(--dim);margin-left:2px}
+.conn-badge{
+  margin-left:auto;font-size:11px;padding:2px 10px;border-radius:12px;
+  background:rgba(166,227,161,.1);border:1px solid rgba(166,227,161,.25);color:var(--green);
+}
+
+/* ── Workspace ── */
+.workspace{flex:1;display:flex;overflow:hidden}
+
+/* ── Sidebar ── */
+#sidebar{
+  width:250px;background:var(--bg2);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;overflow:hidden;flex-shrink:0;
+}
+.sb-search{padding:8px 10px;border-bottom:1px solid var(--border)}
+.sb-search input{
+  width:100%;background:var(--bg3);border:1px solid var(--border);
+  color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px;outline:none;
+}
+.sb-search input::placeholder{color:var(--dim)}
+.sb-search input:focus{border-color:var(--accent)}
+.sb-tree{flex:1;overflow-y:auto;padding:4px 0}
+
+.sec-hdr{
+  display:flex;align-items:center;padding:6px 10px;
+  font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;
+  color:var(--dim);cursor:pointer;user-select:none;gap:5px;
+}
+.sec-hdr:hover{color:var(--text)}
+.sec-hdr .arr{font-size:9px;transition:transform .15s}
+.sec-hdr.closed .arr{transform:rotate(-90deg)}
+.sec-body{overflow:hidden}
+.sec-body.hidden{display:none}
+
+.t-item{
+  display:flex;align-items:center;padding:4px 10px 4px 18px;
+  font-size:12.5px;cursor:pointer;gap:6px;color:var(--text);
+}
+.t-item:hover{background:var(--bg3)}
+.t-item.selected{background:rgba(203,166,247,.12);color:var(--accent)}
+.t-item .ico{font-size:13px;flex-shrink:0}
+.t-item .lbl{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.t-item .cnt{font-size:10px;color:var(--dim);background:var(--bg3);padding:1px 5px;border-radius:8px}
+
+.col-row{
+  display:flex;align-items:center;padding:3px 10px 3px 32px;
+  font-size:11.5px;color:var(--dim);gap:6px;cursor:pointer;
+}
+.col-row:hover{background:rgba(255,255,255,.03);color:var(--text)}
+.col-row .col-type{margin-left:auto;font-size:10px;color:var(--blue)}
+.col-row .pk{color:var(--yellow);font-size:10px}
+
+/* ── Main ── */
+#main{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
+
+/* ── Toolbar ── */
+#toolbar{
+  background:var(--bg2);border-bottom:1px solid var(--border);
+  padding:6px 12px;display:flex;align-items:center;gap:8px;flex-shrink:0;
+}
+.btn{
+  padding:5px 14px;border-radius:6px;border:none;
+  font-size:12px;font-weight:600;cursor:pointer;transition:opacity .15s;
+}
+.btn:hover{opacity:.85}.btn:active{opacity:.65}
+.btn-run{background:var(--accent);color:#1e1e2e}
+.btn-runall{background:var(--blue);color:#1e1e2e}
+.btn-clear{background:var(--bg3);color:var(--text)}
+.btn-fmt{background:var(--bg3);color:var(--text)}
+#run-status{
+  margin-left:auto;font-size:11px;color:var(--dim);
+  transition:color .2s;
+}
+#run-status.ok{color:var(--green)}
+#run-status.err{color:var(--red)}
+
+/* ── Editor ── */
+#editor-pane{flex-shrink:0;position:relative;overflow:hidden}
+.CodeMirror{
+  height:100% !important;
+  font-size:13.5px;
+  font-family:'Cascadia Code','Fira Code','Consolas',monospace;
+  background:var(--bg) !important;
+}
+.CodeMirror-gutters{background:var(--bg2) !important;border-right:1px solid var(--border) !important}
+.CodeMirror-linenumber{color:var(--dim)}
+.CodeMirror-cursor{border-left-color:var(--accent) !important}
+.CodeMirror-selected{background:rgba(203,166,247,.18) !important}
+.CodeMirror-activeline-background{background:rgba(255,255,255,.025) !important}
+
+/* syntax error underline */
+.cm-syntax-error{border-bottom:2px wavy var(--red);text-decoration:none}
+
+/* ── Resizer ── */
+#resizer{
+  height:5px;background:var(--border);cursor:row-resize;flex-shrink:0;
+  transition:background .15s;
+}
+#resizer:hover,#resizer.dragging{background:var(--accent)}
+
+/* ── Results pane ── */
+#results-pane{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0}
+
+.tabs-bar{
+  display:flex;background:var(--bg2);border-bottom:1px solid var(--border);flex-shrink:0;
+}
+.tab-btn{
+  padding:6px 18px;font-size:12px;cursor:pointer;
+  color:var(--dim);border-bottom:2px solid transparent;user-select:none;
+}
+.tab-btn:hover{color:var(--text)}
+.tab-btn.active{color:var(--accent);border-bottom-color:var(--accent)}
+
+.tab-panel{display:none;flex:1;overflow:hidden;flex-direction:column}
+.tab-panel.active{display:flex}
+
+/* Results table */
+#results-wrap{flex:1;overflow:auto}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+thead th{
+  background:var(--bg2);color:var(--accent);font-weight:600;
+  padding:7px 14px;text-align:left;border-bottom:1px solid var(--border);
+  white-space:nowrap;position:sticky;top:0;z-index:1;
+}
+tbody tr{border-bottom:1px solid rgba(49,50,68,.4)}
+tbody tr:hover{background:rgba(255,255,255,.03)}
+tbody td{padding:5px 14px;white-space:nowrap;max-width:320px;overflow:hidden;text-overflow:ellipsis}
+.v-null{color:var(--dim);font-style:italic}
+.v-num{color:var(--blue)}
+.v-bool{color:var(--yellow)}
+
+.results-footer{
+  padding:4px 12px;font-size:11px;color:var(--dim);
+  background:var(--bg2);border-top:1px solid var(--border);flex-shrink:0;
+  display:flex;gap:16px;
+}
+.results-footer span.ok{color:var(--green)}
+.results-footer span.err{color:var(--red)}
+
+/* History */
+#history-wrap{flex:1;overflow-y:auto;padding:8px}
+.h-item{
+  background:var(--bg2);border:1px solid var(--border);border-radius:6px;
+  padding:8px 10px;margin-bottom:6px;cursor:pointer;
+}
+.h-item:hover{border-color:var(--accent)}
+.h-sql{
+  font-family:'Cascadia Code','Fira Code','Consolas',monospace;
+  font-size:11.5px;color:var(--text);white-space:pre-wrap;word-break:break-all;
+  max-height:56px;overflow:hidden;
+}
+.h-meta{margin-top:5px;font-size:10.5px;color:var(--dim);display:flex;gap:12px;align-items:center}
+.h-meta .ok{color:var(--green)}.h-meta .err{color:var(--red)}
+
+/* Validate bar */
+#validate-bar{
+  padding:3px 12px;font-size:11px;min-height:22px;flex-shrink:0;
+  border-top:1px solid var(--border);background:var(--bg2);
+  display:flex;align-items:center;gap:8px;
+}
+#validate-bar.ok{color:var(--green)}
+#validate-bar.err{color:var(--red)}
+#validate-bar.idle{color:var(--dim)}
+
+/* Current statement highlight */
+.cm-stmt-highlight{background:rgba(137,180,250,.08);border-radius:2px}
+
+/* ── Nav buttons (header) ── */
+.nav-btn{
+  padding:4px 12px;border-radius:6px;border:1px solid var(--border);
+  background:transparent;color:var(--dim);font-size:12px;font-weight:600;
+  cursor:pointer;transition:all .15s;
+}
+.nav-btn:hover{color:var(--text);border-color:var(--surface)}
+.nav-btn.active{background:var(--bg3);color:var(--accent);border-color:var(--accent)}
+
+/* ── Diagram overlay ── */
+#diagram-view{
+  position:absolute;top:44px;left:0;right:0;bottom:0;
+  background:var(--bg);display:none;flex-direction:column;z-index:50;
+}
+#diagram-view.visible{display:flex}
+
+#diagram-toolbar{
+  background:var(--bg2);border-bottom:1px solid var(--border);
+  padding:6px 14px;display:flex;align-items:center;gap:8px;flex-shrink:0;
+}
+#diagram-status{margin-left:auto;font-size:11px;color:var(--dim)}
+
+#diagram-svg{
+  flex:1;width:100%;cursor:grab;user-select:none;
+  background:var(--bg);
+  background-image:
+    radial-gradient(circle, #313244 1px, transparent 1px);
+  background-size:28px 28px;
+}
+#diagram-svg.panning{cursor:grabbing}
+
+/* Table group hover & selection */
+.tbl-group{cursor:move}
+.tbl-box{transition:stroke .15s, filter .15s}
+.tbl-group:hover .tbl-box{filter:drop-shadow(0 0 8px rgba(203,166,247,.35))}
+.tbl-group.selected .tbl-box{stroke:#cba6f7!important;stroke-width:2.5px!important;filter:drop-shadow(0 0 14px rgba(203,166,247,.55))}
+.tbl-group.connected .tbl-box{stroke:#89b4fa!important;stroke-width:2px!important}
+.tbl-group.dimmed{opacity:.18;transition:opacity .2s}
+.tbl-group.search-match .tbl-box{stroke:#f9e2af!important;stroke-width:2px!important}
+.tbl-group.search-dim{opacity:.12}
+
+/* FK line states */
+.fk-line-group:hover .fk-path{stroke:#cba6f7!important;stroke-width:2.5px!important;opacity:1!important}
+.fk-line-group.selected .fk-path{stroke:#cba6f7!important;stroke-width:3px!important;opacity:1!important}
+.fk-line-group.dimmed{opacity:.06}
+
+/* Compact mode — hide type labels */
+#diagram-svg.compact .col-type-text{display:none}
+
+/* Toolbar extras */
+.dtb-sep{width:1px;height:20px;background:var(--border);flex-shrink:0}
+.diag-search-input{
+  background:var(--bg3);border:1px solid var(--border);
+  color:var(--text);padding:4px 10px;border-radius:6px;
+  font-size:12px;outline:none;width:155px;
+}
+.diag-search-input:focus{border-color:var(--accent)}
+.diag-search-input::placeholder{color:var(--dim)}
+.diag-zoom-pct{min-width:40px;text-align:center;font-size:11px;color:var(--text);font-variant-numeric:tabular-nums}
+.dtb-zoom-btn{padding:4px 11px!important;font-size:15px!important;font-weight:700!important;line-height:1}
+
+/* Empty state */
+.empty-state{
+  flex:1;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:8px;color:var(--dim);
+}
+.empty-state .big{font-size:28px}
+.empty-state p{font-size:13px}
+
+/* Scrollbar */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--bg3);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--surface)}
+</style>
+</head>
+<body>
+
+<header>
+  <span class="logo">⬡ FocusDB</span>
+  <span class="logo-port">Studio · :9011</span>
+  <span class="conn-badge" id="conn-badge">● connected</span>
+  <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
+    <button class="nav-btn active" id="nav-query"   onclick="showView('query')">⌨ Query</button>
+    <button class="nav-btn"        id="nav-diagram" onclick="showView('diagram')">⬡ Diagram</button>
+  </div>
+</header>
+
+<div class="workspace">
+
+  <!-- Sidebar -->
+  <aside id="sidebar">
+    <div class="sb-search">
+      <input id="tree-filter" type="text" placeholder="🔍  Filter objects…" oninput="filterTree(this.value)">
+    </div>
+    <div class="sb-tree" id="sb-tree">
+      <div class="empty-state" style="height:120px"><p>Loading schema…</p></div>
+    </div>
+  </aside>
+
+  <!-- Editor + Results -->
+  <div id="main">
+    <div id="toolbar">
+      <button class="btn btn-run" id="btn-run" onclick="runQuery()" title="F5 — ejecuta selección o statement actual">▶ Run</button>
+      <button class="btn btn-runall" id="btn-runall" onclick="runAll()" title="Ctrl+Shift+Enter — ejecuta todo el script">▶▶ Run All</button>
+      <button class="btn btn-clear" onclick="clearEditor()">Clear</button>
+      <button class="btn btn-fmt" onclick="activateTab('history')">History</button>
+      <span id="run-mode" style="font-size:11px;color:var(--dim);margin-left:4px"></span>
+      <span id="run-status"></span>
+    </div>
+
+    <div id="editor-pane">
+      <textarea id="sql-input">SELECT * FROM </textarea>
+    </div>
+
+    <div id="validate-bar" class="idle">Ready</div>
+
+    <div id="resizer"></div>
+
+    <div id="results-pane">
+      <div class="tabs-bar">
+        <div class="tab-btn active" id="tab-results" onclick="activateTab('results')">Results</div>
+        <div class="tab-btn" id="tab-history" onclick="activateTab('history')">History</div>
+      </div>
+
+      <div class="tab-panel active" id="tc-results">
+        <div id="results-wrap">
+          <div class="empty-state">
+            <div class="big">⬡</div>
+            <p>Run a query to see results</p>
+            <p style="font-size:11px">Ctrl+Enter to execute</p>
+          </div>
+        </div>
+        <div class="results-footer" id="results-footer"></div>
+      </div>
+
+      <div class="tab-panel" id="tc-history">
+        <div id="history-wrap">
+          <div class="empty-state"><p>No queries yet</p></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── Diagram overlay ──────────────────────────────────────────────────── -->
+<div id="diagram-view">
+  <div id="diagram-toolbar">
+    <button class="btn btn-clear" onclick="loadDiagram()" title="Reload schema">↺</button>
+    <button class="btn btn-clear" onclick="fitDiagram()" title="Fit all  [F]">⊡ Fit</button>
+    <button class="btn btn-clear" onclick="resetDiagramLayout()" title="Re-run force layout  [R]">⟳ Layout</button>
+    <div class="dtb-sep"></div>
+    <input id="diag-search" class="diag-search-input" type="text"
+           placeholder="🔍 Find table…" oninput="diagSearch(this.value)">
+    <div class="dtb-sep"></div>
+    <button class="btn btn-clear dtb-zoom-btn" onclick="diagZoomBy(-0.15)" title="Zoom out  [−]">−</button>
+    <span class="diag-zoom-pct" id="diag-zoom-pct">100%</span>
+    <button class="btn btn-clear dtb-zoom-btn" onclick="diagZoomBy(+0.15)" title="Zoom in  [+]">+</button>
+    <div class="dtb-sep"></div>
+    <button class="btn btn-clear" id="btn-compact" onclick="toggleCompact()">≡ Full</button>
+    <div class="dtb-sep"></div>
+    <button class="btn btn-clear" onclick="exportSVG()" title="Export as SVG vector">↓ SVG</button>
+    <button class="btn btn-clear" onclick="exportPNG()" title="Export as PNG image (2×)">↓ PNG</button>
+    <span id="diagram-status"></span>
+  </div>
+  <svg id="diagram-svg" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="fk-arrow" markerWidth="9" markerHeight="7"
+              refX="8" refY="3.5" orient="auto">
+        <polygon points="0 0, 9 3.5, 0 7" fill="#89b4fa" opacity="0.9"/>
+      </marker>
+      <marker id="fk-circle" markerWidth="6" markerHeight="6"
+              refX="3" refY="3" orient="auto">
+        <circle cx="3" cy="3" r="2.5" fill="none" stroke="#89b4fa" stroke-width="1.5"/>
+      </marker>
+    </defs>
+    <g id="diagram-root">
+      <g id="diagram-lines"></g>
+      <g id="diagram-tables"></g>
+    </g>
+  </svg>
+</div>
+
+<!-- CodeMirror 5 -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/sql/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/show-hint.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/sql-hint.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/matchbrackets.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/closebrackets.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/selection/active-line.min.js"></script>
+
+<script>
+// ─── State ───────────────────────────────────────────────────────────────────
+let editor, schemaData = [], objectsData = {triggers:[], jobs:[], procedures:[]};
+let history = [], validateTimer = null, errorMarks = [], stmtMark = null;
+let tableNames = [], colNames = [];
+
+// ─── CodeMirror init ─────────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  editor = CodeMirror.fromTextArea(document.getElementById('sql-input'), {
+    mode: 'text/x-sql',
+    theme: 'dracula',
+    lineNumbers: true,
+    matchBrackets: true,
+    autoCloseBrackets: true,
+    styleActiveLine: true,
+    indentWithTabs: false,
+    tabSize: 2,
+    extraKeys: {
+      'F5':               runQuery,
+      'Ctrl-Enter':       runQuery,
+      'Cmd-Enter':        runQuery,
+      'Ctrl-Shift-Enter': runAll,
+      'Cmd-Shift-Enter':  runAll,
+      'Ctrl-Space': cm => CodeMirror.showHint(cm, CodeMirror.hint.sql, {
+        tables: buildHintTables(),
+        completeSingle: false,
+      }),
+    },
+  });
+
+  setEditorHeight();
+  window.addEventListener('resize', setEditorHeight);
+
+  // Validate + update statement highlight on change/cursor move
+  editor.on('change', () => {
+    clearTimeout(validateTimer);
+    validateTimer = setTimeout(validateSQL, 600);
+    updateStmtHighlight();
+  });
+  editor.on('cursorActivity', updateStmtHighlight);
+
+  loadSidebar();
+  initResizer();
+});
+
+function setEditorHeight() {
+  const total  = document.getElementById('main').clientHeight;
+  const toolbar = document.getElementById('toolbar').offsetHeight;
+  const vbar   = document.getElementById('validate-bar').offsetHeight;
+  const resizer = document.getElementById('resizer').offsetHeight;
+  const tabs   = document.querySelector('.tabs-bar').offsetHeight;
+  const foot   = document.getElementById('results-footer').offsetHeight;
+  const editorH = Math.floor((total - toolbar - vbar - resizer - tabs - foot) * 0.45);
+  document.getElementById('editor-pane').style.height = editorH + 'px';
+  editor.refresh();
+}
+
+// ─── Resizer drag ─────────────────────────────────────────────────────────────
+function initResizer() {
+  const resizer = document.getElementById('resizer');
+  const edPane  = document.getElementById('editor-pane');
+  let startY, startH;
+
+  resizer.addEventListener('mousedown', e => {
+    startY = e.clientY;
+    startH = edPane.offsetHeight;
+    resizer.classList.add('dragging');
+    document.addEventListener('mousemove', onDrag);
+    document.addEventListener('mouseup', onDrop);
+    e.preventDefault();
+  });
+
+  function onDrag(e) {
+    const dy = e.clientY - startY;
+    const newH = Math.max(80, Math.min(startH + dy, window.innerHeight - 200));
+    edPane.style.height = newH + 'px';
+    editor.refresh();
+  }
+  function onDrop() {
+    resizer.classList.remove('dragging');
+    document.removeEventListener('mousemove', onDrag);
+    document.removeEventListener('mouseup', onDrop);
+  }
+}
+
+// ─── Sidebar ─────────────────────────────────────────────────────────────────
+async function loadSidebar() {
+  try {
+    const [schemaRes, objRes] = await Promise.all([
+      fetch('/api/schema').then(r => r.json()),
+      fetch('/api/objects').then(r => r.json()),
+    ]);
+    schemaData  = schemaRes  || [];
+    objectsData = objRes     || {triggers:[], jobs:[], procedures:[]};
+
+    tableNames = schemaData.map(t => t.name);
+    colNames   = schemaData.flatMap(t => (t.columns||[]).map(c => c.name));
+
+    renderSidebar('');
+    document.getElementById('conn-badge').textContent = '● connected';
+  } catch(e) {
+    document.getElementById('conn-badge').style.color = 'var(--red)';
+    document.getElementById('conn-badge').textContent = '● offline';
+    document.getElementById('sb-tree').innerHTML = '<div class="empty-state" style="height:120px"><p>Cannot reach server</p></div>';
+  }
+}
+
+function buildHintTables() {
+  const tables = {};
+  schemaData.forEach(t => {
+    tables[t.name] = (t.columns||[]).map(c => c.name);
+  });
+  return tables;
+}
+
+function renderSidebar(filter) {
+  const tree = document.getElementById('sb-tree');
+  const f = filter.toLowerCase();
+
+  let html = '';
+
+  // ── Tables / Views section
+  const tableItems = schemaData.filter(t =>
+    t.kind === 'BASE TABLE' && (!f || t.name.toLowerCase().includes(f))
+  );
+  const viewItems = schemaData.filter(t =>
+    t.kind === 'VIEW' && (!f || t.name.toLowerCase().includes(f))
+  );
+
+  html += sectionHTML('📋', 'Tables', 'sec-tables', tableItems.map(t => {
+    const colsHTML = (t.columns||[]).map(c =>
+      `<div class="col-row" onclick="insertColRef('${t.name}','${c.name}')">
+        <span>${c.name}</span>
+        <span class="col-type">${escHtml(c.type)}</span>
+      </div>`
+    ).join('');
+    return `
+      <div class="t-item" onclick="toggleCols(this)" data-table="${escAttr(t.name)}">
+        <span class="ico">▶</span>
+        <span class="lbl">${escHtml(t.name)}</span>
+        <span class="cnt">${(t.columns||[]).length}</span>
+        <button style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:10px;padding:0 4px" title="SELECT *"
+          onclick="event.stopPropagation();quickSelect('${escAttr(t.name)}')">⤢</button>
+      </div>
+      <div class="col-block" style="display:none">${colsHTML}</div>`;
+  }), tableItems.length);
+
+  html += sectionHTML('👁', 'Views', 'sec-views', viewItems.map(t =>
+    `<div class="t-item" onclick="quickSelect('${escAttr(t.name)}')">
+       <span class="ico">🟦</span>
+       <span class="lbl">${escHtml(t.name)}</span>
+     </div>`
+  ), viewItems.length);
+
+  // ── Procedures
+  const procs = objectsData.procedures.filter(p => !f || p.name.toLowerCase().includes(f));
+  html += sectionHTML('⚙', 'Procedures', 'sec-procs', procs.map(p => {
+    const sig = p.params && p.params.length ? p.params.join(', ') : 'no params';
+    return `<div class="t-item" title="${escAttr(sig)}" onclick="insertCall('${escAttr(p.name)}')">
+              <span class="ico">λ</span>
+              <span class="lbl">${escHtml(p.name)}</span>
+            </div>`;
+  }), procs.length);
+
+  // ── Triggers
+  const trigs = objectsData.triggers.filter(t => !f || t.name.toLowerCase().includes(f));
+  html += sectionHTML('⚡', 'Triggers', 'sec-trigs', trigs.map(t =>
+    `<div class="t-item" title="${escAttr(t.timing+' '+t.event+' ON '+t.table)}">
+       <span class="ico">⚡</span>
+       <span class="lbl">${escHtml(t.name)}</span>
+       <span class="cnt" style="color:var(--yellow)">${t.event}</span>
+     </div>`
+  ), trigs.length);
+
+  // ── Jobs
+  const jobs = objectsData.jobs.filter(j => !f || j.name.toLowerCase().includes(f));
+  html += sectionHTML('🕐', 'Jobs', 'sec-jobs', jobs.map(j => {
+    const enabled = j.enabled ? '🟢' : '🔴';
+    return `<div class="t-item" title="every ${j.interval} ${j.unit}">
+              <span class="ico">${enabled}</span>
+              <span class="lbl">${escHtml(j.name)}</span>
+              <span class="cnt">every ${j.interval} ${j.unit.toLowerCase()}</span>
+            </div>`;
+  }), jobs.length);
+
+  tree.innerHTML = html || '<div class="empty-state" style="height:80px"><p>No objects found</p></div>';
+}
+
+function sectionHTML(icon, label, id, itemsHTML, count) {
+  return `
+    <div class="tree-section">
+      <div class="sec-hdr" onclick="toggleSection('${id}')">
+        <span class="arr">▾</span> ${icon} ${label}
+        ${count > 0 ? `<span class="cnt" style="margin-left:auto">${count}</span>` : ''}
+      </div>
+      <div class="sec-body" id="${id}">
+        ${itemsHTML.length ? itemsHTML.join('') : '<div style="padding:4px 18px;font-size:11px;color:var(--dim)">empty</div>'}
+      </div>
+    </div>`;
+}
+
+function toggleSection(id) {
+  const body = document.getElementById(id);
+  const hdr  = body.previousElementSibling;
+  body.classList.toggle('hidden');
+  hdr.classList.toggle('closed');
+}
+
+function toggleCols(el) {
+  const block = el.nextElementSibling;
+  const ico   = el.querySelector('.ico');
+  if (block.style.display === 'none') {
+    block.style.display = 'block';
+    ico.textContent = '▼';
+  } else {
+    block.style.display = 'none';
+    ico.textContent = '▶';
+  }
+}
+
+function filterTree(v) { renderSidebar(v); }
+
+function quickSelect(name) {
+  editor.setValue(`SELECT *\nFROM ${name}\nLIMIT 100;`);
+  editor.focus();
+  runQuery();
+}
+
+function insertColRef(table, col) {
+  editor.replaceSelection(col);
+  editor.focus();
+}
+
+function insertCall(name) {
+  editor.setValue(`CALL ${name}();`);
+  editor.focus();
+}
+
+// ─── Statement detection ──────────────────────────────────────────────────────
+
+// Returns {sql, from, to} of the statement the cursor is inside.
+// Splits on semicolons, respecting single-quoted strings and line comments.
+function getCurrentStatement() {
+  const content = editor.getValue();
+  const cursor  = editor.getCursor();
+
+  // Convert cursor (line, ch) to absolute char offset
+  let cursorPos = 0;
+  for (let i = 0; i < cursor.line; i++) cursorPos += editor.getLine(i).length + 1;
+  cursorPos += cursor.ch;
+
+  // Tokenise: find semicolon boundaries outside strings/comments
+  const boundaries = [0]; // statement start offsets
+  let inString = false, inLineComment = false;
+
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i];
+
+    if (inLineComment) {
+      if (ch === '\n') inLineComment = false;
+      continue;
+    }
+    if (inString) {
+      if (ch === "'" && content[i+1] === "'") { i++; continue; } // escaped quote
+      if (ch === "'") inString = false;
+      continue;
+    }
+    if (ch === "'" ) { inString = true; continue; }
+    if (ch === '-' && content[i+1] === '-') { inLineComment = true; continue; }
+
+    if (ch === ';') boundaries.push(i + 1); // next statement starts after ;
+  }
+  boundaries.push(content.length);
+
+  // Find which segment contains cursorPos
+  for (let i = 0; i < boundaries.length - 1; i++) {
+    const from = boundaries[i];
+    const to   = boundaries[i + 1];
+    if (cursorPos >= from && cursorPos <= to) {
+      const sql = content.slice(from, to).replace(/;\s*$/, '').trim();
+      if (!sql) continue;
+      return { sql, from, to: to - 1 }; // to-1 skips the semicolon itself
+    }
+  }
+  return { sql: content.trim(), from: 0, to: content.length };
+}
+
+// Convert absolute char offset to {line, ch}
+function offsetToPos(offset) {
+  const lines = editor.getValue().split('\n');
+  let remaining = offset;
+  for (let i = 0; i < lines.length; i++) {
+    if (remaining <= lines[i].length) return { line: i, ch: remaining };
+    remaining -= lines[i].length + 1;
+  }
+  return { line: lines.length - 1, ch: lines[lines.length-1].length };
+}
+
+// Highlight the statement that will run (blue tint) when nothing is selected
+function updateStmtHighlight() {
+  if (stmtMark) { stmtMark.clear(); stmtMark = null; }
+
+  const sel = editor.getSelection();
+  const modeEl = document.getElementById('run-mode');
+
+  if (sel.trim()) {
+    modeEl.textContent = '▸ selection';
+    return;
+  }
+
+  const { sql, from, to } = getCurrentStatement();
+  if (!sql) { modeEl.textContent = ''; return; }
+
+  modeEl.textContent = '▸ current statement';
+  stmtMark = editor.markText(
+    offsetToPos(from),
+    offsetToPos(to),
+    { className: 'cm-stmt-highlight' }
+  );
+}
+
+// Decide what SQL to run: selection > current statement
+function getQueryToRun() {
+  const sel = editor.getSelection().trim();
+  if (sel) return { sql: sel, mode: 'selection' };
+  const { sql } = getCurrentStatement();
+  return { sql, mode: 'statement' };
+}
+
+// ─── Run query ────────────────────────────────────────────────────────────────
+async function runQuery() {
+  const { sql, mode } = getQueryToRun();
+  if (!sql) return;
+
+  await execSQL(sql, 'btn-run');
+}
+
+async function runAll() {
+  const sql = editor.getValue().trim();
+  if (!sql) return;
+  await execSQL(sql, 'btn-runall');
+}
+
+async function execSQL(sql, btnId) {
+  const statusEl = document.getElementById('run-status');
+  statusEl.className = '';
+  statusEl.textContent = 'Running…';
+  document.getElementById(btnId).disabled = true;
+
+  const t0 = Date.now();
+  try {
+    const res  = await fetch('/api/query', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({sql}),
+    });
+    const data = await res.json();
+
+    if (data.error) {
+      showError(data.error, data.elapsed_ms ?? (Date.now()-t0));
+      addHistory(sql, false, data.error, data.elapsed_ms ?? 0);
+    } else {
+      showResults(data.columns || [], data.rows || [], data.tag || '', data.elapsed_ms ?? (Date.now()-t0));
+      addHistory(sql, true, data.tag, data.elapsed_ms ?? 0);
+      refreshSidebar();
+    }
+  } catch(e) {
+    showError('Network error: ' + e.message, Date.now()-t0);
+  } finally {
+    document.getElementById(btnId).disabled = false;
+    statusEl.textContent = '';
+  }
+}
+
+function showResults(cols, rows, tag, ms) {
+  activateTab('results');
+  const wrap   = document.getElementById('results-wrap');
+  const footer = document.getElementById('results-footer');
+
+  if (!cols.length && !rows.length) {
+    wrap.innerHTML = `<div class="empty-state"><div class="big">✓</div><p>${escHtml(tag)}</p></div>`;
+    footer.innerHTML = `<span class="ok">${escHtml(tag)}</span><span>${ms}ms</span>`;
+    setStatus(tag, false);
+    return;
+  }
+
+  let th = cols.map(c => `<th>${escHtml(c)}</th>`).join('');
+  let tb = rows.map(row => {
+    const tds = (row||[]).map(v => {
+      if (v === null || v === undefined) return `<td class="v-null">NULL</td>`;
+      if (typeof v === 'number') return `<td class="v-num">${v}</td>`;
+      if (typeof v === 'boolean') return `<td class="v-bool">${v}</td>`;
+      return `<td>${escHtml(String(v))}</td>`;
+    }).join('');
+    return `<tr>${tds}</tr>`;
+  }).join('');
+
+  wrap.innerHTML = `<table><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table>`;
+  footer.innerHTML = `<span class="ok">${escHtml(tag)}</span><span>${rows.length} row${rows.length!==1?'s':''}</span><span>${ms}ms</span>`;
+  setStatus(tag, false);
+}
+
+function showError(msg, ms) {
+  activateTab('results');
+  document.getElementById('results-wrap').innerHTML =
+    `<div class="empty-state"><div class="big" style="color:var(--red)">✕</div><p style="color:var(--red);max-width:480px;text-align:center;word-break:break-word">${escHtml(msg)}</p></div>`;
+  document.getElementById('results-footer').innerHTML =
+    `<span class="err">ERROR</span><span>${ms}ms</span>`;
+  setStatus('ERROR', true);
+}
+
+function setStatus(msg, isErr) {
+  const el = document.getElementById('run-status');
+  el.className = isErr ? 'err' : 'ok';
+  el.textContent = isErr ? '✕ Error' : '✓ ' + msg;
+}
+
+function clearEditor() {
+  editor.setValue('');
+  editor.focus();
+  if (stmtMark) { stmtMark.clear(); stmtMark = null; }
+  document.getElementById('run-mode').textContent = '';
+  document.getElementById('results-wrap').innerHTML =
+    `<div class="empty-state"><div class="big">⬡</div><p>Run a query to see results</p></div>`;
+  document.getElementById('results-footer').innerHTML = '';
+  document.getElementById('run-status').textContent = '';
+  document.getElementById('run-status').className = '';
+  setValidateBar('idle', 'Ready');
+}
+
+// ─── Syntax validation ────────────────────────────────────────────────────────
+function setValidateBar(state, msg) {
+  const bar = document.getElementById('validate-bar');
+  bar.className = state;
+  bar.textContent = msg;
+}
+
+async function validateSQL() {
+  const sql = editor.getValue().trim();
+  clearErrorMarks();
+  if (!sql || sql.startsWith('--')) { setValidateBar('idle', 'Ready'); return; }
+
+  try {
+    const res  = await fetch('/api/validate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({sql}),
+    });
+    const data = await res.json();
+    if (data.valid) {
+      setValidateBar('ok', '✓ Syntax OK');
+    } else {
+      setValidateBar('err', '✕ ' + (data.error || 'Syntax error'));
+      markError(data.error);
+    }
+  } catch(_) {
+    setValidateBar('idle', 'Ready');
+  }
+}
+
+function markError(errMsg) {
+  // Try to extract line/col info from "line X col Y" patterns
+  const lineMatch = /line\s+(\d+)/i.exec(errMsg);
+  const colMatch  = /col(?:umn)?\s+(\d+)/i.exec(errMsg);
+  if (lineMatch) {
+    const line = parseInt(lineMatch[1], 10) - 1;
+    const col  = colMatch ? parseInt(colMatch[1], 10) - 1 : 0;
+    const mark = editor.markText(
+      {line, ch: col},
+      {line, ch: col + 1},
+      {className: 'cm-syntax-error', title: errMsg}
+    );
+    errorMarks.push(mark);
+  }
+}
+
+function clearErrorMarks() {
+  errorMarks.forEach(m => m.clear());
+  errorMarks = [];
+}
+
+// ─── History ─────────────────────────────────────────────────────────────────
+function addHistory(sql, ok, tagOrErr, ms) {
+  history.unshift({sql, ok, tagOrErr, ms, ts: new Date()});
+  if (history.length > 100) history.pop();
+  renderHistory();
+}
+
+function renderHistory() {
+  const wrap = document.getElementById('history-wrap');
+  if (!history.length) {
+    wrap.innerHTML = '<div class="empty-state"><p>No queries yet</p></div>';
+    return;
+  }
+  wrap.innerHTML = history.map((h, i) => {
+    const timeStr = h.ts.toLocaleTimeString();
+    const tag = h.ok
+      ? `<span class="ok">✓ ${escHtml(h.tagOrErr)}</span>`
+      : `<span class="err">✕ error</span>`;
+    return `
+      <div class="h-item" onclick="restoreHistory(${i})">
+        <div class="h-sql">${escHtml(h.sql)}</div>
+        <div class="h-meta">${tag}<span>${h.ms}ms</span><span>${timeStr}</span></div>
+      </div>`;
+  }).join('');
+}
+
+function restoreHistory(i) {
+  editor.setValue(history[i].sql);
+  activateTab('results');
+  editor.focus();
+}
+
+// ─── Tabs ─────────────────────────────────────────────────────────────────────
+function activateTab(name) {
+  ['results','history'].forEach(t => {
+    document.getElementById('tab-'+t).classList.toggle('active', t===name);
+    document.getElementById('tc-'+t).classList.toggle('active', t===name);
+  });
+}
+
+// ─── Sidebar refresh after DDL ────────────────────────────────────────────────
+let refreshPending = false;
+function refreshSidebar() {
+  if (refreshPending) return;
+  refreshPending = true;
+  setTimeout(async () => {
+    await loadSidebar();
+    refreshPending = false;
+  }, 400);
+}
+
+// ─── View switching ───────────────────────────────────────────────────────────
+function showView(name) {
+  const isDiagram = name === 'diagram';
+  document.querySelector('.workspace').style.display = isDiagram ? 'none' : 'flex';
+  document.getElementById('diagram-view').classList.toggle('visible', isDiagram);
+  document.getElementById('nav-query').classList.toggle('active', !isDiagram);
+  document.getElementById('nav-diagram').classList.toggle('active', isDiagram);
+  if (isDiagram) loadDiagram();
+}
+
+// ─── Diagram constants ────────────────────────────────────────────────────────
+const D = {
+  W:       210,   // table width
+  HDR:      38,   // header height
+  ROW:      22,   // row height per column
+  PAD:       8,   // bottom padding inside box
+  BEND:    100,   // bezier control point offset
+};
+function tblH(nCols) { return D.HDR + nCols * D.ROW + D.PAD; }
+function colCY(idx)  { return D.HDR + idx * D.ROW + D.ROW / 2; }
+
+// ─── Diagram state ────────────────────────────────────────────────────────────
+let diagData    = null;   // {tables, fks}
+let diagPos     = {};     // {tableName: {x, y}}
+let diagTx      = 0, diagTy = 0, diagScale = 1;
+let diagDrag    = null;   // {kind:'pan'|'table', name?, ox, oy, sx, sy}
+
+// ─── Load & render ────────────────────────────────────────────────────────────
+async function loadDiagram() {
+  document.getElementById('diagram-status').textContent = 'Loading…';
+  try {
+    const data = await fetch('/api/diagram').then(r => r.json());
+    diagData = data;
+    forceLayout(data);
+    renderDiagram();
+    fitDiagram();
+    document.getElementById('diagram-status').textContent =
+      `${data.tables.length} tables · ${data.fks.length} relationships`;
+  } catch(e) {
+    document.getElementById('diagram-status').textContent = 'Error: ' + e.message;
+  }
+}
+
+// ─── Force-directed layout ────────────────────────────────────────────────────
+function forceLayout(data) {
+  const N = data.tables.length;
+  if (N === 0) return;
+
+  const nodes = data.tables.map((t, i) => {
+    const angle = (2 * Math.PI * i) / N;
+    const r = Math.max(220, N * 70);
+    return { name: t.name, x: 600 + r * Math.cos(angle), y: 400 + r * Math.sin(angle), vx: 0, vy: 0 };
+  });
+
+  const nodeIdx = {};
+  nodes.forEach((n, i) => nodeIdx[n.name] = i);
+
+  const edges = data.fks
+    .map(fk => ({ src: nodeIdx[fk.fromTable], tgt: nodeIdx[fk.toTable] }))
+    .filter(e => e.src !== undefined && e.tgt !== undefined && e.src !== e.tgt);
+
+  const REPULSION = 18000, SPRING_LEN = 320, SPRING_K = 0.04, DAMP = 0.82;
+
+  for (let iter = 0; iter < 200; iter++) {
+    // repulsion between every pair
+    for (let i = 0; i < N; i++) {
+      for (let j = i + 1; j < N; j++) {
+        const dx = nodes[j].x - nodes[i].x;
+        const dy = nodes[j].y - nodes[i].y;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        const f = REPULSION / (dist * dist);
+        const fx = f * dx / dist, fy = f * dy / dist;
+        nodes[i].vx -= fx; nodes[i].vy -= fy;
+        nodes[j].vx += fx; nodes[j].vy += fy;
+      }
+    }
+    // spring attraction along FK edges
+    for (const e of edges) {
+      const a = nodes[e.src], b = nodes[e.tgt];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const f = SPRING_K * (dist - SPRING_LEN);
+      const fx = f * dx / dist, fy = f * dy / dist;
+      a.vx += fx; a.vy += fy;
+      b.vx -= fx; b.vy -= fy;
+    }
+    // integrate
+    for (const n of nodes) {
+      n.vx *= DAMP; n.vy *= DAMP;
+      n.x  += n.vx; n.y  += n.vy;
+    }
+  }
+
+  diagPos = {};
+  for (const n of nodes) diagPos[n.name] = { x: Math.round(n.x), y: Math.round(n.y) };
+}
+
+function resetDiagramLayout() {
+  if (!diagData) return;
+  forceLayout(diagData);
+  renderDiagram();
+  fitDiagram();
+}
+
+// ─── SVG rendering ────────────────────────────────────────────────────────────
+function svgEl(tag, attrs, parent, text) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  if (text !== undefined) el.textContent = text;
+  if (parent) parent.appendChild(el);
+  return el;
+}
+
+function renderDiagram() {
+  if (!diagData) return;
+  const linesG  = document.getElementById('diagram-lines');
+  const tablesG = document.getElementById('diagram-tables');
+  linesG.innerHTML  = '';
+  tablesG.innerHTML = '';
+
+  const tableMap = {};
+  for (const t of diagData.tables) tableMap[t.name] = t;
+
+  // Draw FK lines first (behind tables)
+  for (let i = 0; i < diagData.fks.length; i++) {
+    const fk = diagData.fks[i];
+    const srcPos = diagPos[fk.fromTable];
+    const tgtPos = diagPos[fk.toTable];
+    if (!srcPos || !tgtPos) continue;
+
+    const srcT = tableMap[fk.fromTable];
+    const tgtT = tableMap[fk.toTable];
+    if (!srcT || !tgtT) continue;
+
+    const srcColIdx = srcT.columns.findIndex(c => c.name === fk.fromCol);
+    const tgtColIdx = tgtT.columns.findIndex(c => c.name === fk.toCol);
+
+    drawFKLine(linesG, srcPos, srcColIdx >= 0 ? srcColIdx : 0,
+                        tgtPos, tgtColIdx >= 0 ? tgtColIdx : 0,
+                        fk.fromCol, fk.toTable, fk.fromTable, i);
+  }
+
+  // Draw tables on top
+  for (const t of diagData.tables) {
+    const pos = diagPos[t.name] || { x: 100, y: 100 };
+    drawTable(tablesG, t, pos);
+  }
+
+  applyDiagramTransform();
+}
+
+function drawFKLine(parent, srcPos, srcColIdx, tgtPos, tgtColIdx, label, toTable, fromTable, fkIdx) {
+  const srcCX = srcPos.x + D.W / 2;
+  const tgtCX = tgtPos.x + D.W / 2;
+  const srcLeft = srcCX > tgtCX;
+
+  const x1 = srcLeft ? srcPos.x       : srcPos.x + D.W;
+  const y1 = srcPos.y + colCY(srcColIdx);
+  const x2 = srcLeft ? tgtPos.x + D.W : tgtPos.x;
+  const y2 = tgtPos.y + colCY(tgtColIdx);
+
+  const bend = Math.min(D.BEND, Math.abs(x2 - x1) * 0.55 + 40);
+  const cp1x = srcLeft ? x1 - bend : x1 + bend;
+  const cp2x = srcLeft ? x2 + bend : x2 - bend;
+  const d    = `M ${x1} ${y1} C ${cp1x} ${y1} ${cp2x} ${y2} ${x2} ${y2}`;
+
+  const g = svgEl('g', {
+    class: 'fk-line-group',
+    'data-fk-idx':  fkIdx,
+    'data-fk-from': fromTable,
+    'data-fk-to':   toTable,
+  }, parent);
+
+  // Wide invisible hit area
+  svgEl('path', { d, fill: 'none', stroke: 'transparent', 'stroke-width': 12 }, g);
+
+  // Visible line — class fk-path lets CSS handle hover/selection
+  svgEl('path', {
+    class: 'fk-path',
+    d, fill: 'none', stroke: '#89b4fa', 'stroke-width': 1.8,
+    opacity: '0.65', 'marker-end': 'url(#fk-arrow)',
+    'marker-start': 'url(#fk-circle)',
+  }, g);
+
+  // Tooltip only (visual state handled by CSS)
+  g.addEventListener('mouseenter', () => showDiagramTooltip(`${fromTable}.${label} → ${toTable}`, x1, y1));
+  g.addEventListener('mouseleave', hideDiagramTooltip);
+}
+
+function drawTable(parent, table, pos) {
+  const h = tblH(table.columns.length);
+  const g = svgEl('g', {
+    class: 'tbl-group',
+    transform: `translate(${pos.x},${pos.y})`,
+    'data-table': table.name,
+  }, parent);
+
+  // Shadow / outer glow rect
+  svgEl('rect', {
+    x: 3, y: 3, width: D.W, height: h, rx: 8,
+    fill: 'rgba(0,0,0,0.35)',
+  }, g);
+
+  // Table box background
+  svgEl('rect', {
+    class: 'tbl-box',
+    x: 0, y: 0, width: D.W, height: h, rx: 8,
+    fill: '#181825', stroke: '#45475a', 'stroke-width': 1.5,
+  }, g);
+
+  // Header background (rounded top only via clip trick: rect + cover rect)
+  svgEl('rect', { x: 0, y: 0, width: D.W, height: D.HDR, rx: 8, fill: '#2a2a3d' }, g);
+  svgEl('rect', { x: 0, y: D.HDR - 8, width: D.W, height: 8, fill: '#2a2a3d' }, g);
+
+  // Accent left border stripe
+  svgEl('rect', { x: 0, y: 0, width: 4, height: h, rx: 2, fill: '#cba6f7' }, g);
+
+  // Table name
+  svgEl('text', {
+    x: D.W / 2, y: D.HDR - 12,
+    'text-anchor': 'middle', fill: '#cba6f7',
+    'font-size': 13, 'font-weight': 700,
+    'font-family': 'Segoe UI, system-ui, sans-serif',
+  }, g, table.name);
+
+  // Header separator
+  svgEl('line', {
+    x1: 4, y1: D.HDR, x2: D.W, y2: D.HDR,
+    stroke: '#313244', 'stroke-width': 1,
+  }, g);
+
+  // Column rows
+  table.columns.forEach((col, i) => {
+    const ry = D.HDR + i * D.ROW;
+    const rowG = svgEl('g', { class: 'col-row' }, g);
+
+    // Alternating row bg
+    if (i % 2 === 0) {
+      svgEl('rect', {
+        x: 4, y: ry, width: D.W - 4,
+        height: i === table.columns.length - 1 ? D.ROW + D.PAD : D.ROW,
+        fill: 'rgba(255,255,255,0.02)',
+        rx: i === table.columns.length - 1 ? 6 : 0,
+      }, rowG);
+    }
+
+    // PK icon
+    if (col.isPK) {
+      svgEl('text', { x: 12, y: ry + 15, 'font-size': 11 }, rowG, '🔑');
+    } else if (col.isFK) {
+      svgEl('text', { x: 12, y: ry + 15, 'font-size': 11 }, rowG, '🔗');
+    } else {
+      svgEl('circle', {
+        cx: 14, cy: ry + 11, r: 2.5,
+        fill: '#45475a',
+      }, rowG);
+    }
+
+    // Column name
+    svgEl('text', {
+      x: 28, y: ry + 15,
+      fill: col.isPK ? '#f9e2af' : col.isFK ? '#89dceb' : '#cdd6f4',
+      'font-size': 12,
+      'font-family': 'Cascadia Code, Fira Code, Consolas, monospace',
+    }, rowG, col.name);
+
+    // Column type (right aligned) — class lets compact mode hide via CSS
+    svgEl('text', {
+      class: 'col-type-text',
+      x: D.W - 8, y: ry + 15,
+      'text-anchor': 'end', fill: '#585b70',
+      'font-size': 10.5,
+      'font-family': 'Cascadia Code, Fira Code, Consolas, monospace',
+    }, rowG, col.type);
+
+    // Row separator
+    if (i < table.columns.length - 1) {
+      svgEl('line', {
+        x1: 4, y1: ry + D.ROW, x2: D.W, y2: ry + D.ROW,
+        stroke: '#313244', 'stroke-width': 0.5,
+      }, rowG);
+    }
+  });
+
+  // Click: select/deselect + highlight FK connections
+  g.addEventListener('click', e => { e.stopPropagation(); selectDiagramTable(table.name); });
+
+  // Double-click: jump to Query and run SELECT *
+  g.addEventListener('dblclick', e => {
+    e.stopPropagation();
+    showView('query');
+    editor.setValue(`SELECT *\nFROM ${table.name}\nLIMIT 100;`);
+    setTimeout(runQuery, 60);
+  });
+
+  // Drag
+  g.addEventListener('mousedown', e => startTableDrag(e, table.name, pos));
+}
+
+// ─── Tooltip ─────────────────────────────────────────────────────────────────
+let diagTooltip = null;
+function showDiagramTooltip(text, svgX, svgY) {
+  if (!diagTooltip) {
+    diagTooltip = document.createElement('div');
+    diagTooltip.style.cssText =
+      'position:fixed;background:#313244;color:#cdd6f4;padding:4px 10px;' +
+      'border-radius:6px;font-size:11px;pointer-events:none;z-index:200;' +
+      'border:1px solid #45475a;white-space:nowrap';
+    document.body.appendChild(diagTooltip);
+  }
+  diagTooltip.textContent = text;
+  diagTooltip.style.display = 'block';
+}
+function hideDiagramTooltip() {
+  if (diagTooltip) diagTooltip.style.display = 'none';
+}
+document.addEventListener('mousemove', e => {
+  if (diagTooltip && diagTooltip.style.display === 'block') {
+    diagTooltip.style.left = (e.clientX + 14) + 'px';
+    diagTooltip.style.top  = (e.clientY - 8)  + 'px';
+  }
+});
+
+// ─── Transform / pan / zoom ───────────────────────────────────────────────────
+function applyDiagramTransform() {
+  document.getElementById('diagram-root').setAttribute(
+    'transform', `translate(${diagTx},${diagTy}) scale(${diagScale})`
+  );
+  const pctEl = document.getElementById('diag-zoom-pct');
+  if (pctEl) pctEl.textContent = Math.round(diagScale * 100) + '%';
+}
+
+function fitDiagram() {
+  if (!diagData || diagData.tables.length === 0) return;
+  const svg    = document.getElementById('diagram-svg');
+  const vw     = svg.clientWidth  || 900;
+  const vh     = svg.clientHeight || 600;
+  const margin = 60;
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const t of diagData.tables) {
+    const p = diagPos[t.name];
+    if (!p) continue;
+    const h = tblH(t.columns.length);
+    minX = Math.min(minX, p.x);
+    minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x + D.W);
+    maxY = Math.max(maxY, p.y + h);
+  }
+
+  const contentW = maxX - minX || 1;
+  const contentH = maxY - minY || 1;
+  const scale = Math.min(
+    (vw - margin * 2) / contentW,
+    (vh - margin * 2) / contentH,
+    1.2
+  );
+
+  diagScale = scale;
+  diagTx = (vw - contentW * scale) / 2 - minX * scale;
+  diagTy = (vh - contentH * scale) / 2 - minY * scale;
+  applyDiagramTransform();
+}
+
+// Zoom with scroll wheel
+document.getElementById('diagram-svg').addEventListener('wheel', e => {
+  e.preventDefault();
+  const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+  const svg    = document.getElementById('diagram-svg');
+  const rect   = svg.getBoundingClientRect();
+  const mx     = e.clientX - rect.left;
+  const my     = e.clientY - rect.top;
+
+  diagTx = mx - (mx - diagTx) * factor;
+  diagTy = my - (my - diagTy) * factor;
+  diagScale *= factor;
+  applyDiagramTransform();
+}, { passive: false });
+
+// Pan (drag on SVG background)
+document.getElementById('diagram-svg').addEventListener('mousedown', e => {
+  if (e.target.closest('.tbl-group')) return;
+  diagDrag = { kind: 'pan', ox: diagTx, oy: diagTy, sx: e.clientX, sy: e.clientY };
+  e.currentTarget.classList.add('panning');
+});
+
+// Table drag
+function startTableDrag(e, name, pos) {
+  e.stopPropagation();
+  diagDrag = { kind: 'table', name, ox: pos.x, oy: pos.y, sx: e.clientX, sy: e.clientY };
+}
+
+document.addEventListener('mousemove', e => {
+  if (!diagDrag) return;
+  const dx = (e.clientX - diagDrag.sx) / diagScale;
+  const dy = (e.clientY - diagDrag.sy) / diagScale;
+
+  if (diagDrag.kind === 'pan') {
+    diagTx = diagDrag.ox + (e.clientX - diagDrag.sx);
+    diagTy = diagDrag.oy + (e.clientY - diagDrag.sy);
+    applyDiagramTransform();
+  } else {
+    diagPos[diagDrag.name] = {
+      x: Math.round(diagDrag.ox + dx),
+      y: Math.round(diagDrag.oy + dy),
+    };
+    renderDiagram();
+  }
+});
+
+document.addEventListener('mouseup', () => {
+  if (!diagDrag) return;
+  document.getElementById('diagram-svg').classList.remove('panning');
+  // Snap dragged table to 10px grid on release
+  if (diagDrag.kind === 'table') {
+    const p = diagPos[diagDrag.name];
+    p.x = Math.round(p.x / 10) * 10;
+    p.y = Math.round(p.y / 10) * 10;
+    renderDiagram();
+    // Reapply selection highlight after re-render
+    if (selectedTable) applyDiagramSelection(selectedTable);
+  }
+  diagDrag = null;
+});
+
+// Click on SVG background → deselect / clear search
+document.getElementById('diagram-svg').addEventListener('click', e => {
+  if (e.target.closest('.tbl-group')) return;
+  selectedTable = null;
+  clearDiagramSelection();
+});
+
+// ─── Selection ───────────────────────────────────────────────────────────────
+let selectedTable = null;
+
+function selectDiagramTable(name) {
+  if (selectedTable === name) {
+    selectedTable = null;
+    clearDiagramSelection();
+  } else {
+    selectedTable = name;
+    applyDiagramSelection(name);
+  }
+}
+
+function clearDiagramSelection() {
+  document.querySelectorAll('.tbl-group').forEach(g =>
+    g.classList.remove('selected', 'connected', 'dimmed'));
+  document.querySelectorAll('.fk-line-group').forEach(l =>
+    l.classList.remove('selected', 'dimmed'));
+}
+
+function applyDiagramSelection(name) {
+  if (!diagData) return;
+  const connectedTables = new Set();
+  const connectedIdx    = new Set();
+
+  diagData.fks.forEach((fk, i) => {
+    if (fk.fromTable === name || fk.toTable === name) {
+      connectedTables.add(fk.fromTable === name ? fk.toTable : fk.fromTable);
+      connectedIdx.add(i);
+    }
+  });
+
+  document.querySelectorAll('.tbl-group').forEach(g => {
+    const t = g.dataset.table;
+    g.classList.remove('selected', 'connected', 'dimmed');
+    if (t === name)               g.classList.add('selected');
+    else if (connectedTables.has(t)) g.classList.add('connected');
+    else                          g.classList.add('dimmed');
+  });
+
+  document.querySelectorAll('.fk-line-group').forEach(l => {
+    const idx = Number(l.dataset.fkIdx);
+    l.classList.remove('selected', 'dimmed');
+    if (connectedIdx.has(idx)) l.classList.add('selected');
+    else                       l.classList.add('dimmed');
+  });
+}
+
+// ─── Search ───────────────────────────────────────────────────────────────────
+function diagSearch(query) {
+  if (!query.trim()) {
+    document.querySelectorAll('.tbl-group').forEach(g =>
+      g.classList.remove('search-match', 'search-dim'));
+    return;
+  }
+  const q = query.toLowerCase();
+  document.querySelectorAll('.tbl-group').forEach(g => {
+    const match = (g.dataset.table || '').toLowerCase().includes(q);
+    g.classList.toggle('search-match', match);
+    g.classList.toggle('search-dim',  !match);
+  });
+}
+
+// ─── Zoom controls ────────────────────────────────────────────────────────────
+function diagZoomBy(delta) {
+  const svg  = document.getElementById('diagram-svg');
+  const vw   = svg.clientWidth  / 2;
+  const vh   = svg.clientHeight / 2;
+  const next = Math.max(0.1, Math.min(3, diagScale + delta));
+  const f    = next / diagScale;
+  diagTx     = vw - (vw - diagTx) * f;
+  diagTy     = vh - (vh - diagTy) * f;
+  diagScale  = next;
+  applyDiagramTransform();
+}
+
+// ─── Compact mode ─────────────────────────────────────────────────────────────
+let compactMode = false;
+function toggleCompact() {
+  compactMode = !compactMode;
+  document.getElementById('diagram-svg').classList.toggle('compact', compactMode);
+  document.getElementById('btn-compact').textContent = compactMode ? '≡ Full' : '≡ Compact';
+}
+
+// ─── Export helpers ───────────────────────────────────────────────────────────
+function getDiagramBounds() {
+  if (!diagData || !diagData.tables.length) return null;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const t of diagData.tables) {
+    const p = diagPos[t.name];
+    if (!p) continue;
+    minX = Math.min(minX, p.x);
+    minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x + D.W);
+    maxY = Math.max(maxY, p.y + tblH(t.columns.length));
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+function buildExportSVGString() {
+  const b = getDiagramBounds();
+  if (!b) return null;
+  const PAD = 50;
+  const W   = b.maxX - b.minX + PAD * 2;
+  const H   = b.maxY - b.minY + PAD * 2;
+  const NS  = 'http://www.w3.org/2000/svg';
+
+  const root = document.createElementNS(NS, 'svg');
+  root.setAttribute('xmlns',   NS);
+  root.setAttribute('width',   W);
+  root.setAttribute('height',  H);
+  root.setAttribute('viewBox', `0 0 ${W} ${H}`);
+
+  // Background
+  const bg = document.createElementNS(NS, 'rect');
+  bg.setAttribute('width', W); bg.setAttribute('height', H); bg.setAttribute('fill', '#1e1e2e');
+  root.appendChild(bg);
+
+  // Dot-grid pattern
+  const defs = document.createElementNS(NS, 'defs');
+  const pat  = document.createElementNS(NS, 'pattern');
+  pat.setAttribute('id', 'xdots'); pat.setAttribute('width', '28'); pat.setAttribute('height', '28');
+  pat.setAttribute('patternUnits', 'userSpaceOnUse');
+  const dot = document.createElementNS(NS, 'circle');
+  dot.setAttribute('cx', '1'); dot.setAttribute('cy', '1'); dot.setAttribute('r', '1'); dot.setAttribute('fill', '#313244');
+  pat.appendChild(dot); defs.appendChild(pat);
+
+  // Copy arrow/circle markers
+  const origDefs = document.querySelector('#diagram-svg defs');
+  if (origDefs) [...origDefs.children].forEach(c => defs.appendChild(c.cloneNode(true)));
+  root.appendChild(defs);
+
+  const gridRect = document.createElementNS(NS, 'rect');
+  gridRect.setAttribute('width', W); gridRect.setAttribute('height', H); gridRect.setAttribute('fill', 'url(#xdots)');
+  root.appendChild(gridRect);
+
+  // Content at offset
+  const content = document.createElementNS(NS, 'g');
+  content.setAttribute('transform', `translate(${PAD - b.minX}, ${PAD - b.minY})`);
+
+  const linesClone  = document.getElementById('diagram-lines').cloneNode(true);
+  const tablesClone = document.getElementById('diagram-tables').cloneNode(true);
+
+  // Strip interactive/selection classes from clone
+  [linesClone, tablesClone].forEach(c => {
+    c.querySelectorAll('[class]').forEach(el => {
+      el.classList.remove('selected','connected','dimmed','search-match','search-dim');
+    });
+  });
+
+  content.appendChild(linesClone);
+  content.appendChild(tablesClone);
+  root.appendChild(content);
+
+  return '<?xml version="1.0" encoding="UTF-8"?>\n' +
+         new XMLSerializer().serializeToString(root);
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a   = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 500);
+}
+
+function exportSVG() {
+  const str = buildExportSVGString();
+  if (!str) return;
+  downloadBlob(new Blob([str], { type: 'image/svg+xml;charset=utf-8' }), 'focusdb-schema.svg');
+}
+
+async function exportPNG() {
+  const str = buildExportSVGString();
+  if (!str) return;
+
+  const b     = getDiagramBounds();
+  const PAD   = 50;
+  const W     = (b.maxX - b.minX + PAD * 2);
+  const H     = (b.maxY - b.minY + PAD * 2);
+  const SCALE = 2; // retina
+
+  const canvas = document.createElement('canvas');
+  canvas.width  = W * SCALE;
+  canvas.height = H * SCALE;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(SCALE, SCALE);
+
+  const blob = new Blob([str], { type: 'image/svg+xml;charset=utf-8' });
+  const url  = URL.createObjectURL(blob);
+  const img  = new Image();
+
+  await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = url; });
+  ctx.drawImage(img, 0, 0);
+  URL.revokeObjectURL(url);
+
+  canvas.toBlob(b => downloadBlob(b, 'focusdb-schema.png'), 'image/png');
+}
+
+// ─── Keyboard shortcuts (diagram view) ───────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (!document.getElementById('diagram-view').classList.contains('visible')) return;
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  switch (e.key) {
+    case 'f': case 'F': fitDiagram(); break;
+    case 'r': case 'R': resetDiagramLayout(); break;
+    case 'Escape': selectedTable = null; clearDiagramSelection(); break;
+    case '+': case '=': diagZoomBy(0.15); break;
+    case '-': case '_': diagZoomBy(-0.15); break;
+  }
+});
+
+// ─── Utils ───────────────────────────────────────────────────────────────────
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+function escAttr(s) { return escHtml(s).replace(/'/g,'&#39;'); }
+</script>
+</body>
+</html>
