@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"dbf/internal/catalog"
+	"dbf/internal/constants"
 	"dbf/internal/parser"
 )
 
@@ -231,7 +232,7 @@ func startGUIServer(addr string, h executeHandler, cat *catalog.Catalog) {
 		for _, t := range tables {
 			pkCols[t.Name] = make(map[string]bool)
 			for _, c := range t.Constraints {
-				if c.Type == "PRIMARY KEY" {
+				if c.Type == constants.ConstraintPrimaryKey {
 					pkCols[t.Name][c.ColumnName] = true
 				}
 			}
@@ -242,7 +243,7 @@ func startGUIServer(addr string, h executeHandler, cat *catalog.Catalog) {
 		for _, t := range tables {
 			fkCols[t.Name] = make(map[string]bool)
 			for _, c := range t.Constraints {
-				if c.Type == "FOREIGN KEY" {
+				if c.Type == constants.ConstraintForeignKey {
 					fkCols[t.Name][c.ColumnName] = true
 					dto.FKs = append(dto.FKs, diagramFKDTO{
 						FromTable: t.Name,

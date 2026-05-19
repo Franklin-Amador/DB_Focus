@@ -242,9 +242,12 @@ tbody td{padding:5px 14px;white-space:nowrap;max-width:320px;overflow:hidden;tex
 .tbl-group.search-dim{opacity:.12}
 
 /* FK line states */
-.fk-line-group:hover .fk-path{stroke:#cba6f7!important;stroke-width:2.5px!important;opacity:1!important}
-.fk-line-group.selected .fk-path{stroke:#cba6f7!important;stroke-width:3px!important;opacity:1!important}
-.fk-line-group.dimmed{opacity:.06}
+.fk-line-group:hover .fk-path{stroke:#cba6f7!important;stroke-width:3px!important;opacity:1!important}
+.fk-line-group:hover .fk-label{opacity:1!important}
+.fk-line-group.selected .fk-path{stroke:#cba6f7!important;stroke-width:3.5px!important;opacity:1!important}
+.fk-line-group.selected .fk-label{opacity:1!important}
+.fk-line-group.dimmed{opacity:.05}
+.fk-label{opacity:0;transition:opacity .15s;pointer-events:none}
 
 /* Compact mode — hide type labels */
 #diagram-svg.compact .col-type-text{display:none}
@@ -433,13 +436,13 @@ tbody td{padding:5px 14px;white-space:nowrap;max-width:320px;overflow:hidden;tex
   </div>
   <svg id="diagram-svg" xmlns="http://www.w3.org/2000/svg">
     <defs>
-      <marker id="fk-arrow" markerWidth="9" markerHeight="7"
-              refX="8" refY="3.5" orient="auto">
-        <polygon points="0 0, 9 3.5, 0 7" fill="#89b4fa" opacity="0.9"/>
+      <marker id="fk-arrow" markerWidth="10" markerHeight="8"
+              refX="9" refY="4" orient="auto">
+        <polygon points="0 0, 10 4, 0 8" fill="#89b4fa"/>
       </marker>
-      <marker id="fk-circle" markerWidth="6" markerHeight="6"
-              refX="3" refY="3" orient="auto">
-        <circle cx="3" cy="3" r="2.5" fill="none" stroke="#89b4fa" stroke-width="1.5"/>
+      <marker id="fk-circle" markerWidth="8" markerHeight="8"
+              refX="4" refY="4" orient="auto">
+        <circle cx="4" cy="4" r="3" fill="#1a1a2e" stroke="#89b4fa" stroke-width="1.8"/>
       </marker>
     </defs>
     <g id="diagram-root">
@@ -1152,10 +1155,14 @@ function drawFKLine(parent, srcPos, srcColIdx, tgtPos, tgtColIdx, label, toTable
   const x2 = srcLeft ? tgtPos.x + D.W : tgtPos.x;
   const y2 = tgtPos.y + colCY(tgtColIdx);
 
-  const bend = Math.min(D.BEND, Math.abs(x2 - x1) * 0.55 + 40);
+  const bend = Math.min(D.BEND, Math.abs(x2 - x1) * 0.55 + 50);
   const cp1x = srcLeft ? x1 - bend : x1 + bend;
   const cp2x = srcLeft ? x2 + bend : x2 - bend;
   const d    = `M ${x1} ${y1} C ${cp1x} ${y1} ${cp2x} ${y2} ${x2} ${y2}`;
+
+  // Midpoint on the bezier curve (t=0.5)
+  const mx = 0.125*x1 + 0.375*cp1x + 0.375*cp2x + 0.125*x2;
+  const my = 0.125*y1 + 0.375*y1   + 0.375*y2   + 0.125*y2;
 
   const g = svgEl('g', {
     class: 'fk-line-group',
@@ -1164,18 +1171,38 @@ function drawFKLine(parent, srcPos, srcColIdx, tgtPos, tgtColIdx, label, toTable
     'data-fk-to':   toTable,
   }, parent);
 
-  // Wide invisible hit area
-  svgEl('path', { d, fill: 'none', stroke: 'transparent', 'stroke-width': 12 }, g);
+  // Glow / shadow path (thicker, blurred feel)
+  svgEl('path', {
+    d, fill: 'none', stroke: '#89b4fa', 'stroke-width': 6,
+    opacity: '0.08',
+  }, g);
 
-  // Visible line — class fk-path lets CSS handle hover/selection
+  // Wide invisible hit area
+  svgEl('path', { d, fill: 'none', stroke: 'transparent', 'stroke-width': 14 }, g);
+
+  // Visible line
   svgEl('path', {
     class: 'fk-path',
-    d, fill: 'none', stroke: '#89b4fa', 'stroke-width': 1.8,
-    opacity: '0.65', 'marker-end': 'url(#fk-arrow)',
+    d, fill: 'none', stroke: '#89b4fa', 'stroke-width': 2,
+    opacity: '0.75',
+    'stroke-dasharray': '0',
+    'marker-end': 'url(#fk-arrow)',
     'marker-start': 'url(#fk-circle)',
   }, g);
 
-  // Tooltip only (visual state handled by CSS)
+  // Floating label at midpoint
+  const labelG = svgEl('g', { class: 'fk-label', transform: `translate(${mx},${my})` }, g);
+  svgEl('rect', {
+    x: -28, y: -9, width: 56, height: 16, rx: 4,
+    fill: '#1e1e2e', stroke: '#89b4fa', 'stroke-width': 1, opacity: '0.9',
+  }, labelG);
+  svgEl('text', {
+    x: 0, y: 4,
+    'text-anchor': 'middle', fill: '#89b4fa',
+    'font-size': 9, 'font-weight': 600,
+    'font-family': 'Cascadia Code, Fira Code, Consolas, monospace',
+  }, labelG, `${fromTable}.${label}`);
+
   g.addEventListener('mouseenter', () => showDiagramTooltip(`${fromTable}.${label} → ${toTable}`, x1, y1));
   g.addEventListener('mouseleave', hideDiagramTooltip);
 }
@@ -1188,89 +1215,125 @@ function drawTable(parent, table, pos) {
     'data-table': table.name,
   }, parent);
 
-  // Shadow / outer glow rect
+  // Drop shadow
   svgEl('rect', {
-    x: 3, y: 3, width: D.W, height: h, rx: 8,
-    fill: 'rgba(0,0,0,0.35)',
+    x: 4, y: 5, width: D.W, height: h, rx: 9,
+    fill: 'rgba(0,0,0,0.45)',
   }, g);
 
   // Table box background
   svgEl('rect', {
     class: 'tbl-box',
-    x: 0, y: 0, width: D.W, height: h, rx: 8,
-    fill: '#181825', stroke: '#45475a', 'stroke-width': 1.5,
+    x: 0, y: 0, width: D.W, height: h, rx: 9,
+    fill: '#1a1a2e', stroke: '#45475a', 'stroke-width': 1.5,
   }, g);
 
-  // Header background (rounded top only via clip trick: rect + cover rect)
-  svgEl('rect', { x: 0, y: 0, width: D.W, height: D.HDR, rx: 8, fill: '#2a2a3d' }, g);
-  svgEl('rect', { x: 0, y: D.HDR - 8, width: D.W, height: 8, fill: '#2a2a3d' }, g);
+  // Header gradient background
+  svgEl('rect', { x: 0, y: 0, width: D.W, height: D.HDR, rx: 9, fill: '#2d2b55' }, g);
+  svgEl('rect', { x: 0, y: D.HDR - 9, width: D.W, height: 9, fill: '#2d2b55' }, g);
 
-  // Accent left border stripe
-  svgEl('rect', { x: 0, y: 0, width: 4, height: h, rx: 2, fill: '#cba6f7' }, g);
+  // Accent top border
+  svgEl('rect', { x: 0, y: 0, width: D.W, height: 3, rx: 2, fill: '#cba6f7' }, g);
 
   // Table name
   svgEl('text', {
-    x: D.W / 2, y: D.HDR - 12,
-    'text-anchor': 'middle', fill: '#cba6f7',
+    x: D.W / 2, y: D.HDR - 11,
+    'text-anchor': 'middle', fill: '#e0d7ff',
     'font-size': 13, 'font-weight': 700,
     'font-family': 'Segoe UI, system-ui, sans-serif',
+    'letter-spacing': '0.3',
   }, g, table.name);
+
+  // Column count badge
+  svgEl('rect', { x: D.W - 28, y: 6, width: 22, height: 13, rx: 6, fill: 'rgba(203,166,247,0.2)' }, g);
+  svgEl('text', {
+    x: D.W - 17, y: 16,
+    'text-anchor': 'middle', fill: '#cba6f7',
+    'font-size': 9, 'font-weight': 600,
+    'font-family': 'Segoe UI, system-ui, sans-serif',
+  }, g, table.columns.length);
 
   // Header separator
   svgEl('line', {
-    x1: 4, y1: D.HDR, x2: D.W, y2: D.HDR,
-    stroke: '#313244', 'stroke-width': 1,
+    x1: 0, y1: D.HDR, x2: D.W, y2: D.HDR,
+    stroke: '#413e6e', 'stroke-width': 1,
   }, g);
 
   // Column rows
   table.columns.forEach((col, i) => {
     const ry = D.HDR + i * D.ROW;
+    const isLast = i === table.columns.length - 1;
     const rowG = svgEl('g', { class: 'col-row' }, g);
 
-    // Alternating row bg
-    if (i % 2 === 0) {
+    // PK row highlight
+    if (col.isPK) {
       svgEl('rect', {
-        x: 4, y: ry, width: D.W - 4,
-        height: i === table.columns.length - 1 ? D.ROW + D.PAD : D.ROW,
-        fill: 'rgba(255,255,255,0.02)',
-        rx: i === table.columns.length - 1 ? 6 : 0,
+        x: 1, y: ry, width: D.W - 1,
+        height: isLast ? D.ROW + D.PAD : D.ROW,
+        fill: 'rgba(249,226,175,0.06)',
+        rx: isLast ? 8 : 0,
+      }, rowG);
+    } else if (col.isFK) {
+      svgEl('rect', {
+        x: 1, y: ry, width: D.W - 1,
+        height: isLast ? D.ROW + D.PAD : D.ROW,
+        fill: 'rgba(137,180,250,0.05)',
+        rx: isLast ? 8 : 0,
+      }, rowG);
+    } else if (i % 2 === 0) {
+      svgEl('rect', {
+        x: 1, y: ry, width: D.W - 1,
+        height: isLast ? D.ROW + D.PAD : D.ROW,
+        fill: 'rgba(255,255,255,0.018)',
+        rx: isLast ? 8 : 0,
       }, rowG);
     }
 
-    // PK icon
+    // Left color bar per column type
+    const barColor = col.isPK ? '#f9e2af' : col.isFK ? '#89b4fa' : '#45475a';
+    svgEl('rect', { x: 0, y: ry + 3, width: 3, height: D.ROW - 6, rx: 1.5, fill: barColor, opacity: col.isPK || col.isFK ? '0.8' : '0.3' }, rowG);
+
+    // Icon
     if (col.isPK) {
-      svgEl('text', { x: 12, y: ry + 15, 'font-size': 11 }, rowG, '🔑');
+      svgEl('text', { x: 11, y: ry + 15, 'font-size': 10 }, rowG, '🔑');
     } else if (col.isFK) {
-      svgEl('text', { x: 12, y: ry + 15, 'font-size': 11 }, rowG, '🔗');
+      svgEl('text', { x: 11, y: ry + 15, 'font-size': 10 }, rowG, '🔗');
     } else {
-      svgEl('circle', {
-        cx: 14, cy: ry + 11, r: 2.5,
-        fill: '#45475a',
-      }, rowG);
+      svgEl('circle', { cx: 13, cy: ry + 11, r: 2, fill: '#585b70' }, rowG);
     }
 
     // Column name
     svgEl('text', {
-      x: 28, y: ry + 15,
-      fill: col.isPK ? '#f9e2af' : col.isFK ? '#89dceb' : '#cdd6f4',
-      'font-size': 12,
+      x: 26, y: ry + 15,
+      fill: col.isPK ? '#f9e2af' : col.isFK ? '#89b4fa' : '#cdd6f4',
+      'font-size': 11.5,
+      'font-weight': col.isPK || col.isFK ? 600 : 400,
       'font-family': 'Cascadia Code, Fira Code, Consolas, monospace',
     }, rowG, col.name);
 
-    // Column type (right aligned) — class lets compact mode hide via CSS
+    // Column type badge
+    const typeLabel = col.type ? col.type.toUpperCase() : '';
+    const typeW = Math.max(28, typeLabel.length * 6 + 8);
+    const typeX = D.W - typeW - 6;
+    svgEl('rect', {
+      class: 'col-type-text',
+      x: typeX, y: ry + 4, width: typeW, height: 13, rx: 4,
+      fill: col.isPK ? 'rgba(249,226,175,0.12)' : col.isFK ? 'rgba(137,180,250,0.12)' : 'rgba(88,91,112,0.25)',
+    }, rowG);
     svgEl('text', {
       class: 'col-type-text',
-      x: D.W - 8, y: ry + 15,
-      'text-anchor': 'end', fill: '#585b70',
-      'font-size': 10.5,
+      x: typeX + typeW / 2, y: ry + 14,
+      'text-anchor': 'middle',
+      fill: col.isPK ? '#f9e2af' : col.isFK ? '#89b4fa' : '#6c7086',
+      'font-size': 9, 'font-weight': 600,
       'font-family': 'Cascadia Code, Fira Code, Consolas, monospace',
-    }, rowG, col.type);
+    }, rowG, typeLabel);
 
     // Row separator
-    if (i < table.columns.length - 1) {
+    if (!isLast) {
       svgEl('line', {
-        x1: 4, y1: ry + D.ROW, x2: D.W, y2: ry + D.ROW,
-        stroke: '#313244', 'stroke-width': 0.5,
+        x1: 6, y1: ry + D.ROW, x2: D.W - 6, y2: ry + D.ROW,
+        stroke: '#2a2a3d', 'stroke-width': 0.8,
       }, rowG);
     }
   });
