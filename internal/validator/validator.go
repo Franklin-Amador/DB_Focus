@@ -225,9 +225,24 @@ func (v *Validator) validateDataType(dataType string) error {
 		constants.DataTypeInteger: true,
 		constants.DataTypeText:    true,
 		constants.DataTypeBoolean: true,
-		"INT":                     true, // Alias for INTEGER
-		"VARCHAR":                 true, // Alias for TEXT
-		"BOOL":                    true, // Alias for BOOLEAN
+		"INT":       true,
+		"BIGINT":    true,
+		"SMALLINT":  true,
+		"SERIAL":    true,
+		"BIGSERIAL": true,
+		"VARCHAR":   true,
+		"CHAR":      true,
+		"BOOL":      true,
+		"TIMESTAMP": true,
+		"DATE":      true,
+		"TIME":      true,
+		"FLOAT":     true,
+		"REAL":      true,
+		"NUMERIC":   true,
+		"DECIMAL":   true,
+		"JSON":      true,
+		"JSONB":     true,
+		"UUID":      true,
 	}
 
 	if !validTypes[dataType] {

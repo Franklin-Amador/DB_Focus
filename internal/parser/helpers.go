@@ -433,9 +433,27 @@ func (p *Parser) parseColumnDef() (ast.ColumnDef, error) {
 		return ast.ColumnDef{}, p.errorf("expected type name")
 	}
 	colType := p.cur.Literal
+	isSerial := strings.EqualFold(colType, "SERIAL")
+	if isSerial {
+		colType = "INTEGER"
+	}
 	p.next()
 
-	colDef := ast.ColumnDef{Name: colName, Type: colType, Constraints: []ast.Constraint{}}
+	// Skip optional type length/precision: VARCHAR(50), CHAR(10), NUMERIC(10,2), etc.
+	if p.cur.Type == TokenLParen {
+		p.next()
+		depth := 1
+		for depth > 0 && p.cur.Type != TokenEOF {
+			if p.cur.Type == TokenLParen {
+				depth++
+			} else if p.cur.Type == TokenRParen {
+				depth--
+			}
+			p.next()
+		}
+	}
+
+	colDef := ast.ColumnDef{Name: colName, Type: colType, Constraints: []ast.Constraint{}, Identity: isSerial}
 
 	for {
 		switch p.cur.Type {
@@ -448,6 +466,9 @@ func (p *Parser) parseColumnDef() (ast.ColumnDef, error) {
 				return ast.ColumnDef{}, p.errorf("expected NULL after NOT")
 			}
 			colDef.NotNull = true
+		case TokenNull:
+			// explicit NULL — no-op, just consume
+			p.next()
 		case TokenPrimary:
 			p.next()
 			if !p.expect(TokenKey) {
@@ -457,8 +478,61 @@ func (p *Parser) parseColumnDef() (ast.ColumnDef, error) {
 		case TokenUnique:
 			p.next()
 			colDef.Constraints = append(colDef.Constraints, &ast.UniqueConstraint{ColumnName: colName.Name})
+		case TokenIdent:
+			// DEFAULT keyword (not yet a dedicated token)
+			if strings.EqualFold(p.cur.Literal, "DEFAULT") {
+				p.next()
+				lit, err := p.parseDefaultValue()
+				if err != nil {
+					return ast.ColumnDef{}, err
+				}
+				colDef.DefaultVal = lit
+			} else {
+				return colDef, nil
+			}
 		default:
 			return colDef, nil
 		}
+	}
+}
+
+// parseDefaultValue consumes the default expression after DEFAULT.
+// Supports: literals (string, number), TRUE/FALSE/NULL, identifiers (e.g. CURRENT_TIMESTAMP).
+func (p *Parser) parseDefaultValue() (*ast.Literal, error) {
+	switch p.cur.Type {
+	case TokenString:
+		lit := &ast.Literal{Kind: "string", Value: p.cur.Literal}
+		p.next()
+		return lit, nil
+	case TokenNumber:
+		lit := &ast.Literal{Kind: "number", Value: p.cur.Literal}
+		p.next()
+		return lit, nil
+	case TokenTrue:
+		lit := &ast.Literal{Kind: "bool", Value: "true"}
+		p.next()
+		return lit, nil
+	case TokenFalse:
+		lit := &ast.Literal{Kind: "bool", Value: "false"}
+		p.next()
+		return lit, nil
+	case TokenNull:
+		lit := &ast.Literal{Kind: "null", Value: "NULL"}
+		p.next()
+		return lit, nil
+	case TokenIdent:
+		// e.g. CURRENT_TIMESTAMP or any function-like identifier
+		val := p.cur.Literal
+		p.next()
+		// Handle function call syntax: NOW() etc.
+		if p.cur.Type == TokenLParen {
+			p.next()
+			if p.cur.Type == TokenRParen {
+				p.next()
+			}
+		}
+		return &ast.Literal{Kind: "ident", Value: val}, nil
+	default:
+		return &ast.Literal{Kind: "ident", Value: ""}, nil
 	}
 }
