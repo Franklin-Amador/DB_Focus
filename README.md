@@ -2,6 +2,47 @@
 
 Motor de base de datos en Go con compatibilidad PostgreSQL Wire Protocol.
 
+## GUI — FocusDB Studio
+
+Interfaz web incluida en el binario (`go:embed`), disponible en `http://localhost:9011` (flag `-gui`). **Funciona 100% offline**: CodeMirror 5.65.16 está vendoreado en `cmd/focusd/static/vendor/` (licencia MIT incluida).
+
+**Editor**
+- Pestañas múltiples de consulta (undo propio por pestaña; persisten en el navegador).
+- Ejecutar statement actual (`F5`/`Ctrl+Enter`), selección, o todo el script (`Ctrl+Shift+Enter`).
+- "Ejecutar todo" muestra **un resultado por statement** (acordeón); ante un error se detiene, indica cuál falló y lo subraya en el editor.
+- Botón **Cancelar** para consultas largas (cancelación real vía contexto en el backend).
+- Autocompletado con tablas/columnas del schema, alias del statement y snippets (`Ctrl+Space`); búsqueda en el editor (`Ctrl+F`); validación de sintaxis en vivo; historial persistente.
+
+**Resultados**
+- Orden por columna, filtro rápido, render paginado (500 filas por bloque, "cargar más").
+- Export **CSV** (RFC 4180) y **JSON** del conjunto filtrado.
+- Click en celda copia; doble click abre la celda expandida (pretty-print de JSON).
+- Copiar fila como `INSERT`. Indicador de resultado truncado (la GUI pide `maxRows: 5000`).
+
+**Explorador de datos** (grilla CRUD)
+
+| Acción | Cómo |
+|---|---|
+| **Abrir** | Pasá el mouse sobre una tabla en el árbol lateral → aparecen dos iconos a la derecha; el de **cuadrícula** abre la grilla (el de flecha hace `SELECT *`) |
+| **Paginar** | `‹` `›` en la barra superior (100 filas por página); `↺` recarga; `←` vuelve al editor |
+| **Editar celda** | **Doble click** → `Enter` guarda, `Esc` cancela. Las columnas `IDENTITY` no son editables |
+| **Insertar fila** | Botón `+ Insertar fila` → formulario; los campos `IDENTITY` salen deshabilitados y el `*` marca `NOT NULL` (campo vacío en columna opcional → `NULL`) |
+| **Borrar fila** | Hover sobre la fila → `×` al inicio → confirmación mostrando la fila |
+
+- Los encabezados muestran badges **PK** / **ID** (identity) / **NN** (not null).
+- **Requiere `PRIMARY KEY`**: sin PK el motor no puede identificar la fila, así que la grilla queda en solo lectura (se avisa en la barra de estado y se ocultan insertar/borrar).
+- Todas las escrituras se ejecutan como SQL real contra el motor: **disparan triggers** y persisten en Pebble igual que si las escribieras a mano.
+
+**Diagrama ER**
+- Posiciones, zoom y modo compacto **persisten** (localStorage, por firma del schema); reentrar a la vista no re-organiza.
+- Drag fluido (solo se recalculan las líneas incidentes), pan/zoom con rueda o **pinch** (Pointer Events), minimapa con navegación.
+- Self-FK como bucle, cardinalidad `1`/`N` en los extremos, contador de filas por tabla, badges de índice (`ix`) y `UNIQUE` (`u`).
+- Export SVG/PNG limpio (sin labels de hover). Modo compacto real (cajas más angostas, sin tipos).
+
+**API HTTP** (puerto GUI): `POST /api/query` (`{sql, maxRows?}`), `POST /api/script` (resultados por statement + `failedIndex`), `POST /api/validate`, `GET /api/schema` (columnas con `notNull/identity/isPK/isFK/isUnique`, `rowCount`, `indexes`, `viewDefinition`), `GET /api/objects` (con `bodyText`, `lastRun`), `GET /api/diagram`, `GET /api/table-data?table=&offset=&limit=`.
+
+**Flags**: `-gui :9011` · `-query-timeout 60s` (tope por consulta de la GUI; `0` lo desactiva).
+
 ## Almacenamiento
 
 **Backend:** Pebble (Embedded Key-Value Store con WAL)
@@ -40,9 +81,14 @@ postgresql://postgres:4444@localhost:4444/postgres
 
 ## SQL soportado
 
-- `SELECT` [DISTINCT] columnas FROM tabla [WHERE columna = literal] [GROUP BY columna] [ORDER BY columna [ASC|DESC]] [LIMIT n] [OFFSET n]
-- `SELECT` [DISTINCT] ... FROM tabla [INNER|LEFT|RIGHT|FULL [OUTER]|CROSS] JOIN tabla2 [ON tabla.col = tabla2.col] [ORDER BY columna [ASC|DESC]] [LIMIT n]
-- `SELECT` COUNT(*) FROM tabla [GROUP BY columna] [ORDER BY columna [ASC|DESC]] [LIMIT n]
+- `SELECT` [DISTINCT] columnas FROM tabla [WHERE predicado] [GROUP BY columna] [ORDER BY columna [ASC|DESC]] [LIMIT n] [OFFSET n]
+  - `predicado`: `columna OP literal` combinable con `AND`/`OR` y paréntesis. `OP` puede ser `=`, `<>` (o `!=`), `<`, `>`, `<=`, `>=`.
+- `SELECT` [DISTINCT] ... FROM tabla [NATURAL] [INNER|LEFT|RIGHT|FULL [OUTER]|CROSS] JOIN tabla2 [ON tabla.col = tabla2.col | USING (col, ...)] [JOIN tabla3 ...] ... [WHERE ...] [ORDER BY columna [ASC|DESC]] [LIMIT n]
+  - Soporta **cadenas de N joins** (3+ tablas): `FROM a JOIN b ON ... JOIN c ON ...`. Las columnas se referencian calificadas (`tabla.col`) o sin calificar si son inequívocas.
+  - `NATURAL JOIN`: une por **todas** las columnas con el mismo nombre en ambos lados; las comunes aparecen una sola vez (coalesce). Sin columnas comunes se comporta como `CROSS JOIN`.
+  - `JOIN ... USING (col, ...)`: une por las columnas nombradas (que deben existir en ambos lados); esas columnas aparecen una sola vez (coalesce).
+- `SELECT` agg(...) FROM tabla [GROUP BY columna] [ORDER BY columna [ASC|DESC]] [LIMIT n]
+  - Funciones de agregado: `COUNT(*)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`.
 - `WITH` cte_name AS (SELECT ...) [, cte_name2 AS (SELECT ...)] SELECT ...
 - `CREATE TABLE` tabla (columna tipo [IDENTITY] [PRIMARY KEY], ...)
 - `CREATE VIEW` vista AS SELECT ...
@@ -74,6 +120,8 @@ postgresql://postgres:4444@localhost:4444/postgres
 - `DELETE FROM` tabla [WHERE columna = literal]
 
 **Notas:**
+- `WHERE` soporta operadores de comparación: `=`, `<>`/`!=`, `<`, `>`, `<=`, `>=` (en SELECT, UPDATE y DELETE). La igualdad (`=`) usa índice cuando existe. **Todos** los operadores comparan por forma canónica: numéricamente si ambos lados son números, lexicográficamente en caso contrario. Esto hace que `WHERE id = 1` funcione igual sobre una columna `IDENTITY` (valor `int`) que sobre una columna con valores literales (`string`) — importante en `UPDATE`/`DELETE`, que recorren la tabla en vez de usar el índice.
+- `WHERE` soporta predicados compuestos con `AND` y `OR`, precedencia estándar (`AND` liga más fuerte que `OR`) y paréntesis para agrupar: `WHERE a > 10 AND (b = 'x' OR c <= 5)`. Funciona también sobre JOINs (columnas calificadas, ej. `pedidos.total > 80`).
 - Columnas con `IDENTITY` se auto-incrementan automáticamente en cada INSERT.
 - `INSERT` sin lista de columnas ahora soporta correctamente tablas con `IDENTITY`: si envías solo los valores de columnas no-IDENTITY, el motor autogenera el ID y preserva el resto de valores en su columna correcta.
 - Los procedimientos almacenados pueden tener parámetros y ejecutar múltiples sentencias.
@@ -99,6 +147,9 @@ postgresql://postgres:4444@localhost:4444/postgres
 - `CREATE INDEX` permite acelerar búsquedas por igualdad (`WHERE columna = valor`) en tablas con alto volumen de filas.
 - `DROP INDEX` elimina un índice definido en una tabla y persiste el cambio en disco.
 - Soporta claves foráneas autorreferenciadas (self FK), por ejemplo `FOREIGN KEY (parent_id) REFERENCES categorias(id)`.
+- Las claves foráneas funcionan correctamente cuando referencian una columna `IDENTITY`: la comparación de valores es tolerante al tipo, así que un valor literal (`1`) coincide con una clave IDENTITY autogenerada.
+- Los JOIN encadenan N tablas (3+). La condición `ON` compara por forma canónica, por lo que un JOIN entre una FK literal y una PK `IDENTITY` empareja correctamente.
+- `NATURAL JOIN` y `USING` coalescen las columnas comunes (aparecen una vez). En outer joins el valor coalescido toma el lado no nulo. La columna común sobrevive con la referencia de la tabla izquierda (ej. tras `a NATURAL JOIN b`, se usa `a.col` o `col` sin calificar; `b.col` deja de estar disponible).
 - **Validación de constraints en ALTER TABLE**:
   - No permite agregar una segunda PRIMARY KEY si la tabla ya tiene una
   - No permite eliminar columnas referenciadas por FOREIGN KEY de otras tablas
@@ -147,20 +198,53 @@ Limitaciones actuales:
 
 ## Pruebas de regresión recomendadas
 
+> **Entorno Windows**: compilar/ejecutar con `CGO_ENABLED=0` si el toolchain C no está en el PATH
+> (Pebble tiene implementación puro-Go). Ej: `CGO_ENABLED=0 go run ./cmd/test-multi-join`.
+
 ```bash
 # Escenarios de integración del motor (sin servidor externo)
+
+# DDL / ALTER / schemas
 go run ./cmd/test-alter
 go run ./cmd/test-alter-constraints
 go run ./cmd/test-create-schema
-go run ./cmd/test-drop-table-fk
+go run ./cmd/test-drop-schema
+go run ./cmd/test-parse-ddl
+
+# Índices
 go run ./cmd/test-index
-go run ./cmd/test-job-persistence
-go run ./cmd/test-multi-stmt
-go run ./cmd/test-parse-proc
-go run ./cmd/test-persistence-integration
-go run ./cmd/test-procedure-persistence
+go run ./cmd/test-drop-index
+
+# Claves foráneas e IDENTITY
+go run ./cmd/test-drop-table-fk
 go run ./cmd/test-self-fk
+go run ./cmd/test-fk-identity
+go run ./cmd/test-identity-insert
+
+# Consultas: WHERE, agregados, JOINs
+go run ./cmd/test-where-operators
+go run ./cmd/test-aggregates
+go run ./cmd/test-multi-join
+go run ./cmd/test-natural-join
+
+# Vistas
+go run ./cmd/test-views
+go run ./cmd/test-views-cascade
+go run ./cmd/test-views-columnlist
+go run ./cmd/test-view-if-not-exists
+go run ./cmd/test-view-persistence
+
+# Rutinas (procedures / triggers / jobs) y persistencia
+go run ./cmd/test-parse-proc
+go run ./cmd/test-procedure-persistence
+go run ./cmd/test-routine-persistence
+go run ./cmd/test-job-persistence
 go run ./cmd/test-trigger-recursion
+go run ./cmd/test-persistence-integration
+
+# Parseo multi-statement
+go run ./cmd/test-multi-stmt
+go run ./cmd/test-multiline
 ```
 
 ```bash
@@ -230,8 +314,16 @@ SELECT DISTINCT users.name FROM users INNER JOIN orders ON users.id = orders.use
 -- Agregar COUNT: contar todas las filas (COUNT(*))
 SELECT COUNT(*) FROM users;
 
--- GROUP BY: agrupar y contar por columna
+-- Funciones de agregado: SUM, AVG, MIN, MAX
+SELECT SUM(precio) FROM productos;
+SELECT AVG(precio) FROM productos;
+SELECT MIN(precio) FROM productos;
+SELECT MAX(precio) FROM productos;
+
+-- GROUP BY: agrupar y contar/agregar por columna
 SELECT user_id, COUNT(*) FROM orders GROUP BY user_id;
+SELECT categoria, SUM(precio) FROM productos GROUP BY categoria;
+SELECT categoria, MAX(precio) FROM productos GROUP BY categoria;
 
 -- INNER JOIN: solo filas con coincidencias
 SELECT * FROM users INNER JOIN orders ON users.id = orders.user_id;

@@ -15,7 +15,16 @@ FocusDB is a SQL database engine written in Go with PostgreSQL Wire Protocol com
 ```
 DB_F/
 ├── cmd/                    # Application entry points
-│   ├── focusd/            # Main database server (main.go, handler.go)
+│   ├── focusd/            # Main database server
+│   │   ├── main.go        # Bootstrap + flags (-addr, -gui, -data, -query-timeout)
+│   │   ├── handler.go     # SQL execution (wire + GUI): HandleWithDatabaseCtx, HandleScript
+│   │   ├── gui_server.go  # HTTP mux, static embed, middlewares (recover/method/cache)
+│   │   ├── gui_api.go     # GUI API handlers + DTOs
+│   │   └── static/        # GUI "FocusDB Studio" (embebida con go:embed)
+│   │       ├── index.html # Solo markup + <link>/<script>
+│   │       ├── css/       # app.css (design system "Botánico nocturno")
+│   │       ├── js/        # Módulos ES (ver abajo)
+│   │       └── vendor/    # CodeMirror 5.65.16 vendoreado (offline, MIT)
 │   └── test-*/            # Integration test programs
 ├── internal/               # Private packages
 │   ├── ast/               # Abstract Syntax Tree definitions
@@ -31,7 +40,41 @@ DB_F/
 └── go.mod / go.sum        # Go module files
 ```
 
+### GUI frontend (`cmd/focusd/static/js/`)
+
+Módulos ES sin bundler (`<script type="module">`). CodeMirror se carga antes como script
+clásico y se usa vía el global `window.CodeMirror`.
+
+| Módulo | Responsabilidad |
+|---|---|
+| `app.js` | Bootstrap, cambio de vista (query/diagram/explorer), **puente `window.*`** |
+| `state.js` | Estado compartido (`state.editor`); mutar propiedades, nunca reasignar |
+| `api.js` | Cliente HTTP de los endpoints (+ `AbortController`, `maxRows`) |
+| `dom.js` | `render()` (DOM-safe), `escHtml/escAttr`, `showToast`, `spawnMotes`, `downloadBlob` |
+| `icons.js` | `ICON_PATHS` + `icon()` — iconografía SVG de línea |
+| `editor.js` | CodeMirror, ejecución, validación, historial persistente, autocompletado |
+| `tabs.js` | Pestañas de consulta (`CodeMirror.Doc` + `swapDoc`) |
+| `results.js` | Resultados: filtro/orden/paginación, export CSV-JSON, modal de celda, script runner |
+| `sidebar.js` | Árbol de objetos |
+| `explorer.js` | Grilla CRUD (`/api/table-data` + escrituras por `/api/query`) |
+| `diagram.js` | Diagrama ER (layout, drag, minimapa, export) |
+
+**Convenciones del frontend (importantes)**
+- El markup usa handlers inline (`onclick="..."`). Toda función referenciada desde HTML
+  **debe** exportarse y registrarse en el `Object.assign(window, {...})` de `app.js`.
+  Al agregar una, verificá con `grep -o 'on[a-z]*="[a-zA-Z_]*' static/index.html`.
+- **Nunca usar `innerHTML` directo** (hay un hook de seguridad que lo bloquea): usar el helper
+  `render(el, html)` de `dom.js` (DOMParser + `replaceChildren`).
+- Estado persistido en `localStorage` con claves versionadas: `focusdb.tabs.v1`,
+  `focusdb.history.v1`, `focusdb.diagram.v1.<sig>`. Todo `JSON.parse` va con try/catch.
+- Los colores del diagrama están hardcodeados a propósito (const `C` en `diagram.js`) para que
+  el SVG exportado sea autocontenido; el resto de la UI usa las CSS vars del tema.
+
 ## Build/Lint/Test Commands
+
+> **Windows / entorno sin toolchain C**: anteponer `CGO_ENABLED=0` a todos los comandos de
+> build/test/run (Pebble tiene fallback puro-Go). Sin esto, la compilación de
+> `pebble/internal/manual` y `DataDog/zstd` falla con `cgo.exe: exit status 2`.
 
 ### Build
 ```bash
@@ -41,8 +84,13 @@ go build -o focusd ./cmd/focusd          # Build with custom binary name
 
 ### Run
 ```bash
-go run ./cmd/focusd                      # Run database server
+go run ./cmd/focusd                      # Run database server (wire :4444, GUI :9011)
+go run ./cmd/focusd -gui :9011 -data ./data -query-timeout 60s
 ```
+
+**Nota de Windows**: el binario queda bloqueado mientras corre. Antes de recompilar,
+`taskkill /F /IM focusd.exe`. Pebble además es de **un solo escritor**: solo un proceso
+puede tener abierto el mismo `-data` a la vez.
 
 ### Test Commands
 ```bash
@@ -199,17 +247,54 @@ Check `internal/constants/` for key prefix conventions.
 ## Common Tasks
 
 ### Adding a New SQL Statement Type
-1. Define AST node in `internal/ast/`
-2. Add parser support in `internal/parser/`
-3. Add validation in `internal/validator/`
-4. Implement execution in `internal/executor/`
-5. Add tests at each layer
+
+Desde el refactor (Fase 2) el dispatch es **por datos, con auto-registro**: no hay que editar
+`executor.go` ni el `switch` de `parser.go`.
+
+1. **Token** en `internal/parser/token.go`: la constante + la entrada en el mapa `keywords`.
+2. **Nodo AST** en `internal/ast/ast.go` (con su marker `stmtNode()`).
+3. **Parser**: escribir `parseXxx()` en `parser.go`/`helpers.go` y registrarlo en el `init()` de
+   `parser_registry.go` (`topLevelParsers`, o `createParsers`/`dropParsers`/`alterParsers`
+   según corresponda). Los mapas se pueblan en `init()` a propósito, para evitar el
+   "initialization cycle" estático.
+4. **Executor**: escribir el handler en su propio `executor_*.go` y auto-registrarlo con
+   `registerExec((*Executor).executeXxx)` dentro del `init()` de ese mismo archivo.
+5. **Validación** en `internal/validator/` si aplica.
+6. **Tag de resultado** en `internal/constants/`.
+7. **Tests**: unit en `parser_test.go` + integración en `cmd/test-<feature>/`.
+8. **Docs**: sintaxis en `README.md` + entrada en el Work Log de este archivo.
+
+**Helpers a reutilizar** (no re-implementar):
+- Executor: `checkCtx`, `schemaOrPublic`, `qualifiedName`, `persistTable`, `persistTableWarn`
+  (`executor_helpers.go`).
+- Parser: `parseIdentRequired`, `parseOptionalIfExists`, `parseOptionalCascadeRestrict`,
+  `parseBeginEndBlock`, `parseWhereClause` (`helpers.go`).
+- Comparación de valores: `catalog.ValuesEqual` / `executor.compareCells` — **nunca `==` crudo**
+  (ver "Gotchas" abajo).
 
 ### Adding a New Feature
 1. Understand existing patterns in related code
 2. Write tests first when possible
 3. Follow the layered architecture (parser -> validator -> executor)
 4. Ensure thread safety for shared state
+
+### Gotchas del motor (aprendidos a golpes)
+
+1. **Tipos de celda heterogéneos.** Las filas son `[]interface{}` con tipos Go mezclados: los
+   literales de SQL se guardan como **string**, los valores generados por `IDENTITY` como
+   **int**. Comparar con `==` crudo falla en silencio (`int(1) != "1"`). Usar siempre
+   `catalog.ValuesEqual` (FK, igualdad) o `compareCells` (orden). Los índices ya son coherentes
+   porque sus claves son strings canónicas (`normalizeIndexValue`).
+   Esto causó dos bugs reales: FK contra PK `IDENTITY`, y `UPDATE/DELETE ... WHERE id = 1`
+   afectando 0 filas (el `SELECT` "funcionaba" solo por el fast-path del índice).
+2. **Sin transacciones.** Un script que falla a mitad deja aplicados los statements previos;
+   `/api/script` reporta `failedIndex` pero no hace rollback.
+3. **Persistencia desacoplada del AST.** Vistas y rutinas guardan su SQL canónico
+   (`QueryText`/`BodyText`) y se **re-parsean** al cargar. Al tocar esos structs hay que
+   propagar el texto en las tres capas: `ast` → `catalog` → `storage`, y también en los
+   `Load*` de la recarga (un `Get*` que olvide copiar `BodyText` lo pierde al persistir).
+4. **`gob` acopla el formato en disco.** Agregar campos a un struct persistido es
+   backward-compatible (decodifican a cero); renombrarlos o cambiar su tipo, no.
 
 ## Work Log - Feature Integration Backlog
 
@@ -861,3 +946,329 @@ Phase 3: Testing DROP SCHEMA...
 - ✅ `go test -vet=off ./internal/...`
 
 **Status**: ✅ COMPLETED - IDENTITY positional INSERT now preserves non-IDENTITY values correctly
+
+---
+
+### Session: August 14, 2026 - Modularization Refactor (Roadmap + Fase 1)
+
+**Objective**: Reducir la fricción de agregar features. Diagnóstico completo de acoplamiento y
+plan por fases documentado en `REFACTOR.md`. Arranque de la Fase 1.
+
+**Status**: ⏳ IN PROGRESS
+
+**Diagnóstico (resumen, detalle en `REFACTOR.md`)**:
+- 🔴 Boilerplate copiado en cada handler del executor (resolución de schema, persistencia con
+  warning, ctx-check) — ~13 sitios, con default de schema inconsistente (`""` vs `"public"`) y
+  manejo de error de persistencia inconsistente (unos warning+éxito, otros error).
+- 🔴 Capa pg/system-catalog triplicada: `server/bypass.go` + `catalog/system_handler.go`
+  (~400 líneas muertas) + `catalog/system_catalog.go`, toda por match de strings.
+- 🔴 `storage.Backend` de 18 métodos con implementación legacy toda-stubs.
+- 🟡 `Catalog` god object (5 responsabilidades bajo un solo lock, acoplado al AST).
+- 🟡 Nodos AST anémicos: `WhereClause` = un solo `col = valor` (sin AND/OR ni operadores);
+  agregados detectados por prefijo de string; `gob` de nodos AST acopla persistencia al parseo.
+- 🟡 `validator` desconectado del parser; lógica de validación triplicada; 3 listas de tipos.
+
+**Plan por fases**: ver `REFACTOR.md`.
+1. Fase 1: matar boilerplate (helpers executor/parser) — bajo riesgo. ⏳
+2. Fase 2: registry de statements (dispatch por datos).
+3. Fase 3: consolidar capa pg/system-catalog.
+4. Fase 4: segregar `storage.Backend` y `Catalog`.
+5. Fase 5: AST expresivo (WHERE compuesto, operadores, agregados, HAVING).
+
+**Fase 1 — Cambios**:
+- [x] Helpers en executor (`internal/executor/executor_helpers.go`): `checkCtx`, `schemaOrPublic`,
+      `qualifiedName`, `persistTable`, `persistTableWarn`. Aplicados en `executor_dml.go`,
+      `executor_ddl.go`, `executor_select.go`, `executor_procedure.go`, `executor_trigger.go`,
+      `executor_job.go`. Eliminados: ~13 bloques `select { <-ctx.Done() }` / `if ctx.Err()`,
+      ~11 resoluciones de schema duplicadas, y el bloque `if e.storage != nil { SaveTableWithSchema
+      + warning }` en los sitios de tabla. Mensajes de warning contextuales preservados textualmente.
+- [x] Helpers en parser (`internal/parser/helpers.go`): `parseOptionalIfExists`,
+      `parseOptionalCascadeRestrict`. Aplicados en `parseDropTable`, `parseDropView`, `parseDropSchema`.
+- [x] `parseBeginEndBlock` (procedure/trigger/job comparten `BEGIN … END`) y barrido de
+      `parseIdentRequired` (parseDropIndex, parseDropProcedure, parseDropTrigger, parseDropJob,
+      parseAlterJob, parseCreateIndex). Fase 1 completa. Integración adicional ✅:
+      `test-job-persistence`, `test-drop-index`, `test-parse-proc`.
+- [x] Verificación (CGO_ENABLED=0, por límite de toolchain C del entorno; Pebble usa fallback puro-Go):
+      `go build ./internal/...` ✅, `go vet ./internal/{executor,parser}` ✅,
+      `go test ./internal/...` ✅. Integración ✅: `test-identity-insert`, `test-alter`,
+      `test-trigger-recursion`, `test-drop-table-fk`, `test-drop-schema`, `test-views-cascade`.
+      Cero cambio de comportamiento observable.
+
+**Nota de entorno**: `go build ./...` completo falla al compilar Pebble vía CGO (`cgo.exe: exit
+status 2` en `pebble/internal/manual` y `DataDog/zstd`) porque el toolchain C no está en el PATH
+usado por `go`. Workaround verificado: `CGO_ENABLED=0` (Pebble tiene implementación puro-Go).
+
+**Fase 2 — Registry de statements (dispatch por datos)** ✅ COMPLETED:
+- Executor (`internal/executor/executor_registry.go`): `registerExec[T ast.Statement]` genérico +
+  `execHandlers map[reflect.Type]execHandler`. `Execute` reemplaza el type-switch de ~30 casos por
+  lookup+dispatch. Handlers auto-registrados en `init()` co-localizado en cada `executor_*.go`
+  (ddl/dml/select/procedure/trigger/job) + `executeSet` en `executor.go`. Agregar un statement ya
+  no requiere tocar `executor.go`.
+- Parser (`internal/parser/parser_registry.go`): `topLevelParsers`/`createParsers`/`dropParsers`/
+  `alterParsers` (`map[TokenType]stmtParseFn`). Poblados en `init()` para evitar el "initialization
+  cycle" estático (los parsers referencian de vuelta a los mapas). `ParseStatement`,
+  `parseCreate`, `parseDrop`, `parseAlter` colapsados a lookup + fallback de error. `parseNoop`
+  para tokens no-op (`;`, END, dollar-string) al top level.
+- Fix colateral: `cmd/test-persistence-integration` usaba `DROP SCHEMA` sin CASCADE sobre schema
+  no vacío (fallaba ya en el baseline por RESTRICT-default) → corregido a CASCADE.
+- Verificación (CGO_ENABLED=0): `go build/vet/test ./internal/...` ✅; **20/20** tests de
+  integración del motor ✅; servidor + `test-client` protocolo extendido ✅.
+
+**Fase 3 — Consolidar capa pg/system-catalog** ⏳ PARCIAL:
+- Borradas ~400 líneas de código muerto (versión antigua comentada) en `catalog/system_handler.go`
+  → 1023 → 622 líneas. Verificado con build/vet/test + tests cliente wire-protocol (`test-client`,
+  `test-information-schema`, `test-users` en :4445, `test-simple-query`).
+- Reachability documentada: `checkBypass` precede siempre a `HandleSystemQueryForDatabase`
+  (`conn.go:155`→`:161`); el path extendido (`:281`) usa `checkBypass`+`executeQuery`, nunca
+  `HandleSystemQuery`. Los casos inline de `system_handler` que también matchea `bypass` quedan
+  sombreados/inalcanzables (duplicación latente, no divergencia).
+- PENDIENTE (gateado por riesgo de wire-compat, requiere validar contra pgAdmin/DBeaver/psql real):
+  unificar `bypass.go` + switch de `system_handler.go` en una sola tabla patrón→respuesta sirviendo
+  desde `system_catalog.go`. (Decisión del usuario: no tocarla ahora.)
+
+**Fase 4 — Segregar `storage.Backend` y `Catalog`** ✅ COMPLETED (núcleo):
+- Borrada la implementación legacy `Storage` (backend JSON, toda-stubs, nunca instanciada — no hay
+  `storage.New` en el código): `internal/storage/storage.go` 417 → 141 líneas. Preservados los
+  helpers compartidos con Pebble (`indexColumnsFromData`, `syncIdentityValues`) y recortados los
+  imports huérfanos (`fmt`, `io/ioutil`, `os`, `path/filepath`, `strings`, `sync`).
+- `Backend` (18 métodos planos) segregada en interfaces por responsabilidad: `TableStore`,
+  `ViewStore`, `ProcedureStore`, `TriggerStore`, `JobStore`, `SchemaStore`, compuestas en `Backend`
+  (+ `LoadAll`/`Close`). `PebbleStorage` y `Executor` sin cambios → comportamiento idéntico.
+- Resta (más invasivo, gateado): mover mutación de filas de `DropColumnData`/`RenameColumnData` al
+  catálogo; sub-catálogos con locks propios.
+- Verificación (CGO_ENABLED=0): build/vet/test ✅; **20/20** integración del motor (con ciclos de
+  persistencia+reload) ✅.
+
+**Fase 5 — AST expresivo (Paso 1: operadores de comparación en WHERE)** ✅:
+- Nuevos operadores en WHERE: `=`, `<>`/`!=`, `<`, `>`, `<=`, `>=` (SELECT/UPDATE/DELETE).
+- Cambios: `internal/parser/token.go` (`TokenLte`, `TokenGte`); `internal/parser/lexer.go` (lexeo de
+  `>`, `>=`, `<=`, `!=`); `internal/ast/ast.go` (`WhereClause.Operator`); `internal/parser/helpers.go`
+  (`parseWhereClause` lee operador + helper `whereOperator`); `internal/executor/where.go` (nuevo,
+  comparador type-aware `whereMatches`/`compareCells`: numérico si ambos parsean, si no lexicográfico);
+  y los 4 sitios de evaluación (`fetchRows` — índice preservado para `=`, scan+comparador para el
+  resto —, `filterJoinedRows`, `performUpdate`, `performDelete`).
+- Equality (`=`) preserva EXACTAMENTE la semántica previa (índice + `==`). Aún un solo predicado
+  (sin AND/OR — Paso 2 pendiente).
+- Test nuevo: `cmd/test-where-operators` (10 asserts). Verificación: build/vet/test ✅; **21/21**
+  integración del motor ✅. README actualizado.
+**Fase 5 — Paso 4: desacoplar persistencia del AST (vistas)** ✅:
+- Vistas ahora persisten el texto SQL del SELECT y se re-parsean al cargar (formato en disco estable
+  e independiente de la forma del AST). Cambios: `ast.CreateView.QueryText`; captura en el parser vía
+  `Token.Pos` + helper `sliceFrom`; `catalog.View.QueryText`; `storage.ViewData.QueryText` (guardado
+  en `SaveView`); en `LoadAll`, si `QueryText != ""` se re-parsea con `parseViewQuery` (nuevo import
+  `storage → parser`, sin ciclo), con **fallback** al AST `gob` para datos previos.
+- Test nuevo: `cmd/test-view-persistence` (round-trip create→close→reopen→LoadAll→query).
+  Verificación: build/vet/test ✅; **23/23** integración ✅.
+- Pendiente: aplicar el mismo patrón (capturar texto de `BEGIN…END`) a procedures/triggers/jobs, que
+  aún serializan `[]ast.Statement` vía `gob`.
+
+**Fase 3 — Consolidar capa pg/system-catalog (unificación)** ✅ COMPLETED:
+- `catalog/system_handler.go`: el switch de ~22 casos `strings.Contains` en
+  `HandleSystemQueryForDatabase` reescrito como tabla ordenada `systemRoutes []systemRoute`
+  (`{match func(string)bool, handle func(*Catalog,upper,db)*SystemResult}`), primer match gana,
+  orden/predicados idénticos (1:1). Helpers `hasAny` (multi-substring) y `canned` (respuesta fija).
+  Sin ciclo de init (var literal; las closures referencian métodos que no referencian la tabla).
+- No se fusionó con `server/bypass.go` entre paquetes (mecánicas distintas: bypass escribe wire
+  directo; system_handler arma `SystemResult`); bypass ya es tabla limpia y corre primero. Layering
+  documentado en el código (fallback defensivo para patrones solapados).
+- Verificación: build/vet/test + `catalog` unit tests (system_handler_test.go) + tests cliente
+  wire-protocol (test-client, test-information-schema, test-users@:4445, test-simple-query,
+  test-multi-client) todos ✅. **Roadmap de modularización (Fases 1–5) completo.**
+
+**Fase 5 — Paso 4 (resto): desacoplar persistencia del AST en procedures/triggers/jobs** ✅:
+- `parseBeginEndBlock` ahora devuelve `(body, bodyText, err)` capturando el texto verbatim entre
+  BEGIN y END (`Token.Pos`+`sliceFrom`). Propagado a `ast.Create{Procedure,Trigger,Job}.BodyText`,
+  `catalog.{Procedure,Trigger,Job}.BodyText` (Create* del catálogo reciben `bodyText`), y
+  `storage.{Procedure,Trigger,Job}Data.BodyText`. Cubre también el path dollar-quoted de procedures.
+- En `LoadAll`, si `BodyText != ""` se re-parsea con `parseBody` (nuevo helper) hacia `[]ast.Statement`,
+  con fallback al AST `gob` para datos previos. Fase 5 completa (vistas + rutinas desacopladas).
+- Test `cmd/test-routine-persistence`: proc+trigger creados, cerrados, reabiertos y recargados; el
+  CALL del proc re-parseado inserta y dispara el trigger re-parseado. Regresión **25/25** ✅.
+
+### Session: August 14, 2026 - Rediseño web (Botánico nocturno) + fix ORDER BY
+
+**Rediseño de `cmd/focusd/static/index.html`** (solo la piel; funcionalidad intacta):
+- Identidad "Botánico nocturno": paleta bosque profundo (`#0f1a14`) + savia (`#7bb661`) + arena
+  cálida + floración ámbar. Reemplazados TODOS los literales Catppuccin morado/azul (incl. los
+  hexes del render SVG del diagrama).
+- Capa viva: fondo con luz filtrada (radial-gradients), grano SVG sutil, transiciones lentas
+  orgánicas, wordmark `🌿 focusdb` con hoja que se mece (`@keyframes sway`), badge de conexión que
+  respira (`breathe`), sintaxis del editor CodeMirror retematizada (keywords savia, strings ámbar).
+- Verificado en vivo (server :9011): paleta computada correcta, sin errores de consola, queries y
+  sidebar funcionando. (Screenshot no disponible: el panel del navegador no estaba visible.)
+
+**Bug fix (preexistente) — ORDER BY en columnas proyectadas**: `SELECT col1, col2 ... ORDER BY x`
+no ordenaba (sí funcionaba `SELECT *`). Causa en `executor_select.go` `projectColumns`: aplicaba
+`ApplyOrderBy` sobre filas ya proyectadas pasando `table.Columns` (esquema completo) → índice de la
+columna de orden fuera de rango. Fix: aplicar ORDER BY sobre las filas completas ANTES de proyectar
+(además ahora permite `ORDER BY` por columnas no seleccionadas, como SQL estándar). Verificado;
+regresión **23/23** ✅.
+
+**Fase 5 — Paso 3: agregados SUM/AVG/MIN/MAX** ✅:
+- Parser (`helpers.go`): detección genérica `isAggregateFunc` (COUNT/SUM/AVG/MIN/MAX); el bloque de
+  agregados en `parseSelectItem` ya no es solo-COUNT. Fix en `parser.go`: el fast-path de
+  `SELECT func()` sin argumentos excluye agregados (antes `SUM(monto)` fallaba con "expected )").
+- Executor (`aggregate.go` nuevo): `parseAggregate` (extrae función + columna arg), `computeAggregate`
+  (COUNT/SUM/AVG/MIN/MAX; SUM/AVG numéricos vía `toFloat`, MIN/MAX numérico o lexicográfico vía
+  `compareCells`, NULLs ignorados salvo COUNT(*)), helpers `toFloat`/`numberValue`. `hasAggregates`
+  y el parseo de columnas en `executeGroupedSelect` ahora usan `parseAggregate`; `aggregateAllRows`
+  y `aggregateByGroups` usan `computeAggregate` (antes solo COUNT).
+- Test nuevo: `cmd/test-aggregates` (12 asserts: scalar, agregado+WHERE, y GROUP BY con las 5
+  funciones). Verificación: build/vet/test ✅; **22/22** integración del motor ✅. README actualizado.
+
+**Fase 5 — Paso 2: predicados compuestos AND/OR** ✅:
+- `ast.WhereClause` ahora es un árbol: leaf (`Column`/`Operator`/`Value`, `Conj==""`) o nodo
+  compuesto (`Left`/`Conj`/`Right`). Helpers `IsLeaf()` y `LeafColumns()`.
+- Parser (`helpers.go`): `parseWhereClause` → `parseWhereOr`/`parseWhereAnd`/`parseWherePredicate`
+  con precedencia estándar (OR<AND<comparación) y paréntesis. Token `TokenAnd` agregado a
+  `token.go` (const + keywords map).
+- Evaluador recursivo `evalWhere` (`executor/where.go`) con short-circuit AND/OR; usado en los 4
+  sitios: `fetchRows` (fast-path de índice preservado solo para leaf `=`), `filterJoinedRows`
+  (JOIN, resolver combinado), `performUpdate`, `performDelete`. Helper `columnResolver`.
+- Validator recorre el árbol: `validateWhereColumns` sobre `WhereClause.LeafColumns()`.
+- Compat gob: agregar campos a `WhereClause` es backward-compatible (decode de blobs viejos → cero).
+- Test `cmd/test-where-operators` ampliado a 16 asserts (AND/OR, precedencia, paréntesis, UPDATE/
+  DELETE compuestos, JOIN+WHERE compuesto). Verificación: build/vet/test ✅; 21/21 integración ✅.
+  README actualizado.
+
+### Session: August 14, 2026 - Fixes del motor: FK vs IDENTITY + JOINs N-way
+
+**Objetivo**: dejar el motor "al 100%" tras detectar dos defectos probando la GUI.
+
+**Status**: ✅ COMPLETED
+
+**Bug 1 — FK contra columna IDENTITY (correctitud)**:
+- Síntoma: `INSERT` en una tabla hija con FK a una PK `IDENTITY` fallaba con "foreign key
+  violation: value N not found" aunque el padre existía. Con PK no-IDENTITY (valores literales)
+  sí funcionaba.
+- Causa raíz: el motor almacena valores con tipos Go heterogéneos — los literales como **string**
+  (`stmt.Values[i].Value`), los IDENTITY como **int** (`Column.IdentityValue`). La comprobación FK
+  usaba `==` sobre `interface{}`, sensible al tipo: `int(1) == string("1")` es `false`.
+- Fix: comparación tolerante al tipo por forma canónica (mismo criterio que el matching de JOIN,
+  que ya usaba `fmt.Sprintf("%v", …)`). Nuevo helper exportado `catalog.ValuesEqual(a,b)`.
+  Aplicado en `catalog/table.go` (`InsertRow` FK check) y `executor/executor_dml.go`
+  (`validateForeignKey`, ruta de UPDATE). Los huérfanos se siguen rechazando.
+
+**Bug 2 — JOINs de 3+ tablas (feature/limitación)**:
+- Síntoma: `FROM a JOIN b ON … JOIN c ON …` daba "unknown table qualifier c". El parser parseaba
+  **un solo** JOIN (`if`, no loop) y el AST/executor estaban cableados a exactamente dos tablas
+  (`stmt.Table` + `stmt.Join`).
+- Fix parser (`parser/helpers.go`): `parseFromAndJoin` ahora devuelve `[]*ast.JoinClause` y hace
+  loop sobre joins consecutivos (`parseSingleJoin` extraído). `parser.go` puebla `stmt.Joins`
+  (+ `stmt.Join = Joins[0]` para compat con `catalog/views.go` y blobs gob viejos).
+- Fix AST (`ast.go`): `Select.Joins []*JoinClause` (se conserva `Join *JoinClause`, backward-compat).
+- Fix executor (`executor/executor_select.go`): `executeJoinSelect` reescrito como **fold
+  left-deep** sobre las tablas. Se acumulan filas + columnas como `[]joinColumn{ref,name,typ}`;
+  `foldJoin` maneja INNER/LEFT/RIGHT/FULL/CROSS con relleno de NULLs por lado; `resolveJoinColumn`
+  resuelve refs calificadas/inequívocas contra el esquema acumulado; WHERE/GROUP BY/agregados/
+  ORDER BY/proyección/`SELECT *` operan sobre el conjunto acumulado (columnas `ref.col`).
+  Eliminadas las funciones de 2 tablas (performJoin/perform{Inner,Left,Right,Full}Join,
+  filterJoinedRows, createVirtualTable, projectJoin{Star,Columns}, getRowValue).
+
+**Verificación**: `go build/vet/test ./internal/...` ✅. Regresión de integración ✅
+(`test-self-fk`, `test-drop-table-fk`, `test-where-operators`, `test-aggregates`,
+`test-persistence-integration`, `test-views-cascade`, `test-routine-persistence`, `test-multi-stmt`).
+Nuevo test `cmd/test-multi-join` (FK-IDENTITY + INNER/LEFT 3-way + WHERE compuesto + agregado +
+`SELECT *` calificado + errores de qualifier). Test dedicado `cmd/test-fk-identity` con el repro
+exacto (dos tablas IDENTITY + FK: INSERT hijo válido, rechazo de huérfano, ruta de UPDATE, y
+control con PK no-IDENTITY). E2E vía API confirmado. README actualizado.
+
+### Session: August 14, 2026 - NATURAL JOIN y JOIN ... USING
+
+**Objetivo**: soportar `NATURAL JOIN` y `JOIN ... USING (cols)` sobre el motor de joins N-way.
+
+**Status**: ✅ COMPLETED
+
+**Cambios**:
+- **token.go**: tokens `NATURAL` y `USING` (const + keywords).
+- **ast.go**: `JoinClause.Natural bool` y `JoinClause.Using []string` (backward-compat gob).
+- **parser/helpers.go**: `parseSingleJoin` acepta prefijo opcional `NATURAL` (INNER/LEFT/RIGHT/FULL,
+  no CROSS) y, tras la tabla, resuelve `USING (col, ...)` o `ON …` o nada (natural). Loop de joins
+  incluye `TokenNatural`.
+- **executor/executor_select.go**: `foldJoin` reescrito con detección de pares de columnas:
+  NATURAL → todas las columnas de igual nombre entre el lado acumulado y la tabla nueva; USING →
+  las columnas nombradas (validadas en ambos lados). Semántica **coalesce**: la columna común
+  aparece una sola vez (se descarta la copia del lado derecho) y en outer joins el valor coalescido
+  toma el lado no nulo (`COALESCE`). La columna común sobrevive con el ref del lado izquierdo.
+  `ON` explícito y `CROSS` conservan comportamiento idéntico (sin coalesce/drop). NATURAL sin
+  columnas comunes degrada a CROSS (estándar SQL).
+
+**Verificación**: build/vet/test ✅. Nuevos tests: `cmd/test-natural-join` (NATURAL INNER/LEFT/RIGHT
+con coalesce desde ambos lados, USING simple y multi-columna, error de columna USING inexistente,
+NATURAL sin comunes = CROSS, natural encadenado con join explícito) y `parser_test.go`
+(`TestParseNaturalJoin`, `TestParseJoinUsing`). Regresión de joins con `ON` sin cambios
+(`test-multi-join`, `test-where-operators`) + barrido de integración ✅. README actualizado.
+
+### Session: August 22, 2026 - FocusDB Studio v2 (GUI integral) + fixes de motor
+
+**Objetivo**: mejora mayor de la GUI en 4 frentes (plan aprobado en
+`~/.claude/plans/curious-baking-sunrise.md`): Editor pro, Resultados pro, Explorador de datos,
+Diagrama ER pro. CodeMirror offline. Monolito → módulos ES.
+
+**Status**: ✅ COMPLETED (Fases 0–6)
+
+**F0 — Refactor de base**: `static/index.html` (monolito 2156 líneas) partido en
+`index.html` + `css/app.css` + `js/{state,icons,dom,api,editor,tabs,results,sidebar,explorer,
+diagram,app}.js` (módulos ES; CodeMirror sigue como script clásico global; puente
+`Object.assign(window, {...})` para los handlers inline). CodeMirror 5.65.16 **vendoreado** en
+`static/vendor/codemirror/` (core+dracula+sql+addons hint/edit/search/dialog+LICENSE, 286KB) —
+la GUI funciona sin red. Middleware `withStaticHeaders` (vendor immutable 24h, resto no-cache).
+
+**F1 — Backend API** (`gui_api.go` nuevo; `gui_server.go` adelgazado a mux+middlewares):
+- `POST /api/script`: un resultado por statement `{index,sql,tag,columns,rows,elapsedMs,truncated}`
+  + `failedIndex`/`failedSql`/`error`; el SQL por statement sale del parser (nuevo accessor
+  `Parser.Pos()`, offsets exactos — cubre dollar-quoted).
+- Cancelación real: `handler.go: HandleWithDatabaseCtx(ctx,…)` pasa `r.Context()` +
+  `context.WithTimeout` (flag `-query-timeout`, default 60s) a `executor.Execute`. El path wire
+  (`Handle`/`HandleWithDatabase`) delega con `context.Background()` — sin cambios.
+- `/api/schema` reconstruido sobre `GetTablesForDiagram` + `GetAllViewsInSchema`: arregla el bug
+  `notNull` siempre-false; añade `identity/isPK/isFK/isUnique/ordinal` por columna, `rowCount`,
+  `indexes[]`, `viewDefinition`; orden determinista (`sort.Slice`) — el árbol ya no se reordena.
+- `/api/objects`: + `bodyText` (triggers/jobs/procedures), `forEachRow`, `lastRun`/`nextRun`.
+- `/api/diagram`: + `pk[]` (PK compuesta), `rowCount`, `indexes`, `notNull/identity/isUnique`.
+- `GET /api/table-data?table&offset&limit` (cap 500): página + `total` + `pk` + metadata de
+  columnas; 400 vistas, 404 inexistente. Escrituras del explorador van por `/api/query`.
+- `maxRows`+`truncated` opcionales en query/script (compat total sin ellos). `withRecover`,
+  `withMethod`, `http.Server{ReadHeaderTimeout}`. Borrado `userInfoResult` (muerto).
+
+**F2 — Editor pro**: pestañas con `CodeMirror.Doc`+`swapDoc` (persisten en
+`focusdb.tabs.v1`, Ctrl+T nueva); historial persistente (`focusdb.history.v1`, dedup);
+Ctrl+F búsqueda (addons vendoreados, diálogo tematizado); autocompletado con alias del
+statement (regex FROM/JOIN) + snippets; `runAll` → `/api/script` con acordeón por statement,
+subrayado del fallido (marcas separadas de las de sintaxis para que el debounce de validación
+no las borre) y botón **Cancelar** (AbortController).
+
+**F3 — Resultados pro**: pipeline filtro (debounce 150ms) → sort → render paginado (bloques de
+500 + append sin re-render); export CSV (RFC 4180 + BOM) y JSON del conjunto filtrado; dblclick
+→ modal de celda (pretty-print JSON); copiar fila como INSERT (tabla por heurística del FROM);
+badge `truncated`; `cmpCell` numérico para strings de `sanitizeRows`.
+
+**F4 — Explorador de datos** (`js/explorer.js` + vista overlay): grilla server-side paginada
+(100/página), edición inline por PK (dblclick→input→`UPDATE … WHERE pk=…`), alta con formulario
+generado de columnas (IDENTITY deshabilitada, NOT NULL marcado), borrado con confirmación; sin
+PK → solo lectura. Badges PK/ID/NN en encabezados; rowCount + acceso desde el árbol lateral.
+
+**F5 — Diagrama v2**: persistencia `focusdb.diagram.v1.<sig>` (posiciones+zoom+compacto por
+firma djb2 del schema; reentrar no re-organiza; `resetDiagramLayout` limpia storage); drag
+O(aristas incidentes) — `moveTable` actualiza solo transform + paths (`edgesByTable`), la
+búsqueda/selección sobreviven; **Pointer Events** unificados (pan/drag/pinch-zoom táctil,
+`touch-action:none`); self-FK como bucle lateral; cardinalidad `1`/`N`; rowCount en header;
+badges `ix`/`u` por columna; **minimapa** con viewport navegable; modo compacto real (W 210→150,
+re-render); zoom con clamp también en rueda [0.1,3]; export SVG/PNG sin `.fk-label` fantasma y
+con try/catch+toast; layout AABB consciente del alto de cajas, troceado en rAF si N>25;
+`fitDiagram`/bounds unificados; tooltip sin params muertos.
+
+**Fixes de motor descubiertos durante la fase** (misma familia de tipos mixtos que FK-IDENTITY):
+- `executor/where.go: whereMatches` — `=`/`<>` usaban `==` estricto de Go: `UPDATE/DELETE …
+  WHERE id = 1` sobre PK IDENTITY (int) con literal ("1") afectaba **0 filas** (SELECT solo
+  funcionaba por el fast-path del índice, que compara claves string). Ahora todos los operadores
+  comparan por forma canónica vía `compareCells` (consistente con índices, JOIN ON y FK).
+- `catalog.GetProcedure` no copiaba `BodyText` → los procedures se **persistían sin cuerpo
+  canónico** (SaveProcedure serializa la copia). Corregido + `Load{Procedure,Trigger,Job}` ahora
+  reciben y conservan `bodyText` en la recarga (antes memoria lo perdía tras reinicio).
+
+**Verificación**: build/vet/test ✅; suite de integración **14/14** ✅; E2E browser: offline
+(0 requests CDN), pestañas+historial sobreviven reload, script con error localizado en editor,
+explorador CRUD completo (update/insert/delete reales), diagrama con persistencia/self-FK/
+minimapa/compacto/clamp, 700 filas → primer render 127ms + paginación, consola limpia.
+README actualizado (sección GUI completa + flags).

@@ -41,3 +41,5 @@ docker-compose.*.yml
 tmp/
 *.swp
 
+# Claude Code (worktrees + settings locales)
+.claude/
