@@ -119,8 +119,10 @@ func main() {
 	}
 
 	// Phase 3: Test DROP SCHEMA
+	// CASCADE is required because the schema still contains test_table; the
+	// default RESTRICT behavior (correctly) refuses to drop a non-empty schema.
 	fmt.Println("\nPhase 3: Testing DROP SCHEMA...")
-	dropSchemaSQL := "DROP SCHEMA test_schema;"
+	dropSchemaSQL := "DROP SCHEMA test_schema CASCADE;"
 	p = parser.NewParser(dropSchemaSQL)
 	stmt, _ = p.ParseStatement()
 	if _, err := exe2.Execute(ctx, stmt); err != nil {

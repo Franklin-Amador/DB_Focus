@@ -11,7 +11,7 @@ import (
 // procOIDCounter generates unique OIDs for procedures
 var procOIDCounter int64 = 16384 // Start above system OIDs
 
-func (c *Catalog) CreateProcedure(name string, parameters []ast.Parameter, body []ast.Statement) error {
+func (c *Catalog) CreateProcedure(name string, parameters []ast.Parameter, body []ast.Statement, bodyText string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -23,6 +23,7 @@ func (c *Catalog) CreateProcedure(name string, parameters []ast.Parameter, body 
 		Name:       name,
 		Parameters: parameters,
 		Body:       body,
+		BodyText:   bodyText,
 	}
 
 	// Register in pg_catalog.pg_proc
@@ -77,6 +78,7 @@ func (c *Catalog) GetProcedure(name string) (*Procedure, error) {
 		Name:       proc.Name,
 		Parameters: append([]ast.Parameter(nil), proc.Parameters...),
 		Body:       append([]ast.Statement(nil), proc.Body...),
+		BodyText:   proc.BodyText,
 	}
 	c.mu.RUnlock()
 
@@ -85,7 +87,7 @@ func (c *Catalog) GetProcedure(name string) (*Procedure, error) {
 
 // LoadProcedure inserts a procedure into memory without registering it again in pg_catalog.
 // This is intended for persistence reload paths.
-func (c *Catalog) LoadProcedure(name string, parameters []ast.Parameter, body []ast.Statement) error {
+func (c *Catalog) LoadProcedure(name string, parameters []ast.Parameter, body []ast.Statement, bodyText string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -97,6 +99,7 @@ func (c *Catalog) LoadProcedure(name string, parameters []ast.Parameter, body []
 		Name:       name,
 		Parameters: parameters,
 		Body:       body,
+		BodyText:   bodyText,
 	}
 
 	return nil

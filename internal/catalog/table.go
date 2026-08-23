@@ -9,6 +9,14 @@ import (
 
 const compositeIndexSeparator = "\x1f"
 
+// ValuesEqual reports whether two cell values are equal, tolerant of the mixed
+// Go types the engine stores (literals as strings, IDENTITY keys as ints). It
+// compares by canonical string form, matching JOIN ON equality semantics, so a
+// foreign-key value "1" matches an IDENTITY-generated parent key 1.
+func ValuesEqual(a, b interface{}) bool {
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+}
+
 func normalizeIndexValue(value interface{}) string {
 	if value == nil {
 		return "<nil>"
@@ -104,7 +112,10 @@ func (t *Table) insertRowWithValidation(values []interface{}, catalog *Catalog, 
 
 					found := false
 					for _, refRow := range refTable.Rows {
-						if refRow[refColIdx] == values[colIdx] {
+						// Compare by string form so a literal FK value ("1") matches an
+						// IDENTITY-generated parent key stored as an int (1). This mirrors
+						// how JOIN ON equality compares values.
+						if ValuesEqual(refRow[refColIdx], values[colIdx]) {
 							found = true
 							break
 						}

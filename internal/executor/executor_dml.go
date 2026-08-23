@@ -9,6 +9,12 @@ import (
 	"dbf/internal/constants"
 )
 
+func init() {
+	registerExec((*Executor).executeInsert)
+	registerExec((*Executor).executeUpdate)
+	registerExec((*Executor).executeDelete)
+}
+
 // executeInsert handles INSERT statements
 func (e *Executor) executeInsert(ctx context.Context, stmt *ast.Insert) (*Result, error) {
 	// Determine schema
@@ -29,18 +35,13 @@ func (e *Executor) executeInsert(ctx context.Context, stmt *ast.Insert) (*Result
 	}
 
 	// Check context cancellation
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	// Execute BEFORE INSERT triggers
 	if e.triggersEnabled {
-		qual := stmt.Table.Name
-		if schema != "" {
-			qual = schema + "." + stmt.Table.Name
-		}
+		qual := qualifiedName(schema, stmt.Table.Name)
 		if err := e.executeTriggers(ctx, qual, constants.TriggerBefore, constants.TriggerInsert, nil, nil); err != nil {
 			return nil, fmt.Errorf("BEFORE INSERT trigger failed: %w", err)
 		}
@@ -116,22 +117,11 @@ func (e *Executor) executeInsert(ctx context.Context, stmt *ast.Insert) (*Result
 	}
 
 	// Persist to storage
-	if e.storage != nil {
-		schemaToUse := "public"
-		if schema != "" {
-			schemaToUse = schema
-		}
-		if err := e.storage.SaveTableWithSchema(table, schemaToUse); err != nil {
-			fmt.Printf("warning: failed to persist table %s.%s: %v\n", schemaToUse, stmt.Table.Name, err)
-		}
-	}
+	e.persistTableWarn(table, schema)
 
 	// Execute AFTER INSERT triggers
 	if e.triggersEnabled {
-		qual := stmt.Table.Name
-		if schema != "" {
-			qual = schema + "." + stmt.Table.Name
-		}
+		qual := qualifiedName(schema, stmt.Table.Name)
 		if err := e.executeTriggers(ctx, qual, constants.TriggerAfter, constants.TriggerInsert, nil, values); err != nil {
 			return nil, fmt.Errorf("AFTER INSERT trigger failed: %w", err)
 		}
@@ -160,18 +150,13 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 	}
 
 	// Check context cancellation
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	// Execute BEFORE UPDATE triggers
 	if e.triggersEnabled {
-		qual := stmt.Table.Name
-		if schema != "" {
-			qual = schema + "." + stmt.Table.Name
-		}
+		qual := qualifiedName(schema, stmt.Table.Name)
 		if err := e.executeTriggers(ctx, qual, constants.TriggerBefore, constants.TriggerUpdate, nil, nil); err != nil {
 			return nil, fmt.Errorf("BEFORE UPDATE trigger failed: %w", err)
 		}
@@ -196,22 +181,11 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 	table.RebuildIndexes()
 
 	// Persist to storage
-	if e.storage != nil {
-		schemaToUse := "public"
-		if schema != "" {
-			schemaToUse = schema
-		}
-		if err := e.storage.SaveTableWithSchema(table, schemaToUse); err != nil {
-			fmt.Printf("warning: failed to persist table %s.%s: %v\n", schemaToUse, stmt.Table.Name, err)
-		}
-	}
+	e.persistTableWarn(table, schema)
 
 	// Execute AFTER UPDATE triggers
 	if e.triggersEnabled {
-		qual := stmt.Table.Name
-		if schema != "" {
-			qual = schema + "." + stmt.Table.Name
-		}
+		qual := qualifiedName(schema, stmt.Table.Name)
 		if err := e.executeTriggers(ctx, qual, constants.TriggerAfter, constants.TriggerUpdate, nil, nil); err != nil {
 			return nil, fmt.Errorf("AFTER UPDATE trigger failed: %w", err)
 		}
@@ -240,18 +214,13 @@ func (e *Executor) executeDelete(ctx context.Context, stmt *ast.Delete) (*Result
 	}
 
 	// Check context cancellation
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	// Execute BEFORE DELETE triggers
 	if e.triggersEnabled {
-		qual := stmt.Table.Name
-		if schema != "" {
-			qual = schema + "." + stmt.Table.Name
-		}
+		qual := qualifiedName(schema, stmt.Table.Name)
 		if err := e.executeTriggers(ctx, qual, constants.TriggerBefore, constants.TriggerDelete, nil, nil); err != nil {
 			return nil, fmt.Errorf("BEFORE DELETE trigger failed: %w", err)
 		}
@@ -268,22 +237,11 @@ func (e *Executor) executeDelete(ctx context.Context, stmt *ast.Delete) (*Result
 	table.RebuildIndexes()
 
 	// Persist to storage
-	if e.storage != nil {
-		schemaToUse := "public"
-		if schema != "" {
-			schemaToUse = schema
-		}
-		if err := e.storage.SaveTableWithSchema(table, schemaToUse); err != nil {
-			fmt.Printf("warning: failed to persist table %s.%s: %v\n", schemaToUse, stmt.Table.Name, err)
-		}
-	}
+	e.persistTableWarn(table, schema)
 
 	// Execute AFTER DELETE triggers
 	if e.triggersEnabled {
-		qual := stmt.Table.Name
-		if schema != "" {
-			qual = schema + "." + stmt.Table.Name
-		}
+		qual := qualifiedName(schema, stmt.Table.Name)
 		if err := e.executeTriggers(ctx, qual, constants.TriggerAfter, constants.TriggerDelete, nil, nil); err != nil {
 			return nil, fmt.Errorf("AFTER DELETE trigger failed: %w", err)
 		}
@@ -349,7 +307,7 @@ func (e *Executor) validateForeignKey(refTable, refCol string, value interface{}
 	defer table.Mu().RUnlock()
 
 	for _, row := range table.Rows {
-		if row[refColIdx] == value {
+		if catalog.ValuesEqual(row[refColIdx], value) {
 			return nil
 		}
 	}
@@ -364,13 +322,13 @@ func (e *Executor) performUpdate(table *catalog.Table, stmt *ast.Update, colIdx 
 	updateCount := 0
 
 	if stmt.Where != nil {
-		whereColIdx := findColumnIndex(table.Columns, stmt.Where.Column.Name)
-		if whereColIdx == -1 {
-			return 0, fmt.Errorf("column %s not found", stmt.Where.Column.Name)
-		}
-
+		resolve := columnResolver(table)
 		for i, row := range table.Rows {
-			if row[whereColIdx] == stmt.Where.Value.Value {
+			ok, err := evalWhere(stmt.Where, row, resolve)
+			if err != nil {
+				return 0, err
+			}
+			if ok {
 				table.Rows[i][colIdx] = stmt.Value.Value
 				updateCount++
 			}
@@ -386,6 +344,15 @@ func (e *Executor) performUpdate(table *catalog.Table, stmt *ast.Update, colIdx 
 	return updateCount, nil
 }
 
+// columnResolver returns a resolver that maps a column name to its index in
+// the given table, for use with evalWhere.
+func columnResolver(table *catalog.Table) func(string) (int, bool) {
+	return func(name string) (int, bool) {
+		i := findColumnIndex(table.Columns, name)
+		return i, i != -1
+	}
+}
+
 func (e *Executor) performDelete(table *catalog.Table, stmt *ast.Delete, pkColName string) (int, error) {
 	table.Mu().Lock()
 	defer table.Mu().Unlock()
@@ -393,17 +360,18 @@ func (e *Executor) performDelete(table *catalog.Table, stmt *ast.Delete, pkColNa
 	deleteCount := 0
 
 	if stmt.Where != nil {
-		whereColIdx := findColumnIndex(table.Columns, stmt.Where.Column.Name)
-		if whereColIdx == -1 {
-			return 0, fmt.Errorf("column %s not found", stmt.Where.Column.Name)
-		}
+		resolve := columnResolver(table)
 
 		// Check FK references if necessary
 		if pkColName != "" {
 			pkColIdx := findColumnIndex(table.Columns, pkColName)
 			if pkColIdx != -1 {
 				for _, row := range table.Rows {
-					if row[whereColIdx] == stmt.Where.Value.Value {
+					matched, err := evalWhere(stmt.Where, row, resolve)
+					if err != nil {
+						return 0, err
+					}
+					if matched {
 						if err := e.catalog.CheckForeignKeyReferences(stmt.Table.Name, pkColName, row[pkColIdx]); err != nil {
 							return 0, err
 						}
@@ -415,7 +383,11 @@ func (e *Executor) performDelete(table *catalog.Table, stmt *ast.Delete, pkColNa
 		// Perform deletion
 		newRows := [][]interface{}{}
 		for _, row := range table.Rows {
-			if row[whereColIdx] == stmt.Where.Value.Value {
+			matched, err := evalWhere(stmt.Where, row, resolve)
+			if err != nil {
+				return 0, err
+			}
+			if matched {
 				deleteCount++
 			} else {
 				newRows = append(newRows, row)

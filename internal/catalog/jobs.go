@@ -10,7 +10,7 @@ import (
 // jobOIDCounter generates unique OIDs for jobs
 var jobOIDCounter int64 = 49152 // Start above trigger OIDs
 
-func (c *Catalog) CreateJob(name string, interval int, unit string, body []ast.Statement, enabled bool) error {
+func (c *Catalog) CreateJob(name string, interval int, unit string, body []ast.Statement, bodyText string, enabled bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -23,6 +23,7 @@ func (c *Catalog) CreateJob(name string, interval int, unit string, body []ast.S
 		Interval: interval,
 		Unit:     unit,
 		Body:     body,
+		BodyText: bodyText,
 		Enabled:  enabled,
 		LastRun:  0,
 	}
@@ -118,7 +119,7 @@ func (c *Catalog) AlterJob(name, action string) error {
 
 // LoadJob loads a persisted job into the catalog (used on restart).
 // Unlike CreateJob, this does not re-register in pg_catalog.
-func (c *Catalog) LoadJob(name string, interval int, unit string, body []ast.Statement, enabled bool) error {
+func (c *Catalog) LoadJob(name string, interval int, unit string, body []ast.Statement, enabled bool, bodyText string) error {
 c.mu.Lock()
 defer c.mu.Unlock()
 
@@ -131,6 +132,7 @@ Name:     name,
 Interval: interval,
 Unit:     unit,
 Body:     body,
+BodyText: bodyText,
 Enabled:  enabled,
 LastRun:  0,
 }

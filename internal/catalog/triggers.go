@@ -10,7 +10,7 @@ import (
 // triggerOIDCounter generates unique OIDs for triggers
 var triggerOIDCounter int64 = 32768 // Start above procedure OIDs
 
-func (c *Catalog) CreateTrigger(name, timing, event, table string, forEachRow bool, body []ast.Statement) error {
+func (c *Catalog) CreateTrigger(name, timing, event, table string, forEachRow bool, body []ast.Statement, bodyText string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -29,6 +29,7 @@ func (c *Catalog) CreateTrigger(name, timing, event, table string, forEachRow bo
 		Table:      table,
 		ForEachRow: forEachRow,
 		Body:       body,
+		BodyText:   bodyText,
 	}
 
 	c.triggers[table] = append(c.triggers[table], trigger)
@@ -122,7 +123,7 @@ func (c *Catalog) DropTrigger(name, table string) error {
 
 // LoadTrigger loads a persisted trigger into the catalog (used on restart).
 // Unlike CreateTrigger, this does not re-register in pg_catalog.
-func (c *Catalog) LoadTrigger(name, timing, event, table string, forEachRow bool, body []ast.Statement) error {
+func (c *Catalog) LoadTrigger(name, timing, event, table string, forEachRow bool, body []ast.Statement, bodyText string) error {
 c.mu.Lock()
 defer c.mu.Unlock()
 
@@ -142,6 +143,7 @@ Event:      event,
 Table:      table,
 ForEachRow: forEachRow,
 Body:       body,
+BodyText:   bodyText,
 }
 
 c.triggers[table] = append(c.triggers[table], trigger)

@@ -15,7 +15,41 @@ import (
 
 	"dbf/internal/ast"
 	"dbf/internal/catalog"
+	"dbf/internal/parser"
 )
+
+// parseViewQuery re-parses a stored view SELECT text into an AST. Used on load
+// so that persisted views are defined by stable SQL rather than a serialized
+// AST whose shape may change over time.
+func parseViewQuery(text string) (*ast.Select, error) {
+	stmt, err := parser.NewParser(text).ParseStatement()
+	if err != nil {
+		return nil, err
+	}
+	sel, ok := stmt.(*ast.Select)
+	if !ok {
+		return nil, fmt.Errorf("view definition is not a SELECT")
+	}
+	return sel, nil
+}
+
+// parseBody re-parses a stored routine body (the statements between BEGIN and
+// END) into an AST. Used on load so procedures/triggers/jobs are defined by
+// stable SQL text rather than a serialized AST whose shape may change.
+func parseBody(text string) ([]ast.Statement, error) {
+	p := parser.NewParser(text)
+	var body []ast.Statement
+	for !p.AtEOF() {
+		st, err := p.ParseStatement()
+		if err != nil {
+			return nil, err
+		}
+		if st != nil {
+			body = append(body, st)
+		}
+	}
+	return body, nil
+}
 
 // PebbleStorage wraps Pebble DB for persistent table storage with WAL
 type PebbleStorage struct {
@@ -46,6 +80,7 @@ func (ps *PebbleStorage) SaveProcedure(proc *catalog.Procedure) error {
 		Name:       proc.Name,
 		Parameters: proc.Parameters,
 		Body:       proc.Body,
+		BodyText:   proc.BodyText,
 	}
 	if err := enc.Encode(pd); err != nil {
 		return fmt.Errorf("failed to encode procedure %s: %w", proc.Name, err)
@@ -82,7 +117,7 @@ func (ps *PebbleStorage) SaveView(view *catalog.View, schema string) error {
 	defer gobBufPool.Put(buf)
 
 	enc := gob.NewEncoder(buf)
-	vd := ViewData{Name: view.Name, Schema: schema, Query: view.Query}
+	vd := ViewData{Name: view.Name, Schema: schema, Query: view.Query, QueryText: view.QueryText}
 	vd.Columns = make([]ColumnData, len(view.Columns))
 	for i, col := range view.Columns {
 		vd.Columns[i] = ColumnData{Name: col.Name, Type: col.Type, NotNull: col.NotNull, Identity: col.Identity, IdentityValue: col.IdentityValue}
@@ -129,6 +164,7 @@ func (ps *PebbleStorage) SaveTrigger(trigger *catalog.Trigger) error {
 		Table:      trigger.Table,
 		ForEachRow: trigger.ForEachRow,
 		Body:       trigger.Body,
+		BodyText:   trigger.BodyText,
 	}
 	if err := enc.Encode(td); err != nil {
 		return fmt.Errorf("failed to encode trigger %s: %w", trigger.Name, err)
@@ -166,6 +202,7 @@ func (ps *PebbleStorage) SaveJob(job *catalog.Job) error {
 		Interval: job.Interval,
 		Unit:     job.Unit,
 		Body:     job.Body,
+		BodyText: job.BodyText,
 		Enabled:  job.Enabled,
 	}
 	if err := enc.Encode(jd); err != nil {
@@ -206,6 +243,7 @@ type ProcedureData struct {
 	Name       string
 	Parameters []ast.Parameter
 	Body       []ast.Statement
+	BodyText   string
 }
 
 type ViewData struct {
@@ -213,6 +251,10 @@ type ViewData struct {
 	Schema  string
 	Columns []ColumnData
 	Query   *ast.Select
+	// QueryText is the original SELECT SQL. When present it is the canonical,
+	// AST-independent definition: on load it is re-parsed with the current
+	// parser, so changes to AST node shapes do not invalidate persisted views.
+	QueryText string
 }
 
 type TriggerData struct {
@@ -222,6 +264,7 @@ type TriggerData struct {
 	Table      string
 	ForEachRow bool
 	Body       []ast.Statement
+	BodyText   string
 }
 
 type JobData struct {
@@ -229,6 +272,7 @@ type JobData struct {
 	Interval int
 	Unit     string
 	Body     []ast.Statement
+	BodyText string
 	Enabled  bool
 }
 
@@ -550,7 +594,15 @@ func (ps *PebbleStorage) LoadAll(cat *catalog.Catalog) error {
 				log.Printf("[storage] warning: failed to decode procedure %s: %v", strings.TrimPrefix(key, "proc:"), err)
 				continue
 			}
-			if err := cat.LoadProcedure(pd.Name, pd.Parameters, pd.Body); err != nil {
+			body := pd.Body
+			if pd.BodyText != "" {
+				if reparsed, perr := parseBody(pd.BodyText); perr == nil {
+					body = reparsed
+				} else {
+					log.Printf("[storage] warning: failed to re-parse procedure %s body, using stored AST: %v", pd.Name, perr)
+				}
+			}
+			if err := cat.LoadProcedure(pd.Name, pd.Parameters, body, pd.BodyText); err != nil {
 				log.Printf("[storage] warning: failed to load procedure %s: %v", pd.Name, err)
 			}
 		} else if strings.HasPrefix(key, "trig:") {
@@ -561,7 +613,15 @@ func (ps *PebbleStorage) LoadAll(cat *catalog.Catalog) error {
 				log.Printf("[storage] warning: failed to decode trigger %s: %v", strings.TrimPrefix(key, "trig:"), err)
 				continue
 			}
-			if err := cat.LoadTrigger(td.Name, td.Timing, td.Event, td.Table, td.ForEachRow, td.Body); err != nil {
+			tbody := td.Body
+			if td.BodyText != "" {
+				if reparsed, perr := parseBody(td.BodyText); perr == nil {
+					tbody = reparsed
+				} else {
+					log.Printf("[storage] warning: failed to re-parse trigger %s body, using stored AST: %v", td.Name, perr)
+				}
+			}
+			if err := cat.LoadTrigger(td.Name, td.Timing, td.Event, td.Table, td.ForEachRow, tbody, td.BodyText); err != nil {
 				log.Printf("[storage] warning: failed to load trigger %s: %v", td.Name, err)
 			}
 		} else if strings.HasPrefix(key, "job:") {
@@ -572,7 +632,15 @@ func (ps *PebbleStorage) LoadAll(cat *catalog.Catalog) error {
 				log.Printf("[storage] warning: failed to decode job %s: %v", strings.TrimPrefix(key, "job:"), err)
 				continue
 			}
-			if err := cat.LoadJob(jd.Name, jd.Interval, jd.Unit, jd.Body, jd.Enabled); err != nil {
+			jbody := jd.Body
+			if jd.BodyText != "" {
+				if reparsed, perr := parseBody(jd.BodyText); perr == nil {
+					jbody = reparsed
+				} else {
+					log.Printf("[storage] warning: failed to re-parse job %s body, using stored AST: %v", jd.Name, perr)
+				}
+			}
+			if err := cat.LoadJob(jd.Name, jd.Interval, jd.Unit, jbody, jd.Enabled, jd.BodyText); err != nil {
 				log.Printf("[storage] warning: failed to load job %s: %v", jd.Name, err)
 			}
 		} else if strings.HasPrefix(key, "view:") {
@@ -587,7 +655,17 @@ func (ps *PebbleStorage) LoadAll(cat *catalog.Catalog) error {
 			for i, col := range vd.Columns {
 				cols[i] = catalog.Column{Name: col.Name, Type: col.Type, NotNull: col.NotNull, Identity: col.Identity, IdentityValue: col.IdentityValue}
 			}
-			if err := cat.LoadView(vd.Name, cols, vd.Query, vd.Schema); err != nil {
+			// Prefer re-parsing the stored SQL text (AST-independent). Fall back
+			// to the serialized AST for views persisted before QueryText existed.
+			query := vd.Query
+			if vd.QueryText != "" {
+				if reparsed, perr := parseViewQuery(vd.QueryText); perr == nil {
+					query = reparsed
+				} else {
+					log.Printf("[storage] warning: failed to re-parse view %s.%s text, using stored AST: %v", vd.Schema, vd.Name, perr)
+				}
+			}
+			if err := cat.LoadView(vd.Name, cols, query, vd.Schema); err != nil {
 				log.Printf("[storage] warning: failed to load view %s.%s: %v", vd.Schema, vd.Name, err)
 			}
 		}

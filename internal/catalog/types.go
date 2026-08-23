@@ -39,12 +39,16 @@ type View struct {
 	Name    string
 	Columns []Column
 	Query   *ast.Select
+	// QueryText is the original SELECT SQL. When present it is the canonical,
+	// AST-independent definition used for persistence (re-parsed on load).
+	QueryText string
 }
 
 type Procedure struct {
 	Name       string
 	Parameters []ast.Parameter
 	Body       []ast.Statement
+	BodyText   string // Canonical AST-independent body SQL (re-parsed on load)
 	mu         sync.RWMutex
 }
 
@@ -55,6 +59,7 @@ type Trigger struct {
 	Table      string
 	ForEachRow bool
 	Body       []ast.Statement
+	BodyText   string // Canonical AST-independent body SQL (re-parsed on load)
 }
 
 type Job struct {
@@ -62,6 +67,7 @@ type Job struct {
 	Interval int
 	Unit     string
 	Body     []ast.Statement
+	BodyText string // Canonical AST-independent body SQL (re-parsed on load)
 	Enabled  bool
 	LastRun  int64 // Unix timestamp of last execution
 	Mu       sync.RWMutex
