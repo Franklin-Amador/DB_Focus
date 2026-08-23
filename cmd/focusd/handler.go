@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"dbf/internal/ast"
 	"dbf/internal/catalog"
@@ -23,6 +24,14 @@ func (h executeHandler) Handle(query string) (*server.QueryResult, error) {
 }
 
 func (h executeHandler) HandleWithDatabase(query string, currentDatabase string) (*server.QueryResult, error) {
+	// Wire-protocol path: no request context available, keep prior behavior.
+	return h.HandleWithDatabaseCtx(context.Background(), query, currentDatabase)
+}
+
+// HandleWithDatabaseCtx is the context-aware execution path. The GUI HTTP
+// handlers pass their request context (plus timeout) so long queries are
+// cancelled when the client disconnects or the deadline expires.
+func (h executeHandler) HandleWithDatabaseCtx(ctx context.Context, query string, currentDatabase string) (*server.QueryResult, error) {
 	if currentDatabase == "" {
 		currentDatabase = "postgres"
 	}
@@ -55,7 +64,7 @@ func (h executeHandler) HandleWithDatabase(query string, currentDatabase string)
 
 		applyDatabaseContext(stmt, currentDatabase)
 
-		result, err := h.executor.Execute(context.Background(), stmt)
+		result, err := h.executor.Execute(ctx, stmt)
 		if err != nil {
 			return nil, err
 		}
@@ -70,6 +79,98 @@ func (h executeHandler) HandleWithDatabase(query string, currentDatabase string)
 		return &server.QueryResult{Tag: "EMPTY"}, nil
 	}
 	return lastResult, nil
+}
+
+// scriptStatementResult is the outcome of one statement inside a script run.
+type scriptStatementResult struct {
+	Index     int             `json:"index"`
+	SQL       string          `json:"sql"`
+	Tag       string          `json:"tag"`
+	Columns   []string        `json:"columns"`
+	Rows      [][]interface{} `json:"rows"`
+	ElapsedMs int64           `json:"elapsedMs"`
+	Truncated bool            `json:"truncated,omitempty"`
+}
+
+// scriptResult aggregates a full script run: one entry per executed statement,
+// stopping at the first failure (FailedIndex == -1 when everything succeeded).
+type scriptResult struct {
+	Results     []scriptStatementResult
+	FailedIndex int
+	FailedSQL   string
+	Err         error
+}
+
+// HandleScript parses and executes every statement in sql, collecting one
+// result per statement. Statement boundaries come from the parser itself
+// (Parser.Pos), so quoted semicolons and dollar-quoted bodies are attributed
+// correctly. Execution stops at the first error; prior statements remain
+// applied (there is no transaction support in the engine).
+func (h executeHandler) HandleScript(ctx context.Context, sql string, maxRows int) *scriptResult {
+	out := &scriptResult{FailedIndex: -1}
+
+	query := rewriteSystemFunctions(sql, "postgres")
+	p := parser.NewParser(query)
+	idx := 0
+
+	for !p.AtEOF() {
+		start := p.Pos()
+		stmt, err := p.ParseStatement()
+		end := p.Pos()
+		stmtSQL := strings.TrimSpace(sliceBetween(query, start, end))
+
+		if err != nil {
+			out.FailedIndex = idx
+			out.FailedSQL = stmtSQL
+			out.Err = err
+			return out
+		}
+		if stmt == nil {
+			continue // bare semicolon
+		}
+
+		t0 := time.Now()
+		result, err := h.executor.Execute(ctx, stmt)
+		elapsed := time.Since(t0).Milliseconds()
+		if err != nil {
+			out.FailedIndex = idx
+			out.FailedSQL = stmtSQL
+			out.Err = err
+			return out
+		}
+
+		rows := result.Rows
+		truncated := false
+		if maxRows > 0 && len(rows) > maxRows {
+			rows = rows[:maxRows]
+			truncated = true
+		}
+		out.Results = append(out.Results, scriptStatementResult{
+			Index:     idx,
+			SQL:       stmtSQL,
+			Tag:       result.Tag,
+			Columns:   result.Columns,
+			Rows:      rows,
+			ElapsedMs: elapsed,
+			Truncated: truncated,
+		})
+		idx++
+	}
+	return out
+}
+
+// sliceBetween returns query[start:end] guarding against out-of-range offsets.
+func sliceBetween(query string, start, end int) string {
+	if start < 0 {
+		start = 0
+	}
+	if end > len(query) {
+		end = len(query)
+	}
+	if start >= end {
+		return ""
+	}
+	return query[start:end]
 }
 
 // rewriteSystemFunctions replaces PostgreSQL built-in functions/keywords
@@ -170,22 +271,3 @@ func replaceAllCaseInsensitive(input, pattern, replacement string) string {
 	return out.String()
 }
 
-// userInfoResult returns the focus.users table contents
-func userInfoResult(cat *catalog.Catalog) *server.QueryResult {
-	userTable, err := cat.GetTable("focus.users")
-	if err != nil {
-		return &server.QueryResult{
-			Columns: []string{"username", "superuser", "created_at"},
-			Rows:    [][]interface{}{},
-			Tag:     "SELECT 0",
-		}
-	}
-	allRows := userTable.SelectAll()
-	rows := make([][]interface{}, len(allRows))
-	copy(rows, allRows)
-	return &server.QueryResult{
-		Columns: []string{"username", "superuser", "created_at"},
-		Rows:    rows,
-		Tag:     fmt.Sprintf("SELECT %d", len(rows)),
-	}
-}

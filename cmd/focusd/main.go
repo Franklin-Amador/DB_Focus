@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"dbf/internal/catalog"
 	"dbf/internal/executor"
@@ -20,6 +21,7 @@ func main() {
 	dataDir  := flag.String("data",    "./data", "data directory for persistence")
 	maxConns := flag.Int("max-conns",  20,   "max concurrent connections")
 	bufSize  := flag.Int("buf-size",   4096, "buffer size per connection in bytes")
+	queryTimeout := flag.Duration("query-timeout", 60*time.Second, "max duration for a GUI query (0 = no limit)")
 	flag.Parse()
 
 	cat := catalog.New()
@@ -67,7 +69,7 @@ func main() {
 	if envPort := os.Getenv("PORT"); envPort != "" {
 		guiListen = "0.0.0.0:" + envPort
 	}
-	go startGUIServer(guiListen, handler, cat)
+	go startGUIServer(guiListen, handler, cat, *queryTimeout)
 
 	if err := server.ListenAndServeWithConfig(*addr, handler, cat, *maxConns, *bufSize); err != nil {
 		log.Fatalf("focus: %v", err)
