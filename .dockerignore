@@ -16,7 +16,10 @@ data_test_constraints/
 *.exe~
 *.test
 bin/
-vendor/
+# Anclado a la raíz a propósito: excluye un vendor/ de módulos Go en el root,
+# pero NO cmd/focusd/static/vendor/ (CodeMirror), que va embebido en el binario
+# con go:embed. Sin la barra inicial, la GUI desplegada se quedaría sin editor.
+/vendor/
 
 # Logs and temporary files
 *.log
