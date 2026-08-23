@@ -1,404 +1,3 @@
-// package catalog
-
-// import (
-// 	"dbf/internal/constants"
-// 	"fmt"
-// 	"strings"
-// )
-
-// // SystemResult represents a result from a system catalog query
-// type SystemResult struct {
-// 	Columns []string
-// 	Rows    [][]interface{}
-// 	Tag     string
-// }
-
-// // HandleSystemQuery intercepts system catalog queries from DBeaver/pgAdmin
-// // and returns real data from the catalog. Returns (result, true) if handled,
-// // (nil, false) if the query should be passed to the normal parser.
-// func (c *Catalog) HandleSystemQuery(query string) (*SystemResult, bool) {
-// 	upper := strings.ToUpper(strings.TrimSpace(query))
-
-// 	switch {
-// 	// ── information_schema ──────────────────────────────────────────
-// 	case strings.Contains(upper, "INFORMATION_SCHEMA.TABLES"):
-// 		return c.getISchemaTables(), true
-
-// 	case strings.Contains(upper, "INFORMATION_SCHEMA.COLUMNS"):
-// 		return c.getISchemaColumns(), true
-
-// 	case strings.Contains(upper, "INFORMATION_SCHEMA."):
-// 		// cualquier otra query de information_schema → vacío seguro
-// 		return emptyResult("SELECT 0"), true
-
-// 	// ── pg_type (debe ir antes que pg_catalog genérico) ─────────────
-// 	case strings.Contains(upper, "FORMAT_TYPE(NULLIF"):
-// 		return c.getPgTypeFull(), true
-
-// 	case strings.Contains(upper, "PG_CATALOG.PG_TYPE") ||
-// 		strings.Contains(upper, "PG_TYPE T"):
-// 		return c.getPgTypeBasic(), true
-
-// 	// ── pg_class ────────────────────────────────────────────────────
-// 	case strings.Contains(upper, "PG_CATALOG.PG_CLASS") ||
-// 		strings.Contains(upper, "FROM PG_CLASS"):
-// 		return c.getPgClass(), true
-
-// 	// ── pg_attribute ────────────────────────────────────────────────
-// 	case strings.Contains(upper, "PG_CATALOG.PG_ATTRIBUTE") ||
-// 		strings.Contains(upper, "FROM PG_ATTRIBUTE"):
-// 		return c.getPgAttribute(), true
-
-// 	// ── pg_namespace ─────────────────────────────────────────────────
-// 	case strings.Contains(upper, "PG_CATALOG.PG_NAMESPACE") ||
-// 		strings.Contains(upper, "FROM PG_NAMESPACE"):
-// 		return c.getPgNamespace(), true
-
-// 	// ── pg_roles / pg_user ──────────────────────────────────────────
-// 	case strings.Contains(upper, "PG_CATALOG.PG_ROLES") ||
-// 		strings.Contains(upper, "PG_CATALOG.PG_USER") ||
-// 		strings.Contains(upper, "CAN_SIGNAL_BACKEND"):
-// 		return c.getPgRoles(), true
-
-// 	// ── pg_database ──────────────────────────────────────────────────
-// 	case strings.Contains(upper, "PG_CATALOG.PG_DATABASE") ||
-// 		strings.Contains(upper, "PG_ENCODING_TO_CHAR"):
-// 		return c.getPgDatabase(), true
-
-// 	// ── pg_constraint ────────────────────────────────────────────────
-// 	case strings.Contains(upper, "PG_CATALOG.PG_CONSTRAINT") ||
-// 		strings.Contains(upper, "FROM PG_CONSTRAINT"):
-// 		return c.getPgConstraint(), true
-
-// 	// ── pg_index ─────────────────────────────────────────────────────
-// 	case strings.Contains(upper, "PG_CATALOG.PG_INDEX") ||
-// 		strings.Contains(upper, "FROM PG_INDEX"):
-// 		return emptyResultWithCols(
-// 			[]string{"indexrelid", "indrelid", "indisprimary", "indisunique"},
-// 			"SELECT 0",
-// 		), true
-
-// 	// ── pg_enum ──────────────────────────────────────────────────────
-// 	case strings.Contains(upper, "PG_CATALOG.PG_ENUM") ||
-// 		strings.Contains(upper, "FROM PG_ENUM"):
-// 		return emptyResultWithCols(
-// 			[]string{"oid", "enumtypid", "enumsortorder", "enumlabel"},
-// 			"SELECT 0",
-// 		), true
-
-// 	// ── pg_proc / funciones ──────────────────────────────────────────
-// 	case strings.Contains(upper, "PG_CATALOG.PG_PROC") ||
-// 		strings.Contains(upper, "FROM PG_PROC"):
-// 		return emptyResultWithCols(
-// 			[]string{"oid", "proname", "pronamespace", "prorettype"},
-// 			"SELECT 0",
-// 		), true
-
-// 	// ── pg_stat_gssapi ───────────────────────────────────────────────
-// 	case strings.Contains(upper, "PG_STAT_GSSAPI"):
-// 		return &SystemResult{
-// 			Columns: []string{"gss_authenticated", "encrypted"},
-// 			Rows:    [][]interface{}{{false, false}},
-// 			Tag:     "SELECT 1",
-// 		}, true
-
-// 	// ── recovery / replicación ───────────────────────────────────────
-// 	case strings.Contains(upper, "PG_IS_IN_RECOVERY") ||
-// 		strings.Contains(upper, "PG_IS_WAL_REPLAY_PAUSED"):
-// 		return &SystemResult{
-// 			Columns: []string{"inrecovery", "isreplaypaused"},
-// 			Rows:    [][]interface{}{{false, false}},
-// 			Tag:     "SELECT 1",
-// 		}, true
-
-// 	case strings.Contains(upper, "PG_REPLICATION_SLOTS"):
-// 		return &SystemResult{
-// 			Columns: []string{"count"},
-// 			Rows:    [][]interface{}{{int32(0)}},
-// 			Tag:     "SELECT 1",
-// 		}, true
-
-// 	// ── bdr / replication type ───────────────────────────────────────
-// 	case strings.Contains(upper, "EXTNAME='BDR'"):
-// 		return &SystemResult{
-// 			Columns: []string{"type"},
-// 			Rows:    [][]interface{}{{""}},
-// 			Tag:     "SELECT 1",
-// 		}, true
-
-// 	// ── pg_show_all_settings / set_config ────────────────────────────
-// 	case strings.Contains(upper, "PG_SHOW_ALL_SETTINGS") ||
-// 		strings.Contains(upper, "SET_CONFIG"):
-// 		return &SystemResult{
-// 			Columns: []string{"set_config"},
-// 			Rows:    [][]interface{}{{"hex"}},
-// 			Tag:     "SELECT 1",
-// 		}, true
-
-// 	// ── pg_description ───────────────────────────────────────────────
-// 	case strings.Contains(upper, "PG_CATALOG.PG_DESCRIPTION") ||
-// 		strings.Contains(upper, "FROM PG_DESCRIPTION"):
-// 		return emptyResultWithCols(
-// 			[]string{"objoid", "classoid", "objsubid", "description"},
-// 			"SELECT 0",
-// 		), true
-
-// 	// ── pg_settings ──────────────────────────────────────────────────
-// 	case strings.Contains(upper, "PG_CATALOG.PG_SETTINGS") ||
-// 		strings.Contains(upper, "FROM PG_SETTINGS"):
-// 		return c.getPgSettings(), true
-
-// 	// ── WHERE 1<>1 (introspección de tipos de DBeaver) ───────────────
-// 	case strings.Contains(upper, "WHERE 1<>1") ||
-// 		strings.Contains(upper, "WHERE 1 <> 1"):
-// 		return emptyResult("SELECT 0"), true
-
-// 	case strings.Contains(upper, "PG_GET_KEYWORDS"):
-// 		return &SystemResult{
-// 			Columns: []string{"string_agg"},
-// 			Rows:    [][]interface{}{{""}},
-// 			Tag:     "SELECT 1",
-// 		}, true
-
-// 	case strings.Contains(upper, "FOCUS.USERS"):
-// 		// delegar al handler de usuarios — retorna false para que lo maneje el executor
-// 		return nil, false
-
-// 	case strings.Contains(upper, "$1") && strings.Contains(upper, "PG_CATALOG"):
-// 		// prepared query con parámetro bind contra pg_catalog → vacío seguro
-// 		return emptyResult("SELECT 0"), true
-
-// 	case strings.Contains(upper, "CURRENT_SCHEMA()"):
-// 		return &SystemResult{
-// 			Columns: []string{"current_schema", "session_user"},
-// 			Rows:    [][]interface{}{{"public", "postgres"}},
-// 			Tag:     "SELECT 1",
-// 		}, true
-
-// 	case strings.Contains(upper, "FORMAT_TYPE(NULLIF"):
-// 		return c.getPgTypeFull(), true
-// 	}
-
-// 	return nil, false
-// }
-
-// // ── Implementaciones reales ──────────────────────────────────────────────────
-
-// func (c *Catalog) getISchemaTables() *SystemResult {
-// 	rows := c.GetInformationSchemaTables()
-// 	return &SystemResult{
-// 		Columns: []string{"table_catalog", "table_schema", "table_name", "table_type"},
-// 		Rows:    rows,
-// 		Tag:     fmt.Sprintf("SELECT %d", len(rows)),
-// 	}
-// }
-
-// func (c *Catalog) getISchemaColumns() *SystemResult {
-// 	rows := c.GetInformationSchemaColumns()
-// 	return &SystemResult{
-// 		Columns: []string{"table_catalog", "table_schema", "table_name", "column_name", "ordinal_position", "data_type"},
-// 		Rows:    rows,
-// 		Tag:     fmt.Sprintf("SELECT %d", len(rows)),
-// 	}
-// }
-
-// func (c *Catalog) getPgClass() *SystemResult {
-// 	tables := c.GetAllTables()
-// 	var rows [][]interface{}
-// 	oid := int32(1000)
-// 	for name := range tables {
-// 		if strings.HasPrefix(name, "pg_catalog.") {
-// 			continue
-// 		}
-// 		rows = append(rows, []interface{}{
-// 			oid,         // oid
-// 			name,        // relname
-// 			int32(2200), // relnamespace (public)
-// 			"r",         // relkind (table)
-// 			int32(10),   // relowner
-// 			int32(0),    // reltype
-// 			int32(0),    // reloftype
-// 		})
-// 		oid++
-// 	}
-// 	return &SystemResult{
-// 		Columns: []string{"oid", "relname", "relnamespace", "relkind", "relowner", "reltype", "reloftype"},
-// 		Rows:    rows,
-// 		Tag:     fmt.Sprintf("SELECT %d", len(rows)),
-// 	}
-// }
-
-// func (c *Catalog) getPgAttribute() *SystemResult {
-// 	tables := c.GetAllTables()
-// 	var rows [][]interface{}
-// 	tableOid := int32(1000)
-// 	for tName, table := range tables {
-// 		if strings.HasPrefix(tName, "pg_catalog.") {
-// 			continue
-// 		}
-// 		for i, col := range table.Columns {
-// 			rows = append(rows, []interface{}{
-// 				tableOid,     // attrelid
-// 				col.Name,     // attname
-// 				int32(25),    // atttypid (text por defecto)
-// 				int32(i + 1), // attnum
-// 				col.NotNull,  // attnotnull
-// 				int32(-1),    // atttypmod
-// 				false,        // attisdropped
-// 			})
-// 		}
-// 		tableOid++
-// 	}
-// 	return &SystemResult{
-// 		Columns: []string{"attrelid", "attname", "atttypid", "attnum", "attnotnull", "atttypmod", "attisdropped"},
-// 		Rows:    rows,
-// 		Tag:     fmt.Sprintf("SELECT %d", len(rows)),
-// 	}
-// }
-
-// func (c *Catalog) getPgNamespace() *SystemResult {
-// 	return &SystemResult{
-// 		Columns: []string{"oid", "nspname", "nspowner"},
-// 		Rows: [][]interface{}{
-// 			{int32(11), "pg_catalog", int32(10)},
-// 			{int32(2200), "public", int32(10)},
-// 		},
-// 		Tag: "SELECT 2",
-// 	}
-// }
-
-// func (c *Catalog) getPgRoles() *SystemResult {
-// 	rolesTable, err := c.GetTable(constants.CatalogRoles)
-// 	if err != nil {
-// 		return emptyResultWithCols(
-// 			[]string{"id", "name", "is_superuser", "can_create_role", "can_create_db", "rolcanlogin", "can_signal_backend"},
-// 			"SELECT 0",
-// 		)
-// 	}
-
-// 	allRows := rolesTable.SelectAll()
-// 	result := make([][]interface{}, 0, len(allRows))
-// 	for _, r := range allRows {
-// 		// pg_catalog.pg_roles columns: oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin
-// 		if len(r) < 7 {
-// 			continue
-// 		}
-// 		result = append(result, []interface{}{
-// 			r[0],  // oid
-// 			r[1],  // rolname
-// 			r[2],  // rolsuper
-// 			r[4],  // rolcreaterole
-// 			r[5],  // rolcreatedb
-// 			r[6],  // rolcanlogin
-// 			false, // can_signal_backend
-// 		})
-// 	}
-
-// 	return &SystemResult{
-// 		Columns: []string{"id", "name", "is_superuser", "can_create_role", "can_create_db", "rolcanlogin", "can_signal_backend"},
-// 		Rows:    result,
-// 		Tag:     fmt.Sprintf("SELECT %d", len(result)),
-// 	}
-// }
-
-// func (c *Catalog) getPgDatabase() *SystemResult {
-// 	return &SystemResult{
-// 		Columns: []string{"did", "datname", "datallowconn", "serverencoding", "cancreate", "datistemplate"},
-// 		Rows: [][]interface{}{
-// 			{int32(1), "focusdb", true, "UTF8", true, false},
-// 		},
-// 		Tag: "SELECT 1",
-// 	}
-// }
-
-// func (c *Catalog) getPgConstraint() *SystemResult {
-// 	tables := c.GetAllTables()
-// 	var rows [][]interface{}
-// 	oid := int32(3000)
-// 	tableOid := int32(1000)
-// 	for tName, table := range tables {
-// 		if strings.HasPrefix(tName, "pg_catalog.") {
-// 			continue
-// 		}
-// 		for _, constraint := range table.Constraints {
-// 			contype := "c"
-// 			switch constraint.Type {
-// 			case "PRIMARY_KEY":
-// 				contype = "p"
-// 			case "FOREIGN_KEY":
-// 				contype = "f"
-// 			case "UNIQUE":
-// 				contype = "u"
-// 			}
-// 			rows = append(rows, []interface{}{
-// 				oid,
-// 				constraint.ColumnName + "_" + contype,
-// 				tableOid,
-// 				contype,
-// 				constraint.ReferencedTable,
-// 			})
-// 			oid++
-// 		}
-// 		tableOid++
-// 	}
-// 	return &SystemResult{
-// 		Columns: []string{"oid", "conname", "conrelid", "contype", "confrelid"},
-// 		Rows:    rows,
-// 		Tag:     fmt.Sprintf("SELECT %d", len(rows)),
-// 	}
-// }
-
-// func (c *Catalog) getPgTypeBasic() *SystemResult {
-// 	return &SystemResult{
-// 		Columns: []string{"oid", "typname", "typtype", "typlen", "typbasetype", "typtypmod", "typelem", "typrelid", "typcategory", "typnamespace"},
-// 		Rows: [][]interface{}{
-// 			{int32(16), "bool", "b", int32(1), int32(0), int32(-1), int32(0), int32(0), "B", int32(11)},
-// 			{int32(23), "int4", "b", int32(4), int32(0), int32(-1), int32(0), int32(0), "N", int32(11)},
-// 			{int32(25), "text", "b", int32(-1), int32(0), int32(-1), int32(0), int32(0), "S", int32(11)},
-// 			{int32(701), "float8", "b", int32(8), int32(0), int32(-1), int32(0), int32(0), "N", int32(11)},
-// 			{int32(1043), "varchar", "b", int32(-1), int32(0), int32(-1), int32(0), int32(0), "S", int32(11)},
-// 			{int32(1082), "date", "b", int32(4), int32(0), int32(-1), int32(0), int32(0), "D", int32(11)},
-// 			{int32(1114), "timestamp", "b", int32(8), int32(0), int32(-1), int32(0), int32(0), "D", int32(11)},
-// 		},
-// 		Tag: "SELECT 7",
-// 	}
-// }
-
-// func (c *Catalog) getPgTypeFull() *SystemResult {
-// 	// Mismos datos que basic pero con columnas extra que pide DBeaver
-// 	basic := c.getPgTypeBasic()
-// 	basic.Columns = append(basic.Columns, "relkind", "base_type_name", "description")
-// 	for i := range basic.Rows {
-// 		basic.Rows[i] = append(basic.Rows[i], nil, nil, nil)
-// 	}
-// 	return basic
-// }
-
-// func (c *Catalog) getPgSettings() *SystemResult {
-// 	return &SystemResult{
-// 		Columns: []string{"name", "setting"},
-// 		Rows: [][]interface{}{
-// 			{"server_version", "17.0"},
-// 			{"server_encoding", "UTF8"},
-// 			{"client_encoding", "UTF8"},
-// 			{"bytea_output", "hex"},
-// 			{"standard_conforming_strings", "on"},
-// 			{"integer_datetimes", "on"},
-// 		},
-// 		Tag: "SELECT 6",
-// 	}
-// }
-
-// // ── Helpers ──────────────────────────────────────────────────────────────────
-
-// func emptyResult(tag string) *SystemResult {
-// 	return &SystemResult{Columns: []string{}, Rows: [][]interface{}{}, Tag: tag}
-// }
-
-// func emptyResultWithCols(cols []string, tag string) *SystemResult {
-// 	return &SystemResult{Columns: cols, Rows: [][]interface{}{}, Tag: tag}
-// }
-
 package catalog
 
 import (
@@ -424,92 +23,81 @@ func (c *Catalog) HandleSystemQueryForDatabase(query string, currentDatabase str
 		currentDatabase = "postgres"
 	}
 	upper := strings.ToUpper(strings.TrimSpace(query))
-	switch {
-	case strings.Contains(upper, "CURRENT_SCHEMA()"):
-		return c.getCurrentSchema(currentDatabase), true
-
-	case strings.Contains(upper, "SHOW SEARCH_PATH"):
-		return c.getSearchPath(), true
-
-	case strings.Contains(upper, "SELECT VERSION()"):
-		return c.getVersion(), true
-
-	case strings.Contains(upper, "FORMAT_TYPE(NULLIF"):
-		return c.getPgTypeFull(), true
-
-	case strings.Contains(upper, "PG_GET_KEYWORDS"):
-		return c.getPgKeywords(), true
-
-	case strings.Contains(upper, "PG_CATALOG.PG_DATABASE") || strings.Contains(upper, "FROM PG_DATABASE"):
-		return c.getPgDatabase(), true
-
-	case strings.Contains(upper, "PG_CATALOG.PG_SETTINGS"):
-		return c.getPgSettings(), true
-
-	case isPsqlDtQuery(upper):
-		includeTables, includeViews := relationKindsFromQuery(upper)
-		return c.getDtRelations(currentDatabase, includeTables, includeViews), true
-
-	case strings.Contains(upper, "FROM PG_CATALOG.PG_NAMESPACE") && !strings.Contains(upper, "PG_CATALOG.PG_CLASS"):
-		return c.getPgNamespace(), true
-
-	case strings.Contains(upper, "PG_CATALOG.PG_ENUM"):
-		return c.getPgEnum(), true
-
-	case strings.Contains(upper, "PG_CATALOG.PG_CLASS"):
-		return c.getPgClass(currentDatabase), true
-
-	case strings.Contains(upper, "PG_CATALOG.PG_ATTRIBUTE"):
-		return c.getPgAttribute(), true
-
-	case strings.Contains(upper, "PG_CATALOG.PG_CONSTRAINT"):
-		return c.getPgConstraint(), true
-
-	case strings.Contains(upper, "PG_IS_IN_RECOVERY") ||
-		strings.Contains(upper, "PG_IS_WAL_REPLAY_PAUSED"):
-		return &SystemResult{
-			Columns: []string{"inrecovery", "isreplaypaused"},
-			Rows:    [][]interface{}{{false, false}},
-			Tag:     "SELECT 1",
-		}, true
-
-	case strings.Contains(upper, "PG_REPLICATION_SLOTS"):
-		return &SystemResult{
-			Columns: []string{"count"},
-			Rows:    [][]interface{}{{int32(0)}},
-			Tag:     "SELECT 1",
-		}, true
-
-	case strings.Contains(upper, "EXTNAME='BDR'"):
-		return &SystemResult{
-			Columns: []string{"type"},
-			Rows:    [][]interface{}{{""}},
-			Tag:     "SELECT 1",
-		}, true
-
-	case strings.Contains(upper, "PG_STAT_GSSAPI"):
-		return &SystemResult{
-			Columns: []string{"gss_authenticated", "encrypted"},
-			Rows:    [][]interface{}{{false, false}},
-			Tag:     "SELECT 1",
-		}, true
-
-	case strings.Contains(upper, "INFORMATION_SCHEMA.TABLES"):
-		return c.getISchemaTables(currentDatabase), true
-
-	case strings.Contains(upper, "INFORMATION_SCHEMA.COLUMNS"):
-		return c.getISchemaColumns(currentDatabase), true
-
-	case strings.Contains(upper, "INFORMATION_SCHEMA."):
-		return emptyResult("SELECT 0"), true
-
-	case strings.Contains(upper, "WHERE 1<>1"):
-		return emptyResult("SELECT 0"), true
-
-	case strings.Contains(upper, "PG_CATALOG."):
-		return emptyResult("SELECT 0"), true
+	for _, route := range systemRoutes {
+		if route.match(upper) {
+			return route.handle(c, upper, currentDatabase), true
+		}
 	}
 	return nil, false
+}
+
+// systemRoute maps a predicate over the upper-cased query to a handler that
+// builds the canned or computed system-catalog result.
+type systemRoute struct {
+	match  func(upper string) bool
+	handle func(c *Catalog, upper, currentDatabase string) *SystemResult
+}
+
+// hasAny reports whether the query contains any of the given substrings.
+func hasAny(subs ...string) func(string) bool {
+	return func(u string) bool {
+		for _, s := range subs {
+			if strings.Contains(u, s) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// canned returns a handler that always yields the same fixed SystemResult,
+// used for the client-probe responses that carry no dynamic data.
+func canned(cols []string, row []interface{}, tag string) func(*Catalog, string, string) *SystemResult {
+	return func(*Catalog, string, string) *SystemResult {
+		return &SystemResult{Columns: cols, Rows: [][]interface{}{row}, Tag: tag}
+	}
+}
+
+// systemRoutes is the ordered pattern→response table for PostgreSQL system and
+// information_schema queries. Routes are evaluated top to bottom (first match
+// wins), so order is significant.
+//
+// NOTE: server/bypass.go intercepts a subset of these patterns BEFORE this
+// handler is reached (checkBypass runs first in conn.go's query paths), so the
+// overlapping entries below — pg_is_in_recovery, pg_replication_slots,
+// extname='bdr', pg_stat_gssapi, "WHERE 1<>1" — act as a defensive fallback.
+var systemRoutes = []systemRoute{
+	{hasAny("CURRENT_SCHEMA()"), func(c *Catalog, _, db string) *SystemResult { return c.getCurrentSchema(db) }},
+	{hasAny("SHOW SEARCH_PATH"), func(c *Catalog, _, _ string) *SystemResult { return c.getSearchPath() }},
+	{hasAny("SELECT VERSION()"), func(c *Catalog, _, _ string) *SystemResult { return c.getVersion() }},
+	{hasAny("FORMAT_TYPE(NULLIF"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgTypeFull() }},
+	{hasAny("PG_GET_KEYWORDS"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgKeywords() }},
+	{hasAny("PG_CATALOG.PG_DATABASE", "FROM PG_DATABASE"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgDatabase() }},
+	{hasAny("PG_CATALOG.PG_SETTINGS"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgSettings() }},
+	{isPsqlDtQuery, func(c *Catalog, upper, db string) *SystemResult {
+		includeTables, includeViews := relationKindsFromQuery(upper)
+		return c.getDtRelations(db, includeTables, includeViews)
+	}},
+	{func(u string) bool {
+		return strings.Contains(u, "FROM PG_CATALOG.PG_NAMESPACE") && !strings.Contains(u, "PG_CATALOG.PG_CLASS")
+	}, func(c *Catalog, _, _ string) *SystemResult { return c.getPgNamespace() }},
+	{hasAny("PG_CATALOG.PG_ENUM"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgEnum() }},
+	{hasAny("PG_CATALOG.PG_CLASS"), func(c *Catalog, _, db string) *SystemResult { return c.getPgClass(db) }},
+	{hasAny("PG_CATALOG.PG_ATTRIBUTE"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgAttribute() }},
+	{hasAny("PG_CATALOG.PG_CONSTRAINT"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgConstraint() }},
+	{hasAny("PG_IS_IN_RECOVERY", "PG_IS_WAL_REPLAY_PAUSED"),
+		canned([]string{"inrecovery", "isreplaypaused"}, []interface{}{false, false}, "SELECT 1")},
+	{hasAny("PG_REPLICATION_SLOTS"),
+		canned([]string{"count"}, []interface{}{int32(0)}, "SELECT 1")},
+	{hasAny("EXTNAME='BDR'"),
+		canned([]string{"type"}, []interface{}{""}, "SELECT 1")},
+	{hasAny("PG_STAT_GSSAPI"),
+		canned([]string{"gss_authenticated", "encrypted"}, []interface{}{false, false}, "SELECT 1")},
+	{hasAny("INFORMATION_SCHEMA.TABLES"), func(c *Catalog, _, db string) *SystemResult { return c.getISchemaTables(db) }},
+	{hasAny("INFORMATION_SCHEMA.COLUMNS"), func(c *Catalog, _, db string) *SystemResult { return c.getISchemaColumns(db) }},
+	{hasAny("INFORMATION_SCHEMA."), func(c *Catalog, _, _ string) *SystemResult { return emptyResult("SELECT 0") }},
+	{hasAny("WHERE 1<>1"), func(c *Catalog, _, _ string) *SystemResult { return emptyResult("SELECT 0") }},
+	{hasAny("PG_CATALOG."), func(c *Catalog, _, _ string) *SystemResult { return emptyResult("SELECT 0") }},
 }
 
 func isPsqlDtQuery(upperQuery string) bool {

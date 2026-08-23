@@ -125,20 +125,31 @@ func (v *Validator) ValidateUpdate(stmt *ast.Update, table *catalog.Table) error
 	}
 
 	// Validate WHERE clause if present
-	if stmt.Where != nil {
-		found = false
+	if err := validateWhereColumns(stmt.Where, table); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateWhereColumns checks that every column referenced by a WHERE predicate
+// tree (leaf comparisons of an AND/OR expression) exists in the table.
+func validateWhereColumns(where *ast.WhereClause, table *catalog.Table) error {
+	if where == nil {
+		return nil
+	}
+	for _, name := range where.LeafColumns() {
+		found := false
 		for _, col := range table.Columns {
-			if col.Name == stmt.Where.Column.Name {
+			if col.Name == name {
 				found = true
 				break
 			}
 		}
 		if !found {
-			return fmt.Errorf("WHERE column %s does not exist in table %s",
-				stmt.Where.Column.Name, table.Name)
+			return fmt.Errorf("WHERE column %s does not exist in table %s", name, table.Name)
 		}
 	}
-
 	return nil
 }
 
@@ -153,18 +164,8 @@ func (v *Validator) ValidateDelete(stmt *ast.Delete, table *catalog.Table) error
 	}
 
 	// Validate WHERE clause if present
-	if stmt.Where != nil {
-		found := false
-		for _, col := range table.Columns {
-			if col.Name == stmt.Where.Column.Name {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return fmt.Errorf("WHERE column %s does not exist in table %s",
-				stmt.Where.Column.Name, table.Name)
-		}
+	if err := validateWhereColumns(stmt.Where, table); err != nil {
+		return err
 	}
 
 	return nil

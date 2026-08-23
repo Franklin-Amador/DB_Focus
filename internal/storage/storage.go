@@ -2,42 +2,73 @@ package storage
 
 import (
 	"encoding/json"
-	"fmt"
-	"io/ioutil"
-	"os"
-	"path/filepath"
 	"strconv"
-	"strings"
-	"sync"
 
 	"dbf/internal/catalog"
 )
 
-// Backend is the interface for storage implementations
-type Backend interface {
+// The storage contract is split into small, responsibility-scoped interfaces
+// so consumers can depend on only what they use and new persistent object
+// types get their own interface instead of enlarging one flat contract.
+// Backend composes them all; the Pebble backend satisfies the whole set.
+
+// TableStore persists tables and their row/column data.
+type TableStore interface {
 	SaveTable(table *catalog.Table) error
 	// SaveTableWithSchema persists a table under a specific schema name.
 	SaveTableWithSchema(table *catalog.Table, schema string) error
 	DeleteTable(name string, schema string) error
-	SaveProcedure(proc *catalog.Procedure) error
-	DeleteProcedure(name string) error
+	LoadTable(cat *catalog.Catalog, name string) error
+	// DropColumnData removes a column from all rows in a table.
+	DropColumnData(tableName string, columnName string, schema string) error
+	// RenameColumnData renames a column in all rows in a table.
+	RenameColumnData(tableName string, oldName string, newName string, schema string) error
+}
+
+// ViewStore persists views.
+type ViewStore interface {
 	SaveView(view *catalog.View, schema string) error
 	DeleteView(name string, schema string) error
+}
+
+// ProcedureStore persists stored procedures.
+type ProcedureStore interface {
+	SaveProcedure(proc *catalog.Procedure) error
+	DeleteProcedure(name string) error
+}
+
+// TriggerStore persists triggers.
+type TriggerStore interface {
 	SaveTrigger(trigger *catalog.Trigger) error
 	DeleteTrigger(name string) error
+}
+
+// JobStore persists scheduled jobs.
+type JobStore interface {
 	SaveJob(job *catalog.Job) error
 	DeleteJob(name string) error
-	LoadTable(cat *catalog.Catalog, name string) error
-	LoadAll(cat *catalog.Catalog) error
-	Close() error
+}
+
+// SchemaStore persists schema namespaces.
+type SchemaStore interface {
 	// CreateSchema creates a new schema namespace in persistent storage.
 	CreateSchema(name string) error
 	// DeleteSchema removes a schema and all its tables from persistent storage.
 	DeleteSchema(name string) error
-	// DropColumnData removes a column from all rows in a table
-	DropColumnData(tableName string, columnName string, schema string) error
-	// RenameColumnData renames a column in all rows in a table
-	RenameColumnData(tableName string, oldName string, newName string, schema string) error
+}
+
+// Backend is the full storage contract, composing every per-responsibility
+// store plus lifecycle operations. Implementations (e.g. PebbleStorage) satisfy
+// the whole interface; callers may depend on a narrower store where possible.
+type Backend interface {
+	TableStore
+	ViewStore
+	ProcedureStore
+	TriggerStore
+	JobStore
+	SchemaStore
+	LoadAll(cat *catalog.Catalog) error
+	Close() error
 }
 
 type TableData struct {
@@ -55,6 +86,9 @@ type IndexData struct {
 	ColumnName string `json:"column_name,omitempty"`
 }
 
+// indexColumnsFromData returns the indexed column names for a persisted index,
+// tolerating both the current multi-column format and the legacy single-column
+// field. Shared by the Pebble backend when rehydrating indexes.
 func indexColumnsFromData(idx IndexData) []string {
 	if len(idx.ColumnNames) > 0 {
 		return append([]string(nil), idx.ColumnNames...)
@@ -80,129 +114,10 @@ type ConstraintData struct {
 	ReferencedCol   string `json:"referenced_col,omitempty"`
 }
 
-type Storage struct {
-	dir string
-	mu  sync.RWMutex
-}
-
-func New(dir string) (*Storage, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, err
-	}
-	return &Storage{dir: dir}, nil
-}
-
-func (s *Storage) SaveTable(table *catalog.Table) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	td := TableData{
-		Name:        table.Name,
-		Columns:     make([]ColumnData, len(table.Columns)),
-		Constraints: make([]ConstraintData, len(table.Constraints)),
-		Indexes:     make([]IndexData, 0, len(table.Indexes)),
-		Rows:        table.SelectAll(),
-	}
-
-	for i, col := range table.Columns {
-		td.Columns[i] = ColumnData{
-			Name:          col.Name,
-			Type:          col.Type,
-			NotNull:       col.NotNull,
-			Identity:      col.Identity,
-			IdentityValue: col.IdentityValue,
-		}
-	}
-
-	for i, constraint := range table.Constraints {
-		td.Constraints[i] = ConstraintData{
-			Type:            constraint.Type,
-			ColumnName:      constraint.ColumnName,
-			ReferencedTable: constraint.ReferencedTable,
-			ReferencedCol:   constraint.ReferencedCol,
-		}
-	}
-
-	for _, idx := range table.Indexes {
-		td.Indexes = append(td.Indexes, IndexData{Name: idx.Name, ColumnNames: append([]string(nil), idx.ColumnNames...)})
-	}
-
-	data, err := json.MarshalIndent(td, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	path := filepath.Join(s.dir, table.Name+".json")
-	if err := ioutil.WriteFile(path, data, 0644); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (s *Storage) LoadTable(cat *catalog.Catalog, name string) error {
-	if strings.HasPrefix(name, "pg_catalog.") {
-		return nil
-	}
-
-	s.mu.RLock()
-	path := filepath.Join(s.dir, name+".json")
-	s.mu.RUnlock()
-
-	data, err := ioutil.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-
-	var td TableData
-	if err := json.Unmarshal(data, &td); err != nil {
-		return err
-	}
-
-	cols := make([]catalog.Column, len(td.Columns))
-	for i, col := range td.Columns {
-		cols[i] = catalog.Column{Name: col.Name, Type: col.Type, NotNull: col.NotNull, Identity: col.Identity, IdentityValue: col.IdentityValue}
-	}
-
-	constraints := make([]catalog.Constraint, len(td.Constraints))
-	for i, constraint := range td.Constraints {
-		constraints[i] = catalog.Constraint{
-			Type:            constraint.Type,
-			ColumnName:      constraint.ColumnName,
-			ReferencedTable: constraint.ReferencedTable,
-			ReferencedCol:   constraint.ReferencedCol,
-		}
-	}
-
-	if err := cat.CreateTable(td.Name, cols, constraints); err != nil {
-		return err
-	}
-
-	table, err := cat.GetTable(td.Name)
-	if err != nil {
-		return err
-	}
-
-	for _, idx := range td.Indexes {
-		if err := table.CreateIndex(idx.Name, indexColumnsFromData(idx)); err != nil {
-			return err
-		}
-	}
-
-	for _, row := range td.Rows {
-		if err := table.InsertRow(row, cat); err != nil {
-			return err
-		}
-	}
-
-	syncIdentityValues(table)
-
-	return nil
-}
-
+// syncIdentityValues normalizes a table's IDENTITY columns after a bulk load:
+// it computes the maximum existing identity value, backfills any missing ones,
+// and advances the column's identity counter accordingly. Shared by the Pebble
+// backend after rehydrating table rows.
 func syncIdentityValues(table *catalog.Table) {
 	table.Mu().Lock()
 	defer table.Mu().Unlock()
@@ -260,158 +175,4 @@ func syncIdentityValues(table *catalog.Table) {
 			table.Columns[colIdx].IdentityValue = maxValue
 		}
 	}
-}
-
-func (s *Storage) LoadAll(cat *catalog.Catalog) error {
-	s.mu.RLock()
-	files, err := ioutil.ReadDir(s.dir)
-	s.mu.RUnlock()
-
-	if err != nil {
-		return err
-	}
-
-	// First pass: load all table structures
-	tableData := make(map[string]*TableData)
-	for _, file := range files {
-		if file.IsDir() || filepath.Ext(file.Name()) != ".json" {
-			continue
-		}
-
-		tableName := file.Name()[:len(file.Name())-5]
-		if strings.HasPrefix(tableName, "pg_catalog.") {
-			continue
-		}
-		path := filepath.Join(s.dir, file.Name())
-
-		data, err := ioutil.ReadFile(path)
-		if err != nil {
-			fmt.Printf("warning: failed to read table %s: %v\n", tableName, err)
-			continue
-		}
-
-		var td TableData
-		if err := json.Unmarshal(data, &td); err != nil {
-			fmt.Printf("warning: failed to unmarshal table %s: %v\n", tableName, err)
-			continue
-		}
-		if strings.HasPrefix(td.Name, "pg_catalog.") {
-			continue
-		}
-		tableData[tableName] = &td
-
-		cols := make([]catalog.Column, len(td.Columns))
-		for i, col := range td.Columns {
-			cols[i] = catalog.Column{Name: col.Name, Type: col.Type, NotNull: col.NotNull}
-		}
-
-		constraints := make([]catalog.Constraint, len(td.Constraints))
-		for i, constraint := range td.Constraints {
-			constraints[i] = catalog.Constraint{
-				Type:            constraint.Type,
-				ColumnName:      constraint.ColumnName,
-				ReferencedTable: constraint.ReferencedTable,
-				ReferencedCol:   constraint.ReferencedCol,
-			}
-		}
-
-		if err := cat.CreateTable(td.Name, cols, constraints); err != nil {
-			fmt.Printf("warning: failed to create table %s: %v\n", tableName, err)
-			continue
-		}
-
-		table, err := cat.GetTable(td.Name)
-		if err != nil {
-			fmt.Printf("warning: failed to get table %s: %v\n", tableName, err)
-			continue
-		}
-
-		for _, idx := range td.Indexes {
-			if err := table.CreateIndex(idx.Name, indexColumnsFromData(idx)); err != nil {
-				fmt.Printf("warning: failed to create index %s on %s: %v\n", idx.Name, tableName, err)
-			}
-		}
-	}
-
-	// Second pass: load all data (now all tables exist)
-	for tableName, td := range tableData {
-		table, err := cat.GetTable(tableName)
-		if err != nil {
-			fmt.Printf("warning: table %s not found during data load: %v\n", tableName, err)
-			continue
-		}
-
-		for _, row := range td.Rows {
-			if err := table.InsertRowUnsafe(row); err != nil {
-				fmt.Printf("warning: failed to insert row into %s: %v\n", tableName, err)
-			}
-		}
-	}
-
-	return nil
-}
-
-func (s *Storage) SaveTableWithSchema(table *catalog.Table, schema string) error {
-	return s.SaveTable(table)
-}
-
-func (s *Storage) DeleteTable(name string, schema string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	path := filepath.Join(s.dir, name+".json")
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
-}
-
-func (s *Storage) SaveProcedure(proc *catalog.Procedure) error {
-	// Legacy file storage backend does not persist procedures.
-	return nil
-}
-
-func (s *Storage) DeleteProcedure(name string) error {
-	// Legacy file storage backend does not persist procedures.
-	return nil
-}
-
-func (s *Storage) SaveView(view *catalog.View, schema string) error {
-	// Legacy file storage backend does not persist views.
-	return nil
-}
-
-func (s *Storage) DeleteView(name string, schema string) error {
-	// Legacy file storage backend does not persist views.
-	return nil
-}
-
-func (s *Storage) CreateSchema(name string) error {
-	// Legacy file storage backend does not persist schemas explicitly.
-	return nil
-}
-
-func (s *Storage) DeleteSchema(name string) error {
-	// Legacy file storage backend does not persist schemas explicitly.
-	return nil
-}
-
-func (s *Storage) SaveTrigger(trigger *catalog.Trigger) error {
-	// Legacy file storage backend does not persist triggers.
-	return nil
-}
-
-func (s *Storage) DeleteTrigger(name string) error {
-	// Legacy file storage backend does not persist triggers.
-	return nil
-}
-
-func (s *Storage) SaveJob(job *catalog.Job) error {
-	// Legacy file storage backend does not persist jobs.
-	return nil
-}
-
-func (s *Storage) DeleteJob(name string) error {
-	// Legacy file storage backend does not persist jobs.
-	return nil
 }

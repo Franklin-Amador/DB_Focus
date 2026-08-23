@@ -8,14 +8,20 @@ import (
 	"dbf/internal/constants"
 )
 
+func init() {
+	registerExec((*Executor).executeCreateProcedure)
+	registerExec((*Executor).executeCallProcedure)
+	registerExec((*Executor).executeDropProcedure)
+}
+
 // executeCreateProcedure creates a new stored procedure in the catalog.
 func (e *Executor) executeCreateProcedure(ctx context.Context, stmt *ast.CreateProcedure) (*Result, error) {
 	// Check context cancellation
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
-	if err := e.catalog.CreateProcedure(stmt.Name.Name, stmt.Parameters, stmt.Body); err != nil {
+	if err := e.catalog.CreateProcedure(stmt.Name.Name, stmt.Parameters, stmt.Body, stmt.BodyText); err != nil {
 		return nil, fmt.Errorf("failed to create procedure %s: %w", stmt.Name.Name, err)
 	}
 
@@ -34,8 +40,8 @@ func (e *Executor) executeCreateProcedure(ctx context.Context, stmt *ast.CreateP
 // executeCallProcedure executes a stored procedure with the given arguments.
 func (e *Executor) executeCallProcedure(ctx context.Context, stmt *ast.CallProcedure) (*Result, error) {
 	// Check context cancellation
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	proc, err := e.catalog.GetProcedure(stmt.Name.Name)
@@ -59,8 +65,8 @@ func (e *Executor) executeCallProcedure(ctx context.Context, stmt *ast.CallProce
 	var lastResult *Result
 	for _, bodyStmt := range proc.Body {
 		// Check context cancellation before each statement
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		if err := checkCtx(ctx); err != nil {
+			return nil, err
 		}
 
 		// Substitute parameter values in the statement
@@ -81,8 +87,8 @@ func (e *Executor) executeCallProcedure(ctx context.Context, stmt *ast.CallProce
 
 // executeDropProcedure removes a stored procedure from the catalog.
 func (e *Executor) executeDropProcedure(ctx context.Context, stmt *ast.DropProcedure) (*Result, error) {
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	if err := e.catalog.DropProcedure(stmt.Name.Name); err != nil {

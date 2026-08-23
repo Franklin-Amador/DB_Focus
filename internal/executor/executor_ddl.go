@@ -11,6 +11,20 @@ import (
 	"dbf/internal/constants"
 )
 
+func init() {
+	registerExec((*Executor).executeCreateTable)
+	registerExec((*Executor).executeCreateView)
+	registerExec((*Executor).executeCreateIndex)
+	registerExec((*Executor).executeDropIndex)
+	registerExec((*Executor).executeDropView)
+	registerExec((*Executor).executeDropTable)
+	registerExec((*Executor).executeAlterTable)
+	registerExec((*Executor).executeCreateDatabase)
+	registerExec((*Executor).executeDropDatabase)
+	registerExec((*Executor).executeCreateSchema)
+	registerExec((*Executor).executeDropSchema)
+}
+
 // executeCreateTable handles CREATE TABLE statements
 func (e *Executor) executeCreateTable(ctx context.Context, stmt *ast.CreateTable) (*Result, error) {
 	// Validate statement
@@ -19,10 +33,8 @@ func (e *Executor) executeCreateTable(ctx context.Context, stmt *ast.CreateTable
 	}
 
 	// Check context cancellation
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	// Convert AST columns to catalog columns
@@ -105,26 +117,17 @@ func (e *Executor) executeCreateTable(ctx context.Context, stmt *ast.CreateTable
 		return nil, fmt.Errorf("failed to retrieve created table: %w", err)
 	}
 
-	if e.storage != nil {
-		if err := e.storage.SaveTableWithSchema(table, schema); err != nil {
-			fmt.Printf("warning: failed to persist table %s.%s: %v\n", schema, stmt.Table.Name, err)
-		}
-	}
+	e.persistTableWarn(table, schema)
 
 	return &Result{Tag: constants.ResultCreateTable}, nil
 }
 
 func (e *Executor) executeCreateIndex(ctx context.Context, stmt *ast.CreateIndex) (*Result, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
-	schema := stmt.Table.Alias
-	if schema == "" {
-		schema = "public"
-	}
+	schema := schemaOrPublic(stmt.Table.Alias)
 
 	columnNames := make([]string, 0, len(stmt.Columns))
 	for _, col := range stmt.Columns {
@@ -135,12 +138,9 @@ func (e *Executor) executeCreateIndex(ctx context.Context, stmt *ast.CreateIndex
 		return nil, fmt.Errorf("failed to create index: %w", err)
 	}
 
-	if e.storage != nil {
-		table, err := e.catalog.GetTable(stmt.Table.Name, schema)
-		if err == nil {
-			if err := e.storage.SaveTableWithSchema(table, schema); err != nil {
-				fmt.Printf("warning: failed to persist table %s.%s after CREATE INDEX: %v\n", schema, stmt.Table.Name, err)
-			}
+	if table, err := e.catalog.GetTable(stmt.Table.Name, schema); err == nil {
+		if err := e.persistTable(table, schema); err != nil {
+			fmt.Printf("warning: failed to persist table %s.%s after CREATE INDEX: %v\n", schema, stmt.Table.Name, err)
 		}
 	}
 
@@ -148,27 +148,19 @@ func (e *Executor) executeCreateIndex(ctx context.Context, stmt *ast.CreateIndex
 }
 
 func (e *Executor) executeDropIndex(ctx context.Context, stmt *ast.DropIndex) (*Result, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
-	schema := stmt.Table.Alias
-	if schema == "" {
-		schema = "public"
-	}
+	schema := schemaOrPublic(stmt.Table.Alias)
 
 	if err := e.catalog.DropIndex(stmt.Table.Name, stmt.Name.Name, schema); err != nil {
 		return nil, fmt.Errorf("failed to drop index: %w", err)
 	}
 
-	if e.storage != nil {
-		table, err := e.catalog.GetTable(stmt.Table.Name, schema)
-		if err == nil {
-			if err := e.storage.SaveTableWithSchema(table, schema); err != nil {
-				fmt.Printf("warning: failed to persist table %s.%s after DROP INDEX: %v\n", schema, stmt.Table.Name, err)
-			}
+	if table, err := e.catalog.GetTable(stmt.Table.Name, schema); err == nil {
+		if err := e.persistTable(table, schema); err != nil {
+			fmt.Printf("warning: failed to persist table %s.%s after DROP INDEX: %v\n", schema, stmt.Table.Name, err)
 		}
 	}
 
@@ -176,10 +168,8 @@ func (e *Executor) executeDropIndex(ctx context.Context, stmt *ast.DropIndex) (*
 }
 
 func (e *Executor) executeCreateView(ctx context.Context, stmt *ast.CreateView) (*Result, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 	if stmt.Query == nil {
 		return nil, fmt.Errorf("CREATE VIEW requires a SELECT query")
@@ -263,7 +253,7 @@ func (e *Executor) executeCreateView(ctx context.Context, stmt *ast.CreateView) 
 	}
 
 	if e.storage != nil {
-		if err := e.storage.SaveView(&catalog.View{Name: stmt.Name.Name, Columns: cols, Query: stmt.Query}, schema); err != nil {
+		if err := e.storage.SaveView(&catalog.View{Name: stmt.Name.Name, Columns: cols, Query: stmt.Query, QueryText: stmt.QueryText}, schema); err != nil {
 			fmt.Printf("warning: failed to persist view %s.%s: %v\n", schema, stmt.Name.Name, err)
 		}
 	}
@@ -272,10 +262,8 @@ func (e *Executor) executeCreateView(ctx context.Context, stmt *ast.CreateView) 
 }
 
 func (e *Executor) executeDropView(ctx context.Context, stmt *ast.DropView) (*Result, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	schema := stmt.Name.Alias
@@ -330,10 +318,8 @@ func (e *Executor) executeCreateDatabase(ctx context.Context, stmt *ast.CreateDa
 	}
 
 	// Check context cancellation
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	// Check if database already exists
@@ -400,10 +386,8 @@ func (e *Executor) executeDropDatabase(ctx context.Context, stmt *ast.DropDataba
 	}
 
 	// Check context cancellation
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	// Check if database exists
@@ -475,10 +459,8 @@ func (e *Executor) executeCreateSchema(ctx context.Context, stmt *ast.CreateSche
 	}
 
 	// Check context cancellation
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	if err := e.catalog.CreateSchema(schemaName); err != nil {
@@ -502,16 +484,11 @@ func (e *Executor) executeCreateSchema(ctx context.Context, stmt *ast.CreateSche
 
 // executeDropTable handles DROP TABLE statements with FK dependency checks.
 func (e *Executor) executeDropTable(ctx context.Context, stmt *ast.DropTable) (*Result, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
-	schema := stmt.Table.Alias
-	if schema == "" {
-		schema = "public"
-	}
+	schema := schemaOrPublic(stmt.Table.Alias)
 	tableName := stmt.Table.Name
 	behavior := stmt.Behavior
 	if behavior == "" {
@@ -595,10 +572,8 @@ func (e *Executor) executeDropTable(ctx context.Context, stmt *ast.DropTable) (*
 
 // executeDropSchema handles DROP SCHEMA statements
 func (e *Executor) executeDropSchema(ctx context.Context, stmt *ast.DropSchema) (*Result, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	schemaName := stmt.Name
@@ -645,10 +620,7 @@ func (e *Executor) executeAlterTable(ctx context.Context, stmt *ast.AlterTable) 
 		return nil, ctx.Err()
 	}
 
-	schema := stmt.Table.Alias
-	if schema == "" {
-		schema = "public"
-	}
+	schema := schemaOrPublic(stmt.Table.Alias)
 	tableName := stmt.Table.Name
 
 	// Verify table exists
@@ -711,10 +683,8 @@ func (e *Executor) executeAddColumn(ctx context.Context, schema string, tableNam
 		return nil, fmt.Errorf("failed to get table for persistence: %w", err)
 	}
 
-	if e.storage != nil {
-		if err := e.storage.SaveTableWithSchema(table, schema); err != nil {
-			return nil, fmt.Errorf("failed to persist table schema: %w", err)
-		}
+	if err := e.persistTable(table, schema); err != nil {
+		return nil, fmt.Errorf("failed to persist table schema: %w", err)
 	}
 
 	return &Result{Tag: "ALTER TABLE (ADD COLUMN)"}, nil
@@ -758,10 +728,8 @@ func (e *Executor) executeAlterColumn(ctx context.Context, schema string, tableN
 		return nil, fmt.Errorf("failed to get table for persistence: %w", err)
 	}
 
-	if e.storage != nil {
-		if err := e.storage.SaveTableWithSchema(table, schema); err != nil {
-			return nil, fmt.Errorf("failed to persist table schema: %w", err)
-		}
+	if err := e.persistTable(table, schema); err != nil {
+		return nil, fmt.Errorf("failed to persist table schema: %w", err)
 	}
 
 	return &Result{Tag: "ALTER TABLE (ALTER COLUMN)"}, nil

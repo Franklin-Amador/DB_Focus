@@ -11,11 +11,17 @@ import (
 	"dbf/internal/constants"
 )
 
+func init() {
+	registerExec((*Executor).executeCreateJob)
+	registerExec((*Executor).executeDropJob)
+	registerExec((*Executor).executeAlterJob)
+}
+
 // executeCreateJob creates a new scheduled job in the catalog.
 func (e *Executor) executeCreateJob(ctx context.Context, stmt *ast.CreateJob) (*Result, error) {
 	// Check context cancellation
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	if err := e.catalog.CreateJob(
@@ -23,6 +29,7 @@ func (e *Executor) executeCreateJob(ctx context.Context, stmt *ast.CreateJob) (*
 		stmt.Interval,
 		stmt.Unit,
 		stmt.Body,
+		stmt.BodyText,
 		stmt.Enabled,
 	); err != nil {
 		return nil, fmt.Errorf("failed to create job %s: %w", stmt.Name.Name, err)
@@ -43,8 +50,8 @@ func (e *Executor) executeCreateJob(ctx context.Context, stmt *ast.CreateJob) (*
 // executeDropJob removes a scheduled job from the catalog.
 func (e *Executor) executeDropJob(ctx context.Context, stmt *ast.DropJob) (*Result, error) {
 	// Check context cancellation
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	if err := e.catalog.DropJob(stmt.Name.Name); err != nil {
@@ -64,8 +71,8 @@ func (e *Executor) executeDropJob(ctx context.Context, stmt *ast.DropJob) (*Resu
 // executeAlterJob modifies a scheduled job (enable/disable) and persists the change.
 func (e *Executor) executeAlterJob(ctx context.Context, stmt *ast.AlterJob) (*Result, error) {
 	// Check context cancellation
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	// Modify job state in catalog

@@ -10,11 +10,16 @@ import (
 
 const maxTriggerRecursionDepth = 16
 
+func init() {
+	registerExec((*Executor).executeCreateTrigger)
+	registerExec((*Executor).executeDropTrigger)
+}
+
 // executeCreateTrigger creates a new trigger in the catalog.
 func (e *Executor) executeCreateTrigger(ctx context.Context, stmt *ast.CreateTrigger) (*Result, error) {
 	// Check context cancellation
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	if err := e.catalog.CreateTrigger(
@@ -24,6 +29,7 @@ func (e *Executor) executeCreateTrigger(ctx context.Context, stmt *ast.CreateTri
 		stmt.Table.Name,
 		stmt.ForEachRow,
 		stmt.Body,
+		stmt.BodyText,
 	); err != nil {
 		return nil, fmt.Errorf("failed to create trigger %s: %w", stmt.Name.Name, err)
 	}
@@ -44,8 +50,8 @@ func (e *Executor) executeCreateTrigger(ctx context.Context, stmt *ast.CreateTri
 // executeDropTrigger removes a trigger from the catalog.
 func (e *Executor) executeDropTrigger(ctx context.Context, stmt *ast.DropTrigger) (*Result, error) {
 	// Check context cancellation
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	if err := e.catalog.DropTrigger(stmt.Name.Name, stmt.Table.Name); err != nil {
@@ -83,8 +89,8 @@ func (e *Executor) executeTriggers(ctx context.Context, table, timing, event str
 	}
 
 	// Check context cancellation
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if err := checkCtx(ctx); err != nil {
+		return err
 	}
 
 	e.triggerDepth++
@@ -97,8 +103,8 @@ func (e *Executor) executeTriggers(ctx context.Context, table, timing, event str
 		// Execute each statement in the trigger body
 		for _, stmt := range trigger.Body {
 			// Check context before each statement
-			if ctx.Err() != nil {
-				return ctx.Err()
+			if err := checkCtx(ctx); err != nil {
+				return err
 			}
 
 			// TODO: Support OLD and NEW row references
