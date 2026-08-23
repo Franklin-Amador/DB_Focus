@@ -11,6 +11,11 @@ import (
 	"dbf/internal/queryutil"
 )
 
+func init() {
+	registerExec((*Executor).executeSelect)
+	registerExec((*Executor).executeSelectFunction)
+}
+
 // colSpec represents a column specification for GROUP BY queries
 type colSpec struct {
 	isAggregate bool
@@ -23,8 +28,8 @@ type colSpec struct {
 // executeSelect executes a SELECT statement, handling CTEs (WITH clause) and delegating to specialized handlers.
 func (e *Executor) executeSelect(ctx context.Context, stmt *ast.Select) (*Result, error) {
 	// Check context cancellation
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	// Execute CTEs (WITH clause)
@@ -67,8 +72,8 @@ func (e *Executor) executeSelect(ctx context.Context, stmt *ast.Select) (*Result
 // executeSelectMain handles the main SELECT logic, routing to JOIN or simple SELECT handlers.
 func (e *Executor) executeSelectMain(ctx context.Context, stmt *ast.Select) (*Result, error) {
 	// Check context cancellation
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	// Handle SELECT without FROM clause
@@ -105,8 +110,8 @@ func (e *Executor) executeSelectMain(ctx context.Context, stmt *ast.Select) (*Re
 
 func (e *Executor) executeSelectFromTable(ctx context.Context, stmt *ast.Select, table *catalog.Table) (*Result, error) {
 	// Check context cancellation
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	// Fetch rows
@@ -207,6 +212,14 @@ func (e *Executor) projectColumns(table *catalog.Table, rows [][]interface{}, st
 		colIdxs[i] = colIdx
 	}
 
+	// Apply ORDER BY on the full rows before projecting, using the table's
+	// column schema. This mirrors the SELECT * path and lets ORDER BY reference
+	// any table column, not only projected ones. (Projecting first would leave
+	// ApplyOrderBy resolving column indexes against a mismatched schema.)
+	if len(stmt.OrderBy) > 0 {
+		rows = queryutil.ApplyOrderBy(rows, stmt.OrderBy, table.Columns)
+	}
+
 	projected := make([][]interface{}, 0, len(rows))
 	for _, row := range rows {
 		out := make([]interface{}, len(colIdxs))
@@ -225,11 +238,6 @@ func (e *Executor) projectColumns(table *catalog.Table, rows [][]interface{}, st
 		projected = queryutil.RemoveDuplicateRows(projected)
 	}
 
-	// Apply ORDER BY
-	if len(stmt.OrderBy) > 0 {
-		projected = queryutil.ApplyOrderBy(projected, stmt.OrderBy, table.Columns)
-	}
-
 	// Apply LIMIT/OFFSET
 	projected = queryutil.ApplyLimitOffset(projected, stmt.Limit, stmt.Offset)
 
@@ -243,8 +251,8 @@ func (e *Executor) projectColumns(table *catalog.Table, rows [][]interface{}, st
 // executeGroupedSelect handles GROUP BY and aggregate functions.
 func (e *Executor) executeGroupedSelect(ctx context.Context, stmt *ast.Select, table *catalog.Table, rows [][]interface{}) (*Result, error) {
 	// Check context cancellation
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	colSpecs := make([]colSpec, len(stmt.Columns))
@@ -252,7 +260,6 @@ func (e *Executor) executeGroupedSelect(ctx context.Context, stmt *ast.Select, t
 
 	// Parse columns
 	for i, col := range stmt.Columns {
-		upper := strings.ToUpper(col.Name)
 		outputName := col.Name
 		if col.Alias != "" {
 			outputName = col.Alias
@@ -260,10 +267,18 @@ func (e *Executor) executeGroupedSelect(ctx context.Context, stmt *ast.Select, t
 		columns[i] = outputName
 		colSpecs[i].alias = outputName
 
-		if strings.HasPrefix(upper, "COUNT(") {
+		if fn, arg, ok := parseAggregate(col.Name); ok {
 			colSpecs[i].isAggregate = true
-			colSpecs[i].aggFunc = "COUNT"
-			colSpecs[i].colIdx = -1
+			colSpecs[i].aggFunc = fn
+			if arg == "" || arg == "*" {
+				colSpecs[i].colIdx = -1
+			} else {
+				colIdx := queryutil.IndexOfColumn(table.Columns, arg)
+				if colIdx == -1 {
+					return nil, fmt.Errorf("column %s not found", arg)
+				}
+				colSpecs[i].colIdx = colIdx
+			}
 		} else {
 			// Regular column
 			colIdx := queryutil.IndexOfColumn(table.Columns, col.Name)
@@ -288,8 +303,8 @@ func (e *Executor) executeGroupedSelect(ctx context.Context, stmt *ast.Select, t
 func (e *Executor) aggregateAllRows(columns []string, colSpecs []colSpec, rows [][]interface{}) *Result {
 	resultRow := make([]interface{}, len(colSpecs))
 	for i, spec := range colSpecs {
-		if spec.isAggregate && spec.aggFunc == "COUNT" {
-			resultRow[i] = len(rows)
+		if spec.isAggregate {
+			resultRow[i] = computeAggregate(spec.aggFunc, rows, spec.colIdx)
 		} else {
 			// Non-aggregate column: take first value
 			if len(rows) > 0 && spec.colIdx >= 0 {
@@ -346,8 +361,8 @@ func (e *Executor) aggregateByGroups(ctx context.Context, stmt *ast.Select, tabl
 		resultRow := make([]interface{}, len(colSpecs))
 
 		for i, spec := range colSpecs {
-			if spec.isAggregate && spec.aggFunc == "COUNT" {
-				resultRow[i] = len(groupRows)
+			if spec.isAggregate {
+				resultRow[i] = computeAggregate(spec.aggFunc, groupRows, spec.colIdx)
 			} else {
 				// Non-aggregate column: take first value from group
 				if len(groupRows) > 0 && spec.colIdx >= 0 {
@@ -381,217 +396,409 @@ func (e *Executor) aggregateByGroups(ctx context.Context, stmt *ast.Select, tabl
 	}, nil
 }
 
-// executeJoinSelect handles JOIN queries.
+// joinColumn identifies a column in the accumulated (joined) row: its owning
+// table reference (alias or name) and the column name/type.
+type joinColumn struct {
+	ref  string
+	name string
+	typ  string
+}
+
+// executeJoinSelect handles JOIN queries, including chains of N joins
+// (FROM a JOIN b ON … JOIN c ON … …). The joins are folded left-to-right into a
+// single accumulated rowset whose columns are tracked as (ref, name) pairs so
+// that WHERE, ORDER BY, projection and aggregates can resolve qualified and
+// unqualified column references across every joined table.
 func (e *Executor) executeJoinSelect(ctx context.Context, stmt *ast.Select) (*Result, error) {
-	// Check context cancellation
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-
-	leftTable, err := e.catalog.GetTable(stmt.Table.Name)
-	if err != nil {
-		return nil, fmt.Errorf("left table %s not found: %w", stmt.Table.Name, err)
-	}
-
-	rightTable, err := e.catalog.GetTable(stmt.Join.Table.Name)
-	if err != nil {
-		return nil, fmt.Errorf("right table %s not found: %w", stmt.Join.Table.Name, err)
-	}
-
-	// Determine reference names
-	leftRefName := stmt.Table.Name
-	if stmt.Table.Alias != "" {
-		leftRefName = stmt.Table.Alias
-	}
-	rightRefName := stmt.Join.Table.Name
-	if stmt.Join.Table.Alias != "" {
-		rightRefName = stmt.Join.Table.Alias
-	}
-
-	leftRows := leftTable.SelectAll()
-	rightRows := rightTable.SelectAll()
-
-	// Perform JOIN
-	joinedRows, err := e.performJoin(stmt.Join.Type, leftTable, rightTable, leftRows, rightRows, stmt.Join, leftRefName, rightRefName)
-	if err != nil {
+	if err := checkCtx(ctx); err != nil {
 		return nil, err
 	}
 
-	// Apply WHERE clause
-	if stmt.Where != nil {
-		joinedRows, err = e.filterJoinedRows(joinedRows, stmt.Where, leftTable, rightTable, leftRefName, rightRefName)
+	joins := stmt.Joins
+	if len(joins) == 0 && stmt.Join != nil {
+		joins = []*ast.JoinClause{stmt.Join} // gob-loaded views carry only Join
+	}
+
+	// Base (left-most) table.
+	baseTable, err := e.catalog.GetTable(stmt.Table.Name)
+	if err != nil {
+		return nil, fmt.Errorf("table %s not found: %w", stmt.Table.Name, err)
+	}
+	accRows := baseTable.SelectAll()
+	accCols := joinColsFor(refName(stmt.Table), baseTable.Columns)
+
+	// Fold each JOIN into the accumulated result.
+	for _, j := range joins {
+		rightTable, err := e.catalog.GetTable(j.Table.Name)
+		if err != nil {
+			return nil, fmt.Errorf("joined table %s not found: %w", j.Table.Name, err)
+		}
+		accRows, accCols, err = e.foldJoin(j, accRows, accCols,
+			rightTable.SelectAll(), joinColsFor(refName(j.Table), rightTable.Columns))
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	// Handle aggregates or GROUP BY with joins
+	// WHERE over the joined rows.
+	if stmt.Where != nil {
+		resolve := func(name string) (int, bool) {
+			idx, err := resolveJoinColumn(accCols, name)
+			if err != nil {
+				return -1, false
+			}
+			return idx, true
+		}
+		filtered := make([][]interface{}, 0, len(accRows))
+		for _, row := range accRows {
+			ok, err := evalWhere(stmt.Where, row, resolve)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				filtered = append(filtered, row)
+			}
+		}
+		accRows = filtered
+	}
+
+	// Aggregates / GROUP BY over the joined rows (virtual table carries "ref.name").
 	if e.hasAggregates(stmt) || len(stmt.GroupBy) > 0 {
-		virtualTable := e.createVirtualTable(leftTable, rightTable, leftRefName, rightRefName, joinedRows)
-		return e.executeGroupedSelect(ctx, stmt, virtualTable, joinedRows)
+		return e.executeGroupedSelect(ctx, stmt, joinVirtualTable(accCols, accRows), accRows)
 	}
 
-	// Handle SELECT *
+	// ORDER BY on the full joined rows (qualified or unique-unqualified refs).
+	if len(stmt.OrderBy) > 0 {
+		accRows = applyJoinOrderBy(accRows, stmt.OrderBy, accCols)
+	}
+
+	// SELECT * : emit every joined column as "ref.name".
 	if stmt.Star {
-		return e.projectJoinStar(leftTable, rightTable, leftRefName, rightRefName, joinedRows, stmt)
+		columns := make([]string, len(accCols))
+		for i, c := range accCols {
+			columns[i] = c.ref + "." + c.name
+		}
+		rows := accRows
+		if stmt.Distinct {
+			rows = queryutil.RemoveDuplicateRows(rows)
+		}
+		rows = queryutil.ApplyLimitOffset(rows, stmt.Limit, stmt.Offset)
+		return &Result{Columns: columns, Rows: rows, Tag: constants.ResultSelectTag(len(rows))}, nil
 	}
 
-	// Project specific columns
-	return e.projectJoinColumns(leftTable, rightTable, leftRefName, rightRefName, joinedRows, stmt)
+	// Project specific columns.
+	columns := make([]string, len(stmt.Columns))
+	colIdxs := make([]int, len(stmt.Columns))
+	for i, id := range stmt.Columns {
+		outputName := id.Name
+		if id.Alias != "" {
+			outputName = id.Alias
+		}
+		columns[i] = outputName
+		if id.Name == "" {
+			if !stmt.AllowMissing {
+				return nil, fmt.Errorf("column %s not found", outputName)
+			}
+			colIdxs[i] = -1
+			continue
+		}
+		idx, err := resolveJoinColumn(accCols, id.Name)
+		if err != nil {
+			return nil, err
+		}
+		colIdxs[i] = idx
+	}
+	projected := make([][]interface{}, 0, len(accRows))
+	for _, row := range accRows {
+		out := make([]interface{}, len(colIdxs))
+		for i, idx := range colIdxs {
+			if idx < 0 || idx >= len(row) {
+				out[i] = nil
+				continue
+			}
+			out[i] = row[idx]
+		}
+		projected = append(projected, out)
+	}
+	if stmt.Distinct {
+		projected = queryutil.RemoveDuplicateRows(projected)
+	}
+	projected = queryutil.ApplyLimitOffset(projected, stmt.Limit, stmt.Offset)
+	return &Result{Columns: columns, Rows: projected, Tag: constants.ResultSelectTag(len(projected))}, nil
 }
 
-// performJoin performs the JOIN operation based on join type.
-func (e *Executor) performJoin(joinType string, leftTable, rightTable *catalog.Table, leftRows, rightRows [][]interface{}, join *ast.JoinClause, leftRefName, rightRefName string) ([][]interface{}, error) {
+// refName returns the reference used to qualify a table's columns (alias if set).
+func refName(id ast.Identifier) string {
+	if id.Alias != "" {
+		return id.Alias
+	}
+	return id.Name
+}
+
+func joinColsFor(ref string, cols []catalog.Column) []joinColumn {
+	out := make([]joinColumn, len(cols))
+	for i, c := range cols {
+		out[i] = joinColumn{ref: ref, name: c.Name, typ: c.Type}
+	}
+	return out
+}
+
+// resolveJoinColumn resolves a (possibly qualified) column reference to its index
+// in the accumulated joined row. Qualified refs must match a table reference;
+// unqualified refs must be unambiguous.
+func resolveJoinColumn(cols []joinColumn, ref string) (int, error) {
+	qualifier, colName := queryutil.SplitQualified(ref)
+	if qualifier != "" {
+		refSeen := false
+		for i, c := range cols {
+			if strings.EqualFold(c.ref, qualifier) {
+				refSeen = true
+				if strings.EqualFold(c.name, colName) {
+					return i, nil
+				}
+			}
+		}
+		if refSeen {
+			return -1, fmt.Errorf("column %s not found in table %s", colName, qualifier)
+		}
+		return -1, fmt.Errorf("unknown table qualifier %s", qualifier)
+	}
+	found := -1
+	for i, c := range cols {
+		if strings.EqualFold(c.name, colName) {
+			if found != -1 {
+				return -1, fmt.Errorf("ambiguous column reference %s (exists in multiple tables)", colName)
+			}
+			found = i
+		}
+	}
+	if found == -1 {
+		return -1, fmt.Errorf("column %s not found in either table", colName)
+	}
+	return found, nil
+}
+
+// firstJoinColumnMatch resolves a reference to the first matching column index
+// (no ambiguity error). Used for ORDER BY, which historically tolerated
+// unqualified references shared by multiple joined tables.
+func firstJoinColumnMatch(cols []joinColumn, ref string) int {
+	qualifier, colName := queryutil.SplitQualified(ref)
+	for i, c := range cols {
+		if qualifier != "" && !strings.EqualFold(c.ref, qualifier) {
+			continue
+		}
+		if strings.EqualFold(c.name, colName) {
+			return i
+		}
+	}
+	return -1
+}
+
+// foldJoin joins the accumulated rows (left) with a new table's rows (right),
+// returning the new rows and the extended column set.
+//
+// It supports explicit ON, NATURAL (join on all common column names) and
+// USING (join on the named common columns). For NATURAL/USING the shared columns
+// are coalesced: the right-side duplicate is dropped from the output and its value
+// merged into the surviving left column (COALESCE semantics for outer joins).
+func (e *Executor) foldJoin(j *ast.JoinClause, accRows [][]interface{}, accCols []joinColumn, rightRows [][]interface{}, rightCols []joinColumn) ([][]interface{}, []joinColumn, error) {
+	joinType := j.Type
 	if joinType == "" {
 		joinType = constants.JoinInner
 	}
+	accW, rightW := len(accCols), len(rightCols)
+	unionCols := append(append([]joinColumn{}, accCols...), rightCols...)
 
-	joinedRows := [][]interface{}{}
-
-	// CROSS JOIN: cartesian product
+	// CROSS JOIN: cartesian product, no join condition, no coalesce.
 	if joinType == constants.JoinCross {
-		for _, lrow := range leftRows {
-			for _, rrow := range rightRows {
-				combined := append(append([]interface{}{}, lrow...), rrow...)
-				joinedRows = append(joinedRows, combined)
+		out := make([][]interface{}, 0, len(accRows)*len(rightRows))
+		for _, l := range accRows {
+			for _, r := range rightRows {
+				out = append(out, concatRow(l, r))
 			}
 		}
-		return joinedRows, nil
+		return out, unionCols, nil
 	}
 
-	// Resolve ON clause columns
-	leftIsLeft, leftColIdx, err := queryutil.ResolveJoinColumn(leftTable, rightTable, leftRefName, rightRefName, join.Left.Name)
-	if err != nil {
-		return nil, err
-	}
-	rightIsLeft, rightColIdx, err := queryutil.ResolveJoinColumn(leftTable, rightTable, leftRefName, rightRefName, join.Right.Name)
-	if err != nil {
-		return nil, err
+	// Build the AND-ed equality pairs (as union-row indices). For NATURAL/USING
+	// the same pairs are coalesced (right duplicate dropped from output).
+	coalesce := j.Natural || len(j.Using) > 0
+	var pairs [][2]int
+	dropRight := make(map[int]bool)
+	switch {
+	case j.Natural:
+		// Every right column whose name also exists on the left is a join column.
+		for k, rc := range rightCols {
+			if li := firstJoinColumnMatch(accCols, rc.name); li >= 0 {
+				pairs = append(pairs, [2]int{li, accW + k})
+				dropRight[accW+k] = true
+			}
+		}
+		// No common columns -> NATURAL degrades to CROSS (SQL standard).
+	case len(j.Using) > 0:
+		for _, name := range j.Using {
+			li := firstJoinColumnMatch(accCols, name)
+			if li < 0 {
+				return nil, nil, fmt.Errorf("USING column %s not found on the left side of the join", name)
+			}
+			rk := -1
+			for k, rc := range rightCols {
+				if strings.EqualFold(rc.name, name) {
+					rk = k
+					break
+				}
+			}
+			if rk < 0 {
+				return nil, nil, fmt.Errorf("USING column %s not found in table %s", name, refName(j.Table))
+			}
+			pairs = append(pairs, [2]int{li, accW + rk})
+			dropRight[accW+rk] = true
+		}
+	default:
+		li, err := resolveJoinColumn(unionCols, j.Left.Name)
+		if err != nil {
+			return nil, nil, err
+		}
+		ri, err := resolveJoinColumn(unionCols, j.Right.Name)
+		if err != nil {
+			return nil, nil, err
+		}
+		pairs = append(pairs, [2]int{li, ri})
 	}
 
+	// Output columns: all union columns except coalesced right duplicates.
+	keep := make([]int, 0, len(unionCols))
+	newCols := make([]joinColumn, 0, len(unionCols))
+	for i, c := range unionCols {
+		if dropRight[i] {
+			continue
+		}
+		keep = append(keep, i)
+		newCols = append(newCols, c)
+	}
+
+	match := func(u []interface{}) bool {
+		for _, p := range pairs {
+			var lv, rv interface{}
+			if p[0] < len(u) {
+				lv = u[p[0]]
+			}
+			if p[1] < len(u) {
+				rv = u[p[1]]
+			}
+			if fmt.Sprintf("%v", lv) != fmt.Sprintf("%v", rv) {
+				return false
+			}
+		}
+		return true
+	}
+	project := func(u []interface{}) []interface{} {
+		if coalesce {
+			for _, p := range pairs {
+				if u[p[0]] == nil && u[p[1]] != nil {
+					u[p[0]] = u[p[1]]
+				}
+			}
+		}
+		out := make([]interface{}, len(keep))
+		for i, k := range keep {
+			out[i] = u[k]
+		}
+		return out
+	}
+
+	out := [][]interface{}{}
 	switch joinType {
 	case constants.JoinInner:
-		return e.performInnerJoin(leftRows, rightRows, leftIsLeft, leftColIdx, rightIsLeft, rightColIdx), nil
+		for _, l := range accRows {
+			for _, r := range rightRows {
+				if u := concatRow(l, r); match(u) {
+					out = append(out, project(u))
+				}
+			}
+		}
 	case constants.JoinLeft:
-		return e.performLeftJoin(leftRows, rightRows, leftIsLeft, leftColIdx, rightIsLeft, rightColIdx, rightTable), nil
+		for _, l := range accRows {
+			matched := false
+			for _, r := range rightRows {
+				if u := concatRow(l, r); match(u) {
+					out = append(out, project(u))
+					matched = true
+				}
+			}
+			if !matched {
+				out = append(out, project(concatRow(l, make([]interface{}, rightW))))
+			}
+		}
 	case constants.JoinRight:
-		return e.performRightJoin(leftRows, rightRows, leftIsLeft, leftColIdx, rightIsLeft, rightColIdx, leftTable), nil
+		for _, r := range rightRows {
+			matched := false
+			for _, l := range accRows {
+				if u := concatRow(l, r); match(u) {
+					out = append(out, project(u))
+					matched = true
+				}
+			}
+			if !matched {
+				out = append(out, project(concatRow(make([]interface{}, accW), r)))
+			}
+		}
 	case constants.JoinFull:
-		return e.performFullJoin(leftRows, rightRows, leftIsLeft, leftColIdx, rightIsLeft, rightColIdx, leftTable, rightTable), nil
+		rightMatched := make([]bool, len(rightRows))
+		for _, l := range accRows {
+			matched := false
+			for k, r := range rightRows {
+				if u := concatRow(l, r); match(u) {
+					out = append(out, project(u))
+					matched = true
+					rightMatched[k] = true
+				}
+			}
+			if !matched {
+				out = append(out, project(concatRow(l, make([]interface{}, rightW))))
+			}
+		}
+		for k, r := range rightRows {
+			if !rightMatched[k] {
+				out = append(out, project(concatRow(make([]interface{}, accW), r)))
+			}
+		}
 	default:
-		return nil, fmt.Errorf("unsupported join type: %s", joinType)
+		return nil, nil, fmt.Errorf("unsupported join type: %s", joinType)
 	}
+	return out, newCols, nil
 }
 
-// performInnerJoin performs an INNER JOIN.
-func (e *Executor) performInnerJoin(leftRows, rightRows [][]interface{}, leftIsLeft bool, leftColIdx int, rightIsLeft bool, rightColIdx int) [][]interface{} {
-	joinedRows := [][]interface{}{}
-	for _, lrow := range leftRows {
-		for _, rrow := range rightRows {
-			lv := getRowValue(leftIsLeft, lrow, rrow, leftColIdx)
-			rv := getRowValue(rightIsLeft, lrow, rrow, rightColIdx)
-			if fmt.Sprintf("%v", lv) == fmt.Sprintf("%v", rv) {
-				combined := append(append([]interface{}{}, lrow...), rrow...)
-				joinedRows = append(joinedRows, combined)
-			}
-		}
-	}
-	return joinedRows
+func concatRow(l, r []interface{}) []interface{} {
+	out := make([]interface{}, 0, len(l)+len(r))
+	out = append(out, l...)
+	out = append(out, r...)
+	return out
 }
 
-// performLeftJoin performs a LEFT JOIN.
-func (e *Executor) performLeftJoin(leftRows, rightRows [][]interface{}, leftIsLeft bool, leftColIdx int, rightIsLeft bool, rightColIdx int, rightTable *catalog.Table) [][]interface{} {
-	joinedRows := [][]interface{}{}
-	for _, lrow := range leftRows {
-		matched := false
-		for _, rrow := range rightRows {
-			lv := getRowValue(leftIsLeft, lrow, rrow, leftColIdx)
-			rv := getRowValue(rightIsLeft, lrow, rrow, rightColIdx)
-			if fmt.Sprintf("%v", lv) == fmt.Sprintf("%v", rv) {
-				combined := append(append([]interface{}{}, lrow...), rrow...)
-				joinedRows = append(joinedRows, combined)
-				matched = true
-			}
-		}
-		if !matched {
-			nullRight := make([]interface{}, len(rightTable.Columns))
-			for i := range nullRight {
-				nullRight[i] = nil
-			}
-			combined := append(append([]interface{}{}, lrow...), nullRight...)
-			joinedRows = append(joinedRows, combined)
-		}
+func joinVirtualTable(cols []joinColumn, rows [][]interface{}) *catalog.Table {
+	cc := make([]catalog.Column, len(cols))
+	for i, c := range cols {
+		cc[i] = catalog.Column{Name: c.ref + "." + c.name, Type: c.typ}
 	}
-	return joinedRows
+	return &catalog.Table{Name: "__join_virtual__", Columns: cc, Rows: rows}
 }
 
-// performRightJoin performs a RIGHT JOIN.
-func (e *Executor) performRightJoin(leftRows, rightRows [][]interface{}, leftIsLeft bool, leftColIdx int, rightIsLeft bool, rightColIdx int, leftTable *catalog.Table) [][]interface{} {
-	joinedRows := [][]interface{}{}
-	for _, rrow := range rightRows {
-		matched := false
-		for _, lrow := range leftRows {
-			lv := getRowValue(leftIsLeft, lrow, rrow, leftColIdx)
-			rv := getRowValue(rightIsLeft, lrow, rrow, rightColIdx)
-			if fmt.Sprintf("%v", lv) == fmt.Sprintf("%v", rv) {
-				combined := append(append([]interface{}{}, lrow...), rrow...)
-				joinedRows = append(joinedRows, combined)
-				matched = true
-			}
-		}
-		if !matched {
-			nullLeft := make([]interface{}, len(leftTable.Columns))
-			for i := range nullLeft {
-				nullLeft[i] = nil
-			}
-			combined := append(append([]interface{}{}, nullLeft...), rrow...)
-			joinedRows = append(joinedRows, combined)
+// applyJoinOrderBy sorts joined rows, rewriting each ORDER BY column to its
+// qualified "ref.name" form so queryutil.ApplyOrderBy (exact-name match) resolves it.
+func applyJoinOrderBy(rows [][]interface{}, orderBy []ast.OrderByClause, cols []joinColumn) [][]interface{} {
+	cc := make([]catalog.Column, len(cols))
+	for i, c := range cols {
+		cc[i] = catalog.Column{Name: c.ref + "." + c.name, Type: c.typ}
+	}
+	rewritten := make([]ast.OrderByClause, len(orderBy))
+	for i, ob := range orderBy {
+		rewritten[i] = ob
+		if idx := firstJoinColumnMatch(cols, ob.Column.Name); idx >= 0 {
+			rewritten[i].Column = ast.Identifier{Name: cc[idx].Name}
 		}
 	}
-	return joinedRows
-}
-
-// performFullJoin performs a FULL OUTER JOIN.
-func (e *Executor) performFullJoin(leftRows, rightRows [][]interface{}, leftIsLeft bool, leftColIdx int, rightIsLeft bool, rightColIdx int, leftTable, rightTable *catalog.Table) [][]interface{} {
-	joinedRows := [][]interface{}{}
-	rightMatched := make([]bool, len(rightRows))
-
-	// First pass: match left rows with right rows
-	for _, lrow := range leftRows {
-		matched := false
-		for rIdx, rrow := range rightRows {
-			lv := getRowValue(leftIsLeft, lrow, rrow, leftColIdx)
-			rv := getRowValue(rightIsLeft, lrow, rrow, rightColIdx)
-			if fmt.Sprintf("%v", lv) == fmt.Sprintf("%v", rv) {
-				combined := append(append([]interface{}{}, lrow...), rrow...)
-				joinedRows = append(joinedRows, combined)
-				matched = true
-				rightMatched[rIdx] = true
-			}
-		}
-		if !matched {
-			nullRight := make([]interface{}, len(rightTable.Columns))
-			for i := range nullRight {
-				nullRight[i] = nil
-			}
-			combined := append(append([]interface{}{}, lrow...), nullRight...)
-			joinedRows = append(joinedRows, combined)
-		}
-	}
-
-	// Second pass: add unmatched right rows
-	for rIdx, rrow := range rightRows {
-		if !rightMatched[rIdx] {
-			nullLeft := make([]interface{}, len(leftTable.Columns))
-			for i := range nullLeft {
-				nullLeft[i] = nil
-			}
-			combined := append(append([]interface{}{}, nullLeft...), rrow...)
-			joinedRows = append(joinedRows, combined)
-		}
-	}
-
-	return joinedRows
+	return queryutil.ApplyOrderBy(rows, rewritten, cc)
 }
 
 // Helper functions
@@ -611,150 +818,46 @@ func (e *Executor) createCTETable(name string, result *Result) error {
 }
 
 func (e *Executor) fetchRows(table *catalog.Table, where *ast.WhereClause) ([][]interface{}, error) {
-	if where != nil {
+	if where == nil {
+		return table.SelectAll(), nil
+	}
+	// Fast path: a single equality predicate can use an index when present.
+	if where.IsLeaf() && (where.Operator == "" || where.Operator == "=") {
 		return table.SelectWhere(where.Column.Name, where.Value.Value)
 	}
-	return table.SelectAll(), nil
-}
-
-func (e *Executor) hasAggregates(stmt *ast.Select) bool {
-	for _, col := range stmt.Columns {
-		upper := strings.ToUpper(col.Name)
-		if strings.HasPrefix(upper, "COUNT(") {
-			return true
+	// Otherwise scan the table and evaluate the predicate tree per row.
+	resolve := func(name string) (int, bool) {
+		i := findColumnIndex(table.Columns, name)
+		return i, i != -1
+	}
+	all := table.SelectAll()
+	filtered := make([][]interface{}, 0, len(all))
+	for _, row := range all {
+		ok, err := evalWhere(where, row, resolve)
+		if err != nil {
+			return nil, err
 		}
-	}
-	return false
-}
-
-func (e *Executor) filterJoinedRows(rows [][]interface{}, where *ast.WhereClause, leftTable, rightTable *catalog.Table, leftRefName, rightRefName string) ([][]interface{}, error) {
-	filtered := [][]interface{}{}
-	whereIdx, err := queryutil.ResolveCombinedIndex(leftTable, rightTable, leftRefName, rightRefName, where.Column.Name)
-	if err != nil {
-		return nil, err
-	}
-	for _, row := range rows {
-		if whereIdx >= 0 && row[whereIdx] == where.Value.Value {
+		if ok {
 			filtered = append(filtered, row)
 		}
 	}
 	return filtered, nil
 }
 
-func (e *Executor) createVirtualTable(leftTable, rightTable *catalog.Table, leftRefName, rightRefName string, joinedRows [][]interface{}) *catalog.Table {
-	combinedCols := make([]catalog.Column, 0, len(leftTable.Columns)+len(rightTable.Columns))
-	for _, col := range leftTable.Columns {
-		combinedCols = append(combinedCols, catalog.Column{Name: leftRefName + "." + col.Name, Type: col.Type})
-	}
-	for _, col := range rightTable.Columns {
-		combinedCols = append(combinedCols, catalog.Column{Name: rightRefName + "." + col.Name, Type: col.Type})
-	}
-	return &catalog.Table{
-		Name:    "__join_virtual__",
-		Columns: combinedCols,
-		Rows:    joinedRows,
-	}
-}
-
-func (e *Executor) projectJoinStar(leftTable, rightTable *catalog.Table, leftRefName, rightRefName string, joinedRows [][]interface{}, stmt *ast.Select) (*Result, error) {
-	columns := make([]string, 0, len(leftTable.Columns)+len(rightTable.Columns))
-	for _, col := range leftTable.Columns {
-		columns = append(columns, leftRefName+"."+col.Name)
-	}
-	for _, col := range rightTable.Columns {
-		columns = append(columns, rightRefName+"."+col.Name)
-	}
-
-	// Apply DISTINCT
-	if stmt.Distinct {
-		joinedRows = queryutil.RemoveDuplicateRows(joinedRows)
-	}
-
-	// Create combined columns for ORDER BY
-	combinedCols := append(append([]catalog.Column{}, leftTable.Columns...), rightTable.Columns...)
-
-	// Apply ORDER BY
-	if len(stmt.OrderBy) > 0 {
-		joinedRows = queryutil.ApplyOrderBy(joinedRows, stmt.OrderBy, combinedCols)
-	}
-
-	// Apply LIMIT/OFFSET
-	joinedRows = queryutil.ApplyLimitOffset(joinedRows, stmt.Limit, stmt.Offset)
-
-	return &Result{
-		Columns: columns,
-		Rows:    joinedRows,
-		Tag:     constants.ResultSelectTag(len(joinedRows)),
-	}, nil
-}
-
-func (e *Executor) projectJoinColumns(leftTable, rightTable *catalog.Table, leftRefName, rightRefName string, joinedRows [][]interface{}, stmt *ast.Select) (*Result, error) {
-	columns := make([]string, len(stmt.Columns))
-	colIdxs := make([]int, len(stmt.Columns))
-
-	for i, id := range stmt.Columns {
-		outputName := id.Name
-		if id.Alias != "" {
-			outputName = id.Alias
+func (e *Executor) hasAggregates(stmt *ast.Select) bool {
+	for _, col := range stmt.Columns {
+		if _, _, ok := parseAggregate(col.Name); ok {
+			return true
 		}
-		columns[i] = outputName
-
-		if id.Name == "" {
-			if !stmt.AllowMissing {
-				return nil, fmt.Errorf("column %s not found", outputName)
-			}
-			colIdxs[i] = -1
-			continue
-		}
-
-		idx, err := queryutil.ResolveCombinedIndex(leftTable, rightTable, leftRefName, rightRefName, id.Name)
-		if err != nil {
-			return nil, err
-		}
-		colIdxs[i] = idx
 	}
-
-	projected := make([][]interface{}, 0, len(joinedRows))
-	for _, row := range joinedRows {
-		out := make([]interface{}, len(colIdxs))
-		for i, idx := range colIdxs {
-			if idx == -1 {
-				out[i] = nil
-				continue
-			}
-			out[i] = row[idx]
-		}
-		projected = append(projected, out)
-	}
-
-	// Apply DISTINCT
-	if stmt.Distinct {
-		projected = queryutil.RemoveDuplicateRows(projected)
-	}
-
-	// Create combined columns for ORDER BY
-	combinedCols := append(append([]catalog.Column{}, leftTable.Columns...), rightTable.Columns...)
-
-	// Apply ORDER BY
-	if len(stmt.OrderBy) > 0 {
-		projected = queryutil.ApplyOrderBy(projected, stmt.OrderBy, combinedCols)
-	}
-
-	// Apply LIMIT/OFFSET
-	projected = queryutil.ApplyLimitOffset(projected, stmt.Limit, stmt.Offset)
-
-	return &Result{
-		Columns: columns,
-		Rows:    projected,
-		Tag:     constants.ResultSelectTag(len(projected)),
-	}, nil
+	return false
 }
 
 // executeSelectFunction handles special SELECT function calls (e.g., pg_catalog queries).
 func (e *Executor) executeSelectFunction(ctx context.Context, stmt *ast.SelectFunction) (*Result, error) {
 	// Check context cancellation
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
 	}
 
 	// Handle specific functions
@@ -773,18 +876,4 @@ func (e *Executor) executeSelectFunction(ctx context.Context, stmt *ast.SelectFu
 			Tag:     constants.ResultSelectTag(0),
 		}, nil
 	}
-}
-
-// getRowValue gets a value from either left or right row based on the flag.
-func getRowValue(isLeft bool, leftRow, rightRow []interface{}, colIdx int) interface{} {
-	if isLeft {
-		if colIdx < len(leftRow) {
-			return leftRow[colIdx]
-		}
-	} else {
-		if colIdx < len(rightRow) {
-			return rightRow[colIdx]
-		}
-	}
-	return nil
 }

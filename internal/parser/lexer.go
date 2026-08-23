@@ -96,10 +96,37 @@ func (l *Lexer) NextToken() Token {
 			l.readChar()
 			tok.Type = TokenNotEq
 			tok.Literal = "<>"
+		} else if l.pos+1 < len(l.input) && l.input[l.pos+1] == '=' {
+			l.readChar()
+			l.readChar()
+			tok.Type = TokenLte
+			tok.Literal = "<="
 		} else {
 			l.readChar()
 			tok.Type = TokenLt
 			tok.Literal = "<"
+		}
+	case '>':
+		if l.pos+1 < len(l.input) && l.input[l.pos+1] == '=' {
+			l.readChar()
+			l.readChar()
+			tok.Type = TokenGte
+			tok.Literal = ">="
+		} else {
+			l.readChar()
+			tok.Type = TokenGt
+			tok.Literal = ">"
+		}
+	case '!':
+		if l.pos+1 < len(l.input) && l.input[l.pos+1] == '=' {
+			l.readChar()
+			l.readChar()
+			tok.Type = TokenNotEq
+			tok.Literal = "!="
+		} else {
+			// Bare '!' is not a valid operator - skip it
+			l.readChar()
+			return l.NextToken()
 		}
 	case '"':
 		tok.Type = TokenIdent

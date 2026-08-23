@@ -31,43 +31,17 @@ func (p *Parser) AtEOF() bool {
 	return p.cur.Type == TokenEOF
 }
 
+// Pos returns the byte offset of the current token in the source input.
+// Callers can use it to attribute each parsed statement to its exact SQL text.
+func (p *Parser) Pos() int {
+	return p.cur.Pos
+}
+
 func (p *Parser) ParseStatement() (ast.Statement, error) {
-	switch p.cur.Type {
-	case TokenWith:
-		// WITH starts a SELECT statement with CTEs
-		return p.parseSelect()
-	case TokenSelect:
-		return p.parseSelect()
-	case TokenCreate:
-		return p.parseCreate()
-	case TokenInsert:
-		return p.parseInsert()
-	case TokenUpdate:
-		return p.parseUpdate()
-	case TokenDelete:
-		return p.parseDelete()
-	case TokenSet:
-		return p.parseSet()
-	case TokenCall:
-		return p.parseCall()
-	case TokenDrop:
-		return p.parseDrop()
-	case TokenAlter:
-		return p.parseAlter()
-	case TokenSemicolon:
-		p.next()
-		return nil, nil
-	case TokenEnd:
-		// Ignore stray END tokens at top-level (can appear with some clients after dollar-quoted bodies)
-		p.next()
-		return nil, nil
-	case TokenDollarString:
-		// Ignore stray dollar-quoted blocks at top-level (client-side chunking can leave this token alone)
-		p.next()
-		return nil, nil
-	default:
-		return nil, p.errorf("unexpected token %s", p.cur.Type)
+	if parse, ok := topLevelParsers[p.cur.Type]; ok {
+		return parse(p)
 	}
+	return nil, p.errorf("unexpected token %s", p.cur.Type)
 }
 
 func (p *Parser) parseSelect() (ast.Statement, error) {
@@ -133,7 +107,10 @@ func (p *Parser) parseSelect() (ast.Statement, error) {
 	}
 	p.next()
 
-	if p.cur.Type == TokenIdent && p.peek.Type == TokenLParen {
+	// Zero-argument scalar function call like SELECT version(). Aggregate calls
+	// (SUM(col), etc.) are excluded so they fall through to normal column
+	// parsing, which handles their arguments.
+	if p.cur.Type == TokenIdent && p.peek.Type == TokenLParen && !isAggregateFunc(strings.ToUpper(p.cur.Literal)) {
 		name := p.cur.Literal
 		p.next()
 		if !p.expect(TokenLParen) {
@@ -169,13 +146,14 @@ func (p *Parser) parseSelect() (ast.Statement, error) {
 		return stmt, nil
 	}
 
-	tbl, join, err := p.parseFromAndJoin()
+	tbl, joins, err := p.parseFromAndJoin()
 	if err != nil {
 		return nil, err
 	}
 	stmt.Table = tbl
-	if join != nil {
-		stmt.Join = join
+	if len(joins) > 0 {
+		stmt.Joins = joins
+		stmt.Join = joins[0] // backward-compat: first join mirrored on Join
 	}
 
 	where, err := p.parseWhereClause()
@@ -356,11 +334,13 @@ func (p *Parser) parseCreateProcedure() (ast.Statement, error) {
 		if !inner.expect(TokenBegin) {
 			return nil, p.errorf("expected BEGIN inside dollar-quoted procedure body")
 		}
+		bodyStart := inner.cur.Pos
 		body, err := inner.parseStatementsBlock()
 		if err != nil {
 			return nil, err
 		}
 		stmt.Body = append(stmt.Body, body...)
+		stmt.BodyText = strings.TrimSpace(inner.sliceFrom(bodyStart))
 		if inner.cur.Type == TokenEnd {
 			inner.next()
 			if inner.cur.Type == TokenSemicolon {
@@ -374,20 +354,12 @@ func (p *Parser) parseCreateProcedure() (ast.Statement, error) {
 		return stmt, nil
 	}
 
-	if !p.expect(TokenBegin) {
-		return nil, p.errorf("expected BEGIN")
-	}
-
-	// Parse body statements
-	body, err := p.parseStatementsBlock()
+	body, bodyText, err := p.parseBeginEndBlock()
 	if err != nil {
 		return nil, err
 	}
 	stmt.Body = append(stmt.Body, body...)
-
-	if !p.expect(TokenEnd) {
-		return nil, p.errorf("expected END")
-	}
+	stmt.BodyText = bodyText
 
 	return stmt, nil
 }
@@ -455,57 +427,32 @@ func (p *Parser) parseCreateTrigger() (ast.Statement, error) {
 		}
 	}
 
-	// Expect BEGIN
-	if !p.expect(TokenBegin) {
-		return nil, p.errorf("expected BEGIN")
-	}
-
-	// Parse body statements
-	body, err := p.parseStatementsBlock()
+	// Parse BEGIN ... END body
+	body, bodyText, err := p.parseBeginEndBlock()
 	if err != nil {
 		return nil, err
 	}
 	stmt.Body = append(stmt.Body, body...)
-
-	if !p.expect(TokenEnd) {
-		return nil, p.errorf("expected END")
-	}
+	stmt.BodyText = bodyText
 
 	return stmt, nil
 }
 
 func (p *Parser) parseDrop() (ast.Statement, error) {
 	p.next()
-	switch p.cur.Type {
-	case TokenTable:
-		return p.parseDropTable()
-	case TokenIndex:
-		return p.parseDropIndex()
-	case TokenView:
-		return p.parseDropView()
-	case TokenSchema:
-		return p.parseDropSchema()
-	case TokenDatabase:
-		return p.parseDropDatabase()
-	case TokenProcedure:
-		return p.parseDropProcedure()
-	case TokenTrigger:
-		return p.parseDropTrigger()
-	case TokenJob:
-		return p.parseDropJob()
-	default:
-		return nil, p.errorf("expected TABLE, INDEX, VIEW, SCHEMA, DATABASE, PROCEDURE, TRIGGER o JOB after DROP")
+	if parse, ok := dropParsers[p.cur.Type]; ok {
+		return parse(p)
 	}
+	return nil, p.errorf("expected TABLE, INDEX, VIEW, SCHEMA, DATABASE, PROCEDURE, TRIGGER o JOB after DROP")
 }
 
 // DROP INDEX index_name ON [schema.]table
 func (p *Parser) parseDropIndex() (ast.Statement, error) {
 	p.next()
-	if p.cur.Type != TokenIdent {
-		return nil, p.errorf("expected index name")
+	indexName, err := p.parseIdentRequired("expected index name")
+	if err != nil {
+		return nil, err
 	}
-	indexName := ast.Identifier{Name: p.cur.Literal}
-	p.next()
 
 	if !p.expect(TokenOn) {
 		return nil, p.errorf("expected ON after index name")
@@ -522,11 +469,10 @@ func (p *Parser) parseDropIndex() (ast.Statement, error) {
 // DROP PROCEDURE procedure_name[()]
 func (p *Parser) parseDropProcedure() (ast.Statement, error) {
 	p.next()
-	if p.cur.Type != TokenIdent {
-		return nil, p.errorf("expected procedure name")
+	procName, err := p.parseIdentRequired("expected procedure name")
+	if err != nil {
+		return nil, err
 	}
-	procName := ast.Identifier{Name: p.cur.Literal}
-	p.next()
 
 	// Optional parentheses for PostgreSQL-like syntax: DROP PROCEDURE name()
 	if p.cur.Type == TokenLParen {
@@ -542,14 +488,9 @@ func (p *Parser) parseDropProcedure() (ast.Statement, error) {
 // DROP TABLE [schema.]table
 func (p *Parser) parseDropTable() (ast.Statement, error) {
 	p.next()
-	ifExists := false
-	if p.cur.Type == TokenIf {
-		p.next()
-		if p.cur.Type != TokenExists {
-			return nil, p.errorf("expected EXISTS after IF")
-		}
-		ifExists = true
-		p.next()
+	ifExists, err := p.parseOptionalIfExists()
+	if err != nil {
+		return nil, err
 	}
 
 	if p.cur.Type != TokenIdent {
@@ -557,14 +498,7 @@ func (p *Parser) parseDropTable() (ast.Statement, error) {
 	}
 	tableIdent := p.parseQualifiedIdent()
 
-	behavior := ""
-	if p.cur.Type == TokenCascade {
-		behavior = "CASCADE"
-		p.next()
-	} else if p.cur.Type == TokenRestrict {
-		behavior = "RESTRICT"
-		p.next()
-	}
+	behavior := p.parseOptionalCascadeRestrict()
 
 	return &ast.DropTable{Table: tableIdent, IfExists: ifExists, Behavior: behavior}, nil
 }
@@ -572,14 +506,9 @@ func (p *Parser) parseDropTable() (ast.Statement, error) {
 // DROP VIEW [schema.]view
 func (p *Parser) parseDropView() (ast.Statement, error) {
 	p.next()
-	ifExists := false
-	if p.cur.Type == TokenIf {
-		p.next()
-		if p.cur.Type != TokenExists {
-			return nil, p.errorf("expected EXISTS after IF")
-		}
-		ifExists = true
-		p.next()
+	ifExists, err := p.parseOptionalIfExists()
+	if err != nil {
+		return nil, err
 	}
 
 	if p.cur.Type != TokenIdent {
@@ -587,15 +516,7 @@ func (p *Parser) parseDropView() (ast.Statement, error) {
 	}
 	viewIdent := p.parseQualifiedIdent()
 
-	// Parse optional CASCADE or RESTRICT
-	behavior := ""
-	if p.cur.Type == TokenCascade {
-		behavior = "CASCADE"
-		p.next()
-	} else if p.cur.Type == TokenRestrict {
-		behavior = "RESTRICT"
-		p.next()
-	}
+	behavior := p.parseOptionalCascadeRestrict()
 
 	return &ast.DropView{Name: viewIdent, IfExists: ifExists, Behavior: behavior}, nil
 }
@@ -603,14 +524,9 @@ func (p *Parser) parseDropView() (ast.Statement, error) {
 // DROP SCHEMA [IF EXISTS] schema [CASCADE|RESTRICT]
 func (p *Parser) parseDropSchema() (ast.Statement, error) {
 	p.next()
-	ifExists := false
-	if p.cur.Type == TokenIf {
-		p.next()
-		if p.cur.Type != TokenExists {
-			return nil, p.errorf("expected EXISTS after IF")
-		}
-		ifExists = true
-		p.next()
+	ifExists, err := p.parseOptionalIfExists()
+	if err != nil {
+		return nil, err
 	}
 
 	if p.cur.Type != TokenIdent {
@@ -619,14 +535,7 @@ func (p *Parser) parseDropSchema() (ast.Statement, error) {
 	schema := p.cur.Literal
 	p.next()
 
-	behavior := ""
-	if p.cur.Type == TokenCascade {
-		behavior = "CASCADE"
-		p.next()
-	} else if p.cur.Type == TokenRestrict {
-		behavior = "RESTRICT"
-		p.next()
-	}
+	behavior := p.parseOptionalCascadeRestrict()
 
 	return &ast.DropSchema{Name: schema, IfExists: ifExists, Behavior: behavior}, nil
 }
@@ -645,20 +554,18 @@ func (p *Parser) parseDropDatabase() (ast.Statement, error) {
 // DROP TRIGGER trigger_name ON table_name
 func (p *Parser) parseDropTrigger() (ast.Statement, error) {
 	p.next()
-	if p.cur.Type != TokenIdent {
-		return nil, p.errorf("expected trigger name")
+	triggerName, err := p.parseIdentRequired("expected trigger name")
+	if err != nil {
+		return nil, err
 	}
-	triggerName := ast.Identifier{Name: p.cur.Literal}
-	p.next()
 
 	if !p.expect(TokenOn) {
 		return nil, p.errorf("expected ON after trigger name")
 	}
-	if p.cur.Type != TokenIdent {
-		return nil, p.errorf("expected table name after ON")
+	tableName, err := p.parseIdentRequired("expected table name after ON")
+	if err != nil {
+		return nil, err
 	}
-	tableName := ast.Identifier{Name: p.cur.Literal}
-	p.next()
 
 	return &ast.DropTrigger{Name: triggerName, Table: tableName}, nil
 }
@@ -666,11 +573,10 @@ func (p *Parser) parseDropTrigger() (ast.Statement, error) {
 // DROP JOB job_name
 func (p *Parser) parseDropJob() (ast.Statement, error) {
 	p.next()
-	if p.cur.Type != TokenIdent {
-		return nil, p.errorf("expected job name")
+	jobName, err := p.parseIdentRequired("expected job name")
+	if err != nil {
+		return nil, err
 	}
-	jobName := ast.Identifier{Name: p.cur.Literal}
-	p.next()
 	return &ast.DropJob{Name: jobName}, nil
 }
 
@@ -688,26 +594,10 @@ func (p *Parser) parseCreate() (ast.Statement, error) {
 		return p.parseCreateView(true)
 	}
 
-	switch p.cur.Type {
-	case TokenTable:
-		return p.parseCreateTable()
-	case TokenView:
-		return p.parseCreateView(false)
-	case TokenIndex:
-		return p.parseCreateIndex()
-	case TokenSchema:
-		return p.parseCreateSchema()
-	case TokenDatabase:
-		return p.parseCreateDatabase()
-	case TokenProcedure:
-		return p.parseCreateProcedure()
-	case TokenTrigger:
-		return p.parseCreateTrigger()
-	case TokenJob:
-		return p.parseCreateJob()
-	default:
-		return nil, p.errorf("expected TABLE, VIEW, INDEX, SCHEMA, DATABASE, PROCEDURE, TRIGGER or JOB after CREATE")
+	if parse, ok := createParsers[p.cur.Type]; ok {
+		return parse(p)
 	}
+	return nil, p.errorf("expected TABLE, VIEW, INDEX, SCHEMA, DATABASE, PROCEDURE, TRIGGER or JOB after CREATE")
 }
 
 func (p *Parser) parseCreateView(replace bool) (ast.Statement, error) {
@@ -766,6 +656,9 @@ func (p *Parser) parseCreateView(replace bool) (ast.Statement, error) {
 		return nil, p.errorf("expected SELECT after AS in CREATE VIEW")
 	}
 
+	// Capture the original SELECT source text so the view can be persisted as
+	// stable SQL (re-parsed on load) rather than a serialized AST.
+	queryStart := p.cur.Pos
 	stmt, err := p.parseSelect()
 	if err != nil {
 		return nil, err
@@ -774,17 +667,17 @@ func (p *Parser) parseCreateView(replace bool) (ast.Statement, error) {
 	if !ok {
 		return nil, p.errorf("expected SELECT query for CREATE VIEW")
 	}
+	queryText := strings.TrimSpace(p.sliceFrom(queryStart))
 
-	return &ast.CreateView{Name: viewName, ColumnNames: columnNames, Query: sel, Replace: replace, IfNotExists: ifNotExists}, nil
+	return &ast.CreateView{Name: viewName, ColumnNames: columnNames, Query: sel, QueryText: queryText, Replace: replace, IfNotExists: ifNotExists}, nil
 }
 
 func (p *Parser) parseCreateIndex() (ast.Statement, error) {
 	p.next()
-	if p.cur.Type != TokenIdent {
-		return nil, p.errorf("expected index name")
+	idxName, err := p.parseIdentRequired("expected index name")
+	if err != nil {
+		return nil, err
 	}
-	idxName := ast.Identifier{Name: p.cur.Literal}
-	p.next()
 
 	if !p.expect(TokenOn) {
 		return nil, p.errorf("expected ON after index name")
@@ -1266,17 +1159,9 @@ func (p *Parser) parseCreateJob() (ast.Statement, error) {
 	}
 	p.next()
 
-	if !p.expect(TokenBegin) {
-		return nil, p.errorf("expected BEGIN for job body")
-	}
-
-	body, err := p.parseStatementsBlock()
+	body, bodyText, err := p.parseBeginEndBlock()
 	if err != nil {
 		return nil, err
-	}
-
-	if !p.expect(TokenEnd) {
-		return nil, p.errorf("expected END after job body")
 	}
 
 	return &ast.CreateJob{
@@ -1284,6 +1169,7 @@ func (p *Parser) parseCreateJob() (ast.Statement, error) {
 		Interval: interval,
 		Unit:     unit,
 		Body:     body,
+		BodyText: bodyText,
 		Enabled:  true, // Jobs are enabled by default
 	}, nil
 }
@@ -1291,14 +1177,10 @@ func (p *Parser) parseCreateJob() (ast.Statement, error) {
 // ALTER [TABLE|JOB] ...
 func (p *Parser) parseAlter() (ast.Statement, error) {
 	p.next()
-	switch p.cur.Type {
-	case TokenTable:
-		return p.parseAlterTable()
-	case TokenJob:
-		return p.parseAlterJob()
-	default:
-		return nil, p.errorf("expected TABLE or JOB after ALTER")
+	if parse, ok := alterParsers[p.cur.Type]; ok {
+		return parse(p)
 	}
+	return nil, p.errorf("expected TABLE or JOB after ALTER")
 }
 
 // ALTER TABLE table_name action
@@ -1418,11 +1300,10 @@ func (p *Parser) parseRenameColumn() (ast.AlterAction, error) {
 // ALTER JOB job_name [ENABLE|DISABLE]
 func (p *Parser) parseAlterJob() (ast.Statement, error) {
 	p.next() // consume JOB
-	if p.cur.Type != TokenIdent {
-		return nil, p.errorf("expected job name after ALTER JOB")
+	jobName, err := p.parseIdentRequired("expected job name after ALTER JOB")
+	if err != nil {
+		return nil, err
 	}
-	jobName := ast.Identifier{Name: p.cur.Literal}
-	p.next()
 
 	// Parse action (ENABLE or DISABLE)
 	var action string

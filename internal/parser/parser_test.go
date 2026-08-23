@@ -62,6 +62,43 @@ func TestSimpleSelect(t *testing.T) {
 	}
 }
 
+func TestParseNaturalJoin(t *testing.T) {
+	p := NewParser("SELECT * FROM a NATURAL LEFT JOIN b;")
+	stmt, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse NATURAL JOIN: %v", err)
+	}
+	sel := stmt.(*ast.Select)
+	if len(sel.Joins) != 1 {
+		t.Fatalf("Expected 1 join, got %d", len(sel.Joins))
+	}
+	j := sel.Joins[0]
+	if !j.Natural {
+		t.Errorf("Expected Natural=true")
+	}
+	if j.Type != "LEFT" {
+		t.Errorf("Expected Type=LEFT, got %q", j.Type)
+	}
+	if j.Table.Name != "b" {
+		t.Errorf("Expected joined table 'b', got %q", j.Table.Name)
+	}
+}
+
+func TestParseJoinUsing(t *testing.T) {
+	p := NewParser("SELECT * FROM a JOIN b USING (k1, k2);")
+	stmt, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse JOIN USING: %v", err)
+	}
+	j := stmt.(*ast.Select).Joins[0]
+	if j.Natural {
+		t.Errorf("Expected Natural=false for USING join")
+	}
+	if len(j.Using) != 2 || j.Using[0] != "k1" || j.Using[1] != "k2" {
+		t.Errorf("Expected Using=[k1 k2], got %v", j.Using)
+	}
+}
+
 func TestCreateTable(t *testing.T) {
 	input := "CREATE TABLE test (id INT PRIMARY KEY, name TEXT);"
 	p := NewParser(input)

@@ -74,6 +74,7 @@ type CreateView struct {
 	Name        Identifier
 	ColumnNames []string // Optional: explicit column names for view
 	Query       *Select
+	QueryText   string // Original SQL text of the SELECT, for stable persistence
 	Replace     bool
 	IfNotExists bool
 }
@@ -151,7 +152,8 @@ type Select struct {
 	With         []CTE
 	Columns      []Identifier
 	Table        Identifier
-	Join         *JoinClause
+	Join         *JoinClause   // first join (kept for backward-compat; mirrors Joins[0])
+	Joins        []*JoinClause // full chain of joins (supports N-way joins)
 	Where        *WhereClause
 	GroupBy      []Identifier
 	OrderBy      []OrderByClause
@@ -165,10 +167,12 @@ type Select struct {
 func (Select) stmtNode() {}
 
 type JoinClause struct {
-	Type  string // "INNER", "LEFT", "RIGHT"
-	Table Identifier
-	Left  Identifier
-	Right Identifier
+	Type    string // "INNER", "LEFT", "RIGHT", "FULL", "CROSS"
+	Table   Identifier
+	Left    Identifier
+	Right   Identifier
+	Natural bool     // NATURAL JOIN: join on all common column names (no ON)
+	Using   []string // JOIN ... USING (col, ...): join on the named common columns
 }
 
 type SelectFunction struct {
@@ -177,9 +181,37 @@ type SelectFunction struct {
 
 func (SelectFunction) stmtNode() {}
 
+// WhereClause is a boolean predicate tree. A leaf node is a single comparison
+// (Column Operator Value) and has Conj == "". A compound node combines two
+// sub-predicates with Conj ("AND" or "OR") and leaves the leaf fields unused.
 type WhereClause struct {
-	Column Identifier
-	Value  Literal
+	// Leaf fields (used when Conj == "").
+	Column   Identifier
+	Operator string // "=", "<>", "<", ">", "<=", ">=" (default "=")
+	Value    Literal
+
+	// Compound fields (used when Conj != "").
+	Left  *WhereClause
+	Conj  string // "AND" or "OR"
+	Right *WhereClause
+}
+
+// IsLeaf reports whether the clause is a single comparison predicate rather
+// than an AND/OR combination.
+func (w *WhereClause) IsLeaf() bool {
+	return w != nil && w.Conj == ""
+}
+
+// LeafColumns returns the column names referenced by every leaf predicate in
+// the tree, in left-to-right order. Used for validation.
+func (w *WhereClause) LeafColumns() []string {
+	if w == nil {
+		return nil
+	}
+	if w.Conj == "" {
+		return []string{w.Column.Name}
+	}
+	return append(w.Left.LeafColumns(), w.Right.LeafColumns()...)
 }
 
 type Update struct {
@@ -212,6 +244,7 @@ type CreateProcedure struct {
 	Name       Identifier
 	Parameters []Parameter
 	Body       []Statement
+	BodyText   string // Verbatim SQL of the body, for stable persistence
 }
 
 func (CreateProcedure) stmtNode() {}
@@ -236,6 +269,7 @@ type CreateTrigger struct {
 	Table      Identifier
 	ForEachRow bool
 	Body       []Statement
+	BodyText   string // Verbatim SQL of the body, for stable persistence
 }
 
 func (CreateTrigger) stmtNode() {}
@@ -252,6 +286,7 @@ type CreateJob struct {
 	Interval int    // Number of units (1, 5, 10, etc.)
 	Unit     string // "MINUTE", "HOUR", "DAY"
 	Body     []Statement
+	BodyText string // Verbatim SQL of the body, for stable persistence
 	Enabled  bool
 }
 

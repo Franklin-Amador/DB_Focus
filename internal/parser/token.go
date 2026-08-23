@@ -19,6 +19,8 @@ const (
 	TokenNotEq        TokenType = "<>"
 	TokenLt           TokenType = "<"
 	TokenGt           TokenType = ">"
+	TokenLte          TokenType = "<="
+	TokenGte          TokenType = ">="
 
 	TokenAs         TokenType = "AS"
 	TokenCount      TokenType = "COUNT"
@@ -35,6 +37,8 @@ const (
 	TokenFull       TokenType = "FULL"
 	TokenOuter      TokenType = "OUTER"
 	TokenCross      TokenType = "CROSS"
+	TokenNatural    TokenType = "NATURAL"
+	TokenUsing      TokenType = "USING"
 	TokenSelect     TokenType = "SELECT"
 	TokenDistinct   TokenType = "DISTINCT"
 	TokenFrom       TokenType = "FROM"
@@ -43,6 +47,7 @@ const (
 	TokenBy         TokenType = "BY"
 	TokenCreate     TokenType = "CREATE"
 	TokenOr         TokenType = "OR"
+	TokenAnd        TokenType = "AND"
 	TokenReplace    TokenType = "REPLACE"
 	TokenIf         TokenType = "IF"
 	TokenExists     TokenType = "EXISTS"
@@ -131,6 +136,7 @@ var keywords = map[string]TokenType{
 	"BY":         TokenBy,
 	"CREATE":     TokenCreate,
 	"OR":         TokenOr,
+	"AND":        TokenAnd,
 	"REPLACE":    TokenReplace,
 	"IF":         TokenIf,
 	"EXISTS":     TokenExists,
@@ -159,6 +165,8 @@ var keywords = map[string]TokenType{
 	"FULL":       TokenFull,
 	"OUTER":      TokenOuter,
 	"CROSS":      TokenCross,
+	"NATURAL":    TokenNatural,
+	"USING":      TokenUsing,
 	"PRIMARY":    TokenPrimary,
 	"KEY":        TokenKey,
 	"FOREIGN":    TokenForeign,

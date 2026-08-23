@@ -44,9 +44,10 @@ func (p *Parser) parseStatementsBlock() ([]ast.Statement, error) {
 	return stmts, nil
 }
 
-// parseFromAndJoin parses FROM table and optional JOIN clause. It assumes
-// the current token is TokenFrom and advances the parser accordingly.
-func (p *Parser) parseFromAndJoin() (ast.Identifier, *ast.JoinClause, error) {
+// parseFromAndJoin parses FROM table and an optional chain of JOIN clauses. It
+// assumes the current token is TokenFrom and advances the parser accordingly.
+// Multiple joins (N-way) are supported: each JOIN is appended to the returned slice.
+func (p *Parser) parseFromAndJoin() (ast.Identifier, []*ast.JoinClause, error) {
 	// consume FROM
 	p.next()
 
@@ -65,95 +66,144 @@ func (p *Parser) parseFromAndJoin() (ast.Identifier, *ast.JoinClause, error) {
 		p.next()
 	}
 
-	// Optional JOIN
-	var join *ast.JoinClause
-	if p.cur.Type == TokenInner || p.cur.Type == TokenLeft || p.cur.Type == TokenRight || p.cur.Type == TokenFull || p.cur.Type == TokenCross || p.cur.Type == TokenJoin {
-		var joinType string
-		switch p.cur.Type {
-		case TokenInner, TokenJoin:
-			joinType = "INNER"
-			p.next()
-			if p.cur.Type == TokenJoin { // when explicit JOIN token followed
-				// already advanced
-			}
-			if p.cur.Type == TokenJoin {
-				// consume JOIN
-				p.next()
-			}
-		case TokenLeft:
-			joinType = "LEFT"
-			p.next()
-			if p.cur.Type == TokenOuter {
-				p.next()
-			}
-			if p.cur.Type == TokenJoin {
-				p.next()
-			}
-		case TokenRight:
-			joinType = "RIGHT"
-			p.next()
-			if p.cur.Type == TokenOuter {
-				p.next()
-			}
-			if p.cur.Type == TokenJoin {
-				p.next()
-			}
-		case TokenFull:
-			joinType = "FULL"
-			p.next()
-			if p.cur.Type == TokenOuter {
-				p.next()
-			}
-			if p.cur.Type == TokenJoin {
-				p.next()
-			}
-		case TokenCross:
-			joinType = "CROSS"
-			p.next()
-			if p.cur.Type == TokenJoin {
-				p.next()
-			}
+	// Optional chain of JOINs
+	var joins []*ast.JoinClause
+	for p.cur.Type == TokenNatural || p.cur.Type == TokenInner || p.cur.Type == TokenLeft || p.cur.Type == TokenRight || p.cur.Type == TokenFull || p.cur.Type == TokenCross || p.cur.Type == TokenJoin {
+		join, err := p.parseSingleJoin()
+		if err != nil {
+			return ast.Identifier{}, nil, err
 		}
+		joins = append(joins, join)
+	}
 
-		if p.cur.Type != TokenIdent {
-			return ast.Identifier{}, nil, p.errorf("expected table name after JOIN")
-		}
-		joinTable := ast.Identifier{Name: p.cur.Literal}
+	return table, joins, nil
+}
+
+// parseSingleJoin parses one JOIN clause (the current token is a join keyword or
+// NATURAL). Supports explicit ON, USING (col, ...), and NATURAL joins.
+func (p *Parser) parseSingleJoin() (*ast.JoinClause, error) {
+	// Optional NATURAL prefix.
+	natural := false
+	if p.cur.Type == TokenNatural {
+		natural = true
 		p.next()
-		if p.cur.Type == TokenAs {
-			p.next()
-			if p.cur.Type != TokenIdent {
-				return ast.Identifier{}, nil, p.errorf("expected alias after AS")
-			}
-			joinTable.Alias = p.cur.Literal
+	}
+
+	var joinType string
+	switch p.cur.Type {
+	case TokenInner, TokenJoin:
+		joinType = "INNER"
+		p.next()
+		if p.cur.Type == TokenJoin {
 			p.next()
 		}
-
-		if joinType == "CROSS" {
-			join = &ast.JoinClause{Type: joinType, Table: joinTable}
-		} else {
-			if !p.expect(TokenOn) {
-				return ast.Identifier{}, nil, p.errorf("expected ON after JOIN table")
-			}
-			if p.cur.Type != TokenIdent {
-				return ast.Identifier{}, nil, p.errorf("expected column in JOIN condition")
-			}
-			left := ast.Identifier{Name: p.cur.Literal}
+	case TokenLeft:
+		joinType = "LEFT"
+		p.next()
+		if p.cur.Type == TokenOuter {
 			p.next()
-			if !p.expect(TokenEq) {
-				return ast.Identifier{}, nil, p.errorf("expected = in JOIN condition")
-			}
-			if p.cur.Type != TokenIdent {
-				return ast.Identifier{}, nil, p.errorf("expected column in JOIN condition")
-			}
-			right := ast.Identifier{Name: p.cur.Literal}
+		}
+		if p.cur.Type == TokenJoin {
 			p.next()
-
-			join = &ast.JoinClause{Type: joinType, Table: joinTable, Left: left, Right: right}
+		}
+	case TokenRight:
+		joinType = "RIGHT"
+		p.next()
+		if p.cur.Type == TokenOuter {
+			p.next()
+		}
+		if p.cur.Type == TokenJoin {
+			p.next()
+		}
+	case TokenFull:
+		joinType = "FULL"
+		p.next()
+		if p.cur.Type == TokenOuter {
+			p.next()
+		}
+		if p.cur.Type == TokenJoin {
+			p.next()
+		}
+	case TokenCross:
+		joinType = "CROSS"
+		p.next()
+		if p.cur.Type == TokenJoin {
+			p.next()
 		}
 	}
 
-	return table, join, nil
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected table name after JOIN")
+	}
+	joinTable := ast.Identifier{Name: p.cur.Literal}
+	p.next()
+	if p.cur.Type == TokenAs {
+		p.next()
+		if p.cur.Type != TokenIdent {
+			return nil, p.errorf("expected alias after AS")
+		}
+		joinTable.Alias = p.cur.Literal
+		p.next()
+	}
+
+	if natural && joinType == "CROSS" {
+		return nil, p.errorf("NATURAL CROSS JOIN is not allowed")
+	}
+
+	// NATURAL join: no ON/USING; common columns are matched at execution time.
+	if natural {
+		return &ast.JoinClause{Type: joinType, Table: joinTable, Natural: true}, nil
+	}
+
+	// CROSS join has no join condition.
+	if joinType == "CROSS" {
+		return &ast.JoinClause{Type: joinType, Table: joinTable}, nil
+	}
+
+	// USING (col, ...): join on the named common columns.
+	if p.cur.Type == TokenUsing {
+		p.next()
+		if !p.expect(TokenLParen) {
+			return nil, p.errorf("expected ( after USING")
+		}
+		var cols []string
+		for {
+			if p.cur.Type != TokenIdent {
+				return nil, p.errorf("expected column name in USING list")
+			}
+			cols = append(cols, p.cur.Literal)
+			p.next()
+			if p.cur.Type == TokenComma {
+				p.next()
+				continue
+			}
+			break
+		}
+		if !p.expect(TokenRParen) {
+			return nil, p.errorf("expected ) after USING column list")
+		}
+		return &ast.JoinClause{Type: joinType, Table: joinTable, Using: cols}, nil
+	}
+
+	// Explicit ON condition.
+	if !p.expect(TokenOn) {
+		return nil, p.errorf("expected ON, USING or NATURAL for JOIN")
+	}
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected column in JOIN condition")
+	}
+	left := ast.Identifier{Name: p.cur.Literal}
+	p.next()
+	if !p.expect(TokenEq) {
+		return nil, p.errorf("expected = in JOIN condition")
+	}
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected column in JOIN condition")
+	}
+	right := ast.Identifier{Name: p.cur.Literal}
+	p.next()
+
+	return &ast.JoinClause{Type: joinType, Table: joinTable, Left: left, Right: right}, nil
 }
 
 func (p *Parser) parseWhereClause() (*ast.WhereClause, error) {
@@ -161,19 +211,118 @@ func (p *Parser) parseWhereClause() (*ast.WhereClause, error) {
 		return nil, nil
 	}
 	p.next()
+	return p.parseWhereOr()
+}
+
+// parseWhereOr parses OR-separated conjunctions (OR has the lowest precedence).
+func (p *Parser) parseWhereOr() (*ast.WhereClause, error) {
+	left, err := p.parseWhereAnd()
+	if err != nil {
+		return nil, err
+	}
+	for p.cur.Type == TokenOr {
+		p.next()
+		right, err := p.parseWhereAnd()
+		if err != nil {
+			return nil, err
+		}
+		left = &ast.WhereClause{Conj: "OR", Left: left, Right: right}
+	}
+	return left, nil
+}
+
+// parseWhereAnd parses AND-separated predicates (AND binds tighter than OR).
+func (p *Parser) parseWhereAnd() (*ast.WhereClause, error) {
+	left, err := p.parseWherePredicate()
+	if err != nil {
+		return nil, err
+	}
+	for p.cur.Type == TokenAnd {
+		p.next()
+		right, err := p.parseWherePredicate()
+		if err != nil {
+			return nil, err
+		}
+		left = &ast.WhereClause{Conj: "AND", Left: left, Right: right}
+	}
+	return left, nil
+}
+
+// parseWherePredicate parses a parenthesized sub-expression or a single
+// `column OP literal` comparison (the leaf).
+func (p *Parser) parseWherePredicate() (*ast.WhereClause, error) {
+	if p.cur.Type == TokenLParen {
+		p.next()
+		inner, err := p.parseWhereOr()
+		if err != nil {
+			return nil, err
+		}
+		if !p.expect(TokenRParen) {
+			return nil, p.errorf("expected ) in WHERE")
+		}
+		return inner, nil
+	}
+
 	if p.cur.Type != TokenIdent {
 		return nil, p.errorf("expected column in WHERE")
 	}
 	col := ast.Identifier{Name: p.cur.Literal}
 	p.next()
-	if !p.expect(TokenEq) {
-		return nil, p.errorf("expected = in WHERE")
+	op, ok := whereOperator(p.cur.Type)
+	if !ok {
+		return nil, p.errorf("expected comparison operator (=, <>, <, >, <=, >=) in WHERE")
 	}
+	p.next()
 	lit, err := p.parseLiteral()
 	if err != nil {
 		return nil, err
 	}
-	return &ast.WhereClause{Column: col, Value: lit}, nil
+	return &ast.WhereClause{Column: col, Operator: op, Value: lit}, nil
+}
+
+// sliceFrom returns the original source text from byte offset start up to the
+// start of the current token, clamped to valid bounds. Used to capture the
+// verbatim SQL of a sub-clause (e.g. a view's SELECT) for stable persistence.
+func (p *Parser) sliceFrom(start int) string {
+	src := p.l.input
+	end := p.cur.Pos
+	if start < 0 || start > len(src) {
+		return ""
+	}
+	if end < start || end > len(src) {
+		end = len(src)
+	}
+	return src[start:end]
+}
+
+// isAggregateFunc reports whether an (already upper-cased) identifier is a
+// supported aggregate function name.
+func isAggregateFunc(upper string) bool {
+	switch upper {
+	case "COUNT", "SUM", "AVG", "MIN", "MAX":
+		return true
+	}
+	return false
+}
+
+// whereOperator maps a comparison token to its canonical operator string,
+// reporting whether the token is a recognized comparison operator.
+func whereOperator(t TokenType) (string, bool) {
+	switch t {
+	case TokenEq:
+		return "=", true
+	case TokenNotEq:
+		return "<>", true
+	case TokenLt:
+		return "<", true
+	case TokenGt:
+		return ">", true
+	case TokenLte:
+		return "<=", true
+	case TokenGte:
+		return ">=", true
+	}
+	return "", false
 }
 
 func (p *Parser) parseGroupByClause() ([]ast.Identifier, error) {
@@ -376,8 +525,8 @@ func (p *Parser) parseSelectItem(depth *int, exprIdx int) (ast.Identifier, bool,
 				}
 			}
 
-			// Handle aggregate functions like COUNT(*)
-			if p.peek.Type == TokenLParen && (upper == "COUNT" || p.cur.Type == TokenCount) {
+			// Handle aggregate functions like COUNT(*), SUM(col), AVG/MIN/MAX(col)
+			if p.peek.Type == TokenLParen && (isAggregateFunc(upper) || p.cur.Type == TokenCount) {
 				funcName := lit
 				p.next() // consume function name
 				p.next() // consume (
@@ -534,5 +683,55 @@ func (p *Parser) parseDefaultValue() (*ast.Literal, error) {
 		return &ast.Literal{Kind: "ident", Value: val}, nil
 	default:
 		return &ast.Literal{Kind: "ident", Value: ""}, nil
+	}
+}
+
+// parseBeginEndBlock parses a `BEGIN <statements> END` block and returns the
+// body statements together with their verbatim source text (between BEGIN and
+// END). The current token must be BEGIN; both BEGIN and the closing END are
+// consumed. The body text lets callers persist a stable, AST-independent
+// definition. Shared by CREATE PROCEDURE/TRIGGER/JOB bodies.
+func (p *Parser) parseBeginEndBlock() ([]ast.Statement, string, error) {
+	if !p.expect(TokenBegin) {
+		return nil, "", p.errorf("expected BEGIN")
+	}
+	bodyStart := p.cur.Pos
+	body, err := p.parseStatementsBlock()
+	if err != nil {
+		return nil, "", err
+	}
+	bodyText := strings.TrimSpace(p.sliceFrom(bodyStart))
+	if !p.expect(TokenEnd) {
+		return nil, "", p.errorf("expected END")
+	}
+	return body, bodyText, nil
+}
+
+// parseOptionalIfExists consumes an optional "IF EXISTS" prefix and reports
+// whether it was present. It errors if IF is seen without a following EXISTS.
+func (p *Parser) parseOptionalIfExists() (bool, error) {
+	if p.cur.Type != TokenIf {
+		return false, nil
+	}
+	p.next()
+	if p.cur.Type != TokenExists {
+		return false, p.errorf("expected EXISTS after IF")
+	}
+	p.next()
+	return true, nil
+}
+
+// parseOptionalCascadeRestrict consumes an optional CASCADE or RESTRICT
+// modifier and returns "CASCADE", "RESTRICT", or "" when neither is present.
+func (p *Parser) parseOptionalCascadeRestrict() string {
+	switch p.cur.Type {
+	case TokenCascade:
+		p.next()
+		return "CASCADE"
+	case TokenRestrict:
+		p.next()
+		return "RESTRICT"
+	default:
+		return ""
 	}
 }
