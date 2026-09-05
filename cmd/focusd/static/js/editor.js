@@ -31,9 +31,22 @@ function persistHistory() {
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
+// Modo SQL de CodeMirror extendido con las keywords propias del motor que el
+// diccionario vendoreado no conoce (ventanas y QUALIFY). Se registra como MIME
+// propio para que el editor inicial y cada CodeMirror.Doc de las pestañas
+// (tabs.js) compartan exactamente el mismo modo.
+export const SQL_MIME = 'text/x-focusdb';
+const EXTRA_KEYWORDS = ['qualify', 'over', 'partition', 'row_number', 'rank', 'dense_rank'];
+(function defineSqlMode() {
+  const base = CodeMirror.resolveMode('text/x-sql') || {};
+  const keywords = { ...(base.keywords || {}) };
+  EXTRA_KEYWORDS.forEach(k => { keywords[k] = true; });
+  CodeMirror.defineMIME(SQL_MIME, { ...base, name: 'sql', keywords });
+})();
+
 export function initEditor() {
   state.editor = CodeMirror.fromTextArea(document.getElementById('sql-input'), {
-    mode: 'text/x-sql',
+    mode: SQL_MIME,
     theme: 'dracula',
     lineNumbers: true,
     matchBrackets: true,
@@ -80,6 +93,8 @@ const SNIPPETS = [
   { text: 'LEFT JOIN  ON ',                          displayText: 'LEFT JOIN … ON …' },
   { text: 'GROUP BY ',                               displayText: 'GROUP BY …' },
   { text: 'ORDER BY  DESC',                          displayText: 'ORDER BY … DESC' },
+  { text: 'ROW_NUMBER() OVER (PARTITION BY  ORDER BY  DESC) AS rn', displayText: 'ROW_NUMBER() OVER (…) AS rn' },
+  { text: 'QUALIFY ',                                displayText: 'QUALIFY …' },
 ];
 
 // Resuelve alias del statement bajo el cursor: FROM t AS x / JOIN t x → {x: cols de t}
@@ -87,7 +102,7 @@ function aliasTables(base) {
   const { sql } = getCurrentStatement();
   const out = {};
   const re = /(?:FROM|JOIN)\s+([A-Za-z_][\w]*)(?:\s+(?:AS\s+)?([A-Za-z_][\w]*))?/gi;
-  const KEYWORDS = new Set(['ON','WHERE','INNER','LEFT','RIGHT','FULL','CROSS','NATURAL','JOIN','GROUP','ORDER','LIMIT','USING','AS','SET']);
+  const KEYWORDS = new Set(['ON','WHERE','INNER','LEFT','RIGHT','FULL','CROSS','NATURAL','JOIN','GROUP','ORDER','LIMIT','USING','AS','SET','QUALIFY','OVER','PARTITION']);
   let m;
   while ((m = re.exec(sql)) !== null) {
     const table = m[1], alias = m[2];

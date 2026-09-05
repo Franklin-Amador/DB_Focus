@@ -267,6 +267,14 @@ Desde el refactor (Fase 2) el dispatch es **por datos, con auto-registro**: no h
 **Helpers a reutilizar** (no re-implementar):
 - Executor: `checkCtx`, `schemaOrPublic`, `qualifiedName`, `persistTable`, `persistTableWarn`
   (`executor_helpers.go`).
+- **Pipeline de SELECT** (`executor/select_pipeline.go`): toda etapa posterior a FROM/WHERE
+  (GROUP BY, ventanas, QUALIFY, ORDER BY, proyección, DISTINCT, LIMIT) vive en `finishSelect`
+  sobre un `rowset` (`cols []joinColumn` + `rows`). Resolver columnas con `rowset.resolve` /
+  `resolveWithAliases` (acepta `ref.col`, alias del SELECT y texto de agregado `SUM(x)`); no
+  volver a duplicar post-procesado por ruta. Funciones de ventana en `window.go`
+  (`evalWindow`), comparación de orden en `queryutil.CompareByKeys`/`SortRowsByKeys`.
+- Parser: `parseColumnRef` (columna o `AGG(col)` como texto) y `parseWindowCall`
+  (`FUNC(arg) [OVER (...)]`) para cualquier cláusula que acepte expresiones de columna.
 - Parser: `parseIdentRequired`, `parseOptionalIfExists`, `parseOptionalCascadeRestrict`,
   `parseBeginEndBlock`, `parseWhereClause` (`helpers.go`).
 - Comparación de valores: `catalog.ValuesEqual` / `executor.compareCells` — **nunca `==` crudo**
@@ -1272,3 +1280,78 @@ con try/catch+toast; layout AABB consciente del alto de cajas, troceado en rAF s
 explorador CRUD completo (update/insert/delete reales), diagrama con persistencia/self-FK/
 minimapa/compacto/clamp, 700 filas → primer render 127ms + paginación, consola limpia.
 README actualizado (sección GUI completa + flags).
+
+### Session: September 5, 2026 - Funciones de ventana + QUALIFY (pipeline de SELECT unificado)
+
+**Objetivo**: agregar `QUALIFY` al motor. Como no existían funciones de ventana (ni `HAVING`),
+la entrega incluye `ROW_NUMBER/RANK/DENSE_RANK` y `COUNT/SUM/AVG/MIN/MAX ... OVER (PARTITION BY …
+ORDER BY …)`, y QUALIFY por alias, inline y sobre `GROUP BY`.
+
+**Status**: ✅ COMPLETED
+
+**Cambios**:
+- **token.go**: `QUALIFY`, `OVER`, `PARTITION`. `ROW_NUMBER/RANK/DENSE_RANK` siguen siendo
+  identificadores (como `SUM`), reconocidos por nombre (`isRankingFunc`).
+- **ast.go**: `WindowFunc{Func, Arg, PartitionBy, OrderBy}`; `Identifier.Window *WindowFunc`
+  (item de ventana = `Name:""`, `Alias: salida`); `Select.Qualify *WhereClause`;
+  `WhereClause.Leaves()`. Campos nuevos → gob backward-compat.
+- **parser**: `parseWindowCall` (`FUNC(arg) [OVER (...)]`, anidado `SUM(SUM(x)) OVER ()`),
+  `parseColumnRef`/`parseColumnRefList` (columna o texto de agregado; usados por GROUP BY,
+  ORDER BY, PARTITION BY y hojas de QUALIFY) y `parseQualifyClause` (flag `p.inQualify` que
+  permite ventanas/agregados en `parseWherePredicate`; errores dicen `QUALIFY`). En
+  `parseSelectItem` la rama de agregados delega en `parseWindowCall`. Beneficio colateral:
+  `ORDER BY SUM(monto) DESC` ahora parsea (antes rompía).
+- **executor — pipeline unificado** (`select_pipeline.go`, nuevo): `rowset{cols,rows,qualified}`
+  + `finishSelect` = `groupRows` → `computeWindows` → QUALIFY (`evalWhere`) → ORDER BY
+  (`queryutil.SortRowsByKeys`) → `projectRows` → DISTINCT → LIMIT. Las rutas tabla-simple y JOIN
+  solo producen el rowset post-WHERE y delegan. Eliminadas `executeSelectStar`, `projectColumns`,
+  `executeGroupedSelect`, `aggregateAllRows`, `aggregateByGroups`, `joinVirtualTable`,
+  `applyJoinOrderBy`, `hasAggregates`, `colSpec` (salda la duplicación de `REFACTOR.md`).
+  `groupRows` emite las columnas del select-list (name=alias, `expr`=texto fuente) más columnas
+  **ocultas** para agregados/columnas que ventanas, QUALIFY u ORDER BY referencian sin proyectar.
+- **executor/window.go** (nuevo): `evalWindow` particiona por clave `%v` (mismo criterio que
+  GROUP BY), ordena índices con `queryutil.CompareByKeys`, detecta pares; ranking + agregados
+  con frame por defecto (`RANGE UNBOUNDED PRECEDING → CURRENT ROW`, acumulado con pares).
+  Las ventanas inline de QUALIFY se materializan como columnas ocultas `__qualify_N` y el
+  predicado se **copia** con `substituteLeaves` (el AST de una vista es compartido: no mutar).
+  Filas ampliadas con slices nuevos (las de origen pueden compartir backing array).
+- **queryutil**: `OrderKey`, `CompareByKeys`, `SortRowsByKeys` (estable); `ApplyOrderBy` delega.
+- **GUI** (`editor.js`): modo SQL con keywords extra (`sqlMode()` sobre `resolveMode`, sin
+  tocar el vendor), snippets `ROW_NUMBER() OVER (...)`/`QUALIFY`, keywords en `aliasTables`.
+
+**Cambios de comportamiento a conocer**:
+- `ORDER BY` de columna inexistente ahora **falla** (`ORDER BY: column X not found`); antes se
+  ignoraba en silencio. Acepta alias del SELECT y texto de agregado.
+- `resolveJoinColumn` sin calificar: mensaje `column X not found` (antes "…in either table").
+- Ventanas en `WHERE` no están permitidas (error de parseo), como en el estándar.
+
+**Verificación**: `go build/vet/test ./internal/...` ✅; `parser_test.go` +8 tests;
+`cmd/test-qualify` (40 casos: ranking/pares, agregados OVER con y sin ORDER BY, QUALIFY alias/
+inline/compuesto/`SELECT *`/DISTINCT/LIMIT, GROUP BY con agregado proyectado y no proyectado,
+`SUM(SUM(x)) OVER ()`, JOIN calificado, CTE, vista re-ejecutada, errores) ✅; regresión de
+integración de SELECT ✅.
+
+**Revisión de código (8 ángulos) y correcciones aplicadas antes del commit**:
+- Proyección **posicional**: `selectItemIndexes` liga cada item del SELECT a su índice antes de
+  anexar ventanas (un alias igual a una columna base ya no la sombrea; `SELECT monto,
+  ROW_NUMBER() ... AS monto` devolvía el número de fila en ambas columnas). Las ventanas de
+  QUALIFY se resuelven por índice (`hidden` map), no por nombre `__qualify_N`.
+- Reglas estrictas: un agregado solo en ORDER BY/QUALIFY/OVER sin GROUP BY ni agregado en el
+  SELECT es error (antes colapsaba la consulta a una fila); una columna no agrupada referenciada
+  fuera del SELECT en consulta agrupada es error `must appear in GROUP BY` (antes tomaba el
+  primer valor del grupo y `SUM(monto) OVER (PARTITION BY categoria)` sobre GROUP BY daba
+  cifras falsas). La leniencia "primer valor" se conserva solo para el select-list.
+- `errAmbiguousColumn` (sentinel): la ambigüedad en JOIN se reporta aunque otro item haya
+  activado `AllowMissing`; `GROUP BY` envuelve el error real con `%w`.
+- `ROW_NUMBER() OVER () * 2` → placeholder NULL (antes descartaba el `* 2` en silencio);
+  `ORDER BY` sobre alias de placeholder se ignora en vez de fallar.
+- `evalWindow` con acumulador incremental (`windowAccumulator`): lineal en vez de O(n²).
+- Memoización del `resolve` de QUALIFY por consulta; proyección identidad sin copiar filas.
+- GUI: MIME propio `text/x-focusdb` (`CodeMirror.defineMIME`) compartido por `editor.js` y
+  `tabs.js` — antes las pestañas nuevas perdían el resaltado de QUALIFY/OVER.
+- Limpieza: `queryutil.ApplyOrderBy` eliminado (sin llamadores); `parseSelect` usa
+  `isFunctionCallStart`. Documentado en README que QUALIFY/OVER/PARTITION son reservadas.
+
+**Fuera de alcance / follow-ups**: `HAVING` (filtro post-`groupRows`, misma infraestructura),
+`LAG/LEAD/NTILE/FIRST_VALUE`, frames explícitos `ROWS/RANGE BETWEEN`, `SELECT *, ventana`
+(limitación previa del parser con `*`), cláusula `WINDOW w AS (...)`.

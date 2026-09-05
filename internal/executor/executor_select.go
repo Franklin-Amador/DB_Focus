@@ -16,15 +16,6 @@ func init() {
 	registerExec((*Executor).executeSelectFunction)
 }
 
-// colSpec represents a column specification for GROUP BY queries
-type colSpec struct {
-	isAggregate bool
-	aggFunc     string
-	colIdx      int
-	name        string
-	alias       string
-}
-
 // executeSelect executes a SELECT statement, handling CTEs (WITH clause) and delegating to specialized handlers.
 func (e *Executor) executeSelect(ctx context.Context, stmt *ast.Select) (*Result, error) {
 	// Check context cancellation
@@ -114,24 +105,16 @@ func (e *Executor) executeSelectFromTable(ctx context.Context, stmt *ast.Select,
 		return nil, err
 	}
 
-	// Fetch rows
+	// FROM + WHERE (index fast-path for single equality predicates).
 	rows, err := e.fetchRows(table, stmt.Where)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check for aggregates or GROUP BY
-	if e.hasAggregates(stmt) || len(stmt.GroupBy) > 0 {
-		return e.executeGroupedSelect(ctx, stmt, table, rows)
-	}
-
-	// Handle SELECT *
-	if stmt.Star {
-		return e.executeSelectStar(table, rows, stmt)
-	}
-
-	// Project specific columns
-	return e.projectColumns(table, rows, stmt)
+	// Every later stage (grouping, windows, QUALIFY, ORDER BY, projection)
+	// runs on the shared pipeline.
+	rs := &rowset{cols: joinColsFor(stmt.Table.Name, table.Columns), rows: rows}
+	return e.finishSelect(ctx, stmt, rs)
 }
 
 // executeSelectNoTable handles SELECT without FROM clause.
@@ -153,255 +136,17 @@ func (e *Executor) executeSelectNoTable(stmt *ast.Select) (*Result, error) {
 	}, nil
 }
 
-// executeSelectStar handles SELECT * queries.
-func (e *Executor) executeSelectStar(table *catalog.Table, rows [][]interface{}, stmt *ast.Select) (*Result, error) {
-	columns := make([]string, len(table.Columns))
-	for i, col := range table.Columns {
-		columns[i] = col.Name
-	}
-
-	// Apply DISTINCT
-	if stmt.Distinct {
-		rows = queryutil.RemoveDuplicateRows(rows)
-	}
-
-	// Apply ORDER BY
-	if len(stmt.OrderBy) > 0 {
-		rows = queryutil.ApplyOrderBy(rows, stmt.OrderBy, table.Columns)
-	}
-
-	// Apply LIMIT/OFFSET
-	rows = queryutil.ApplyLimitOffset(rows, stmt.Limit, stmt.Offset)
-
-	return &Result{
-		Columns: columns,
-		Rows:    rows,
-		Tag:     constants.ResultSelectTag(len(rows)),
-	}, nil
-}
-
-// projectColumns projects specific columns from rows.
-func (e *Executor) projectColumns(table *catalog.Table, rows [][]interface{}, stmt *ast.Select) (*Result, error) {
-	colIdxs := make([]int, len(stmt.Columns))
-	columns := make([]string, len(stmt.Columns))
-
-	for i, id := range stmt.Columns {
-		outputName := id.Name
-		if id.Alias != "" {
-			outputName = id.Alias
-		}
-		columns[i] = outputName
-
-		if id.Name == "" {
-			if !stmt.AllowMissing {
-				return nil, fmt.Errorf("column %s not found", outputName)
-			}
-			colIdxs[i] = -1
-			continue
-		}
-
-		qualifier, colName := queryutil.SplitQualified(id.Name)
-		if qualifier != "" && !strings.EqualFold(qualifier, stmt.Table.Name) {
-			return nil, fmt.Errorf("unknown table %s in column %s", qualifier, id.Name)
-		}
-
-		colIdx := queryutil.IndexOfColumn(table.Columns, colName)
-		if colIdx == -1 && !stmt.AllowMissing {
-			return nil, fmt.Errorf("column %s not found", outputName)
-		}
-		colIdxs[i] = colIdx
-	}
-
-	// Apply ORDER BY on the full rows before projecting, using the table's
-	// column schema. This mirrors the SELECT * path and lets ORDER BY reference
-	// any table column, not only projected ones. (Projecting first would leave
-	// ApplyOrderBy resolving column indexes against a mismatched schema.)
-	if len(stmt.OrderBy) > 0 {
-		rows = queryutil.ApplyOrderBy(rows, stmt.OrderBy, table.Columns)
-	}
-
-	projected := make([][]interface{}, 0, len(rows))
-	for _, row := range rows {
-		out := make([]interface{}, len(colIdxs))
-		for i, idx := range colIdxs {
-			if idx == -1 {
-				out[i] = nil
-				continue
-			}
-			out[i] = row[idx]
-		}
-		projected = append(projected, out)
-	}
-
-	// Apply DISTINCT
-	if stmt.Distinct {
-		projected = queryutil.RemoveDuplicateRows(projected)
-	}
-
-	// Apply LIMIT/OFFSET
-	projected = queryutil.ApplyLimitOffset(projected, stmt.Limit, stmt.Offset)
-
-	return &Result{
-		Columns: columns,
-		Rows:    projected,
-		Tag:     constants.ResultSelectTag(len(projected)),
-	}, nil
-}
-
-// executeGroupedSelect handles GROUP BY and aggregate functions.
-func (e *Executor) executeGroupedSelect(ctx context.Context, stmt *ast.Select, table *catalog.Table, rows [][]interface{}) (*Result, error) {
-	// Check context cancellation
-	if err := checkCtx(ctx); err != nil {
-		return nil, err
-	}
-
-	colSpecs := make([]colSpec, len(stmt.Columns))
-	columns := make([]string, len(stmt.Columns))
-
-	// Parse columns
-	for i, col := range stmt.Columns {
-		outputName := col.Name
-		if col.Alias != "" {
-			outputName = col.Alias
-		}
-		columns[i] = outputName
-		colSpecs[i].alias = outputName
-
-		if fn, arg, ok := parseAggregate(col.Name); ok {
-			colSpecs[i].isAggregate = true
-			colSpecs[i].aggFunc = fn
-			if arg == "" || arg == "*" {
-				colSpecs[i].colIdx = -1
-			} else {
-				colIdx := queryutil.IndexOfColumn(table.Columns, arg)
-				if colIdx == -1 {
-					return nil, fmt.Errorf("column %s not found", arg)
-				}
-				colSpecs[i].colIdx = colIdx
-			}
-		} else {
-			// Regular column
-			colIdx := queryutil.IndexOfColumn(table.Columns, col.Name)
-			if colIdx == -1 {
-				return nil, fmt.Errorf("column %s not found", col.Name)
-			}
-			colSpecs[i].colIdx = colIdx
-			colSpecs[i].name = col.Name
-		}
-	}
-
-	// No GROUP BY: aggregate all rows
-	if len(stmt.GroupBy) == 0 {
-		return e.aggregateAllRows(columns, colSpecs, rows), nil
-	}
-
-	// GROUP BY: aggregate by groups
-	return e.aggregateByGroups(ctx, stmt, table, columns, colSpecs, rows)
-}
-
-// aggregateAllRows aggregates all rows without grouping.
-func (e *Executor) aggregateAllRows(columns []string, colSpecs []colSpec, rows [][]interface{}) *Result {
-	resultRow := make([]interface{}, len(colSpecs))
-	for i, spec := range colSpecs {
-		if spec.isAggregate {
-			resultRow[i] = computeAggregate(spec.aggFunc, rows, spec.colIdx)
-		} else {
-			// Non-aggregate column: take first value
-			if len(rows) > 0 && spec.colIdx >= 0 {
-				resultRow[i] = rows[0][spec.colIdx]
-			} else {
-				resultRow[i] = nil
-			}
-		}
-	}
-
-	return &Result{
-		Columns: columns,
-		Rows:    [][]interface{}{resultRow},
-		Tag:     constants.ResultSelectTag(1),
-	}
-}
-
-// aggregateByGroups aggregates rows by GROUP BY columns.
-func (e *Executor) aggregateByGroups(ctx context.Context, stmt *ast.Select, table *catalog.Table, columns []string, colSpecs []colSpec, rows [][]interface{}) (*Result, error) {
-	// Build GROUP BY column indexes
-	groupByIdxs := make([]int, len(stmt.GroupBy))
-	for i, gbCol := range stmt.GroupBy {
-		idx := queryutil.IndexOfColumn(table.Columns, gbCol.Name)
-		if idx == -1 {
-			return nil, fmt.Errorf("GROUP BY column %s not found", gbCol.Name)
-		}
-		groupByIdxs[i] = idx
-	}
-
-	// Group rows
-	type groupKey struct {
-		values string
-	}
-	groups := make(map[groupKey][][]interface{})
-	groupOrder := []groupKey{}
-
-	for _, row := range rows {
-		keyVals := make([]interface{}, len(groupByIdxs))
-		for i, idx := range groupByIdxs {
-			keyVals[i] = row[idx]
-		}
-		key := groupKey{values: fmt.Sprintf("%v", keyVals)}
-		if _, exists := groups[key]; !exists {
-			groupOrder = append(groupOrder, key)
-			groups[key] = [][]interface{}{}
-		}
-		groups[key] = append(groups[key], row)
-	}
-
-	// Generate result rows
-	resultRows := [][]interface{}{}
-	for _, key := range groupOrder {
-		groupRows := groups[key]
-		resultRow := make([]interface{}, len(colSpecs))
-
-		for i, spec := range colSpecs {
-			if spec.isAggregate {
-				resultRow[i] = computeAggregate(spec.aggFunc, groupRows, spec.colIdx)
-			} else {
-				// Non-aggregate column: take first value from group
-				if len(groupRows) > 0 && spec.colIdx >= 0 {
-					resultRow[i] = groupRows[0][spec.colIdx]
-				} else {
-					resultRow[i] = nil
-				}
-			}
-		}
-		resultRows = append(resultRows, resultRow)
-	}
-
-	// Create temporary columns for ORDER BY
-	tempCols := make([]catalog.Column, len(columns))
-	for i, colName := range columns {
-		tempCols[i] = catalog.Column{Name: colName, Type: "TEXT"}
-	}
-
-	// Apply ORDER BY
-	if len(stmt.OrderBy) > 0 {
-		resultRows = queryutil.ApplyOrderBy(resultRows, stmt.OrderBy, tempCols)
-	}
-
-	// Apply LIMIT/OFFSET
-	resultRows = queryutil.ApplyLimitOffset(resultRows, stmt.Limit, stmt.Offset)
-
-	return &Result{
-		Columns: columns,
-		Rows:    resultRows,
-		Tag:     constants.ResultSelectTag(len(resultRows)),
-	}, nil
-}
-
-// joinColumn identifies a column in the accumulated (joined) row: its owning
-// table reference (alias or name) and the column name/type.
+// joinColumn describes one column of a rowset flowing through the SELECT
+// pipeline: its owning table reference (alias or name; empty for computed
+// columns such as aggregates and window functions), the column/output name,
+// its type, the canonical source expression when the column was computed
+// from one (e.g. "SUM(monto)"), and whether SELECT * should hide it.
 type joinColumn struct {
-	ref  string
-	name string
-	typ  string
+	ref    string
+	name   string
+	typ    string
+	expr   string
+	hidden bool
 }
 
 // executeJoinSelect handles JOIN queries, including chains of N joins
@@ -462,69 +207,7 @@ func (e *Executor) executeJoinSelect(ctx context.Context, stmt *ast.Select) (*Re
 		accRows = filtered
 	}
 
-	// Aggregates / GROUP BY over the joined rows (virtual table carries "ref.name").
-	if e.hasAggregates(stmt) || len(stmt.GroupBy) > 0 {
-		return e.executeGroupedSelect(ctx, stmt, joinVirtualTable(accCols, accRows), accRows)
-	}
-
-	// ORDER BY on the full joined rows (qualified or unique-unqualified refs).
-	if len(stmt.OrderBy) > 0 {
-		accRows = applyJoinOrderBy(accRows, stmt.OrderBy, accCols)
-	}
-
-	// SELECT * : emit every joined column as "ref.name".
-	if stmt.Star {
-		columns := make([]string, len(accCols))
-		for i, c := range accCols {
-			columns[i] = c.ref + "." + c.name
-		}
-		rows := accRows
-		if stmt.Distinct {
-			rows = queryutil.RemoveDuplicateRows(rows)
-		}
-		rows = queryutil.ApplyLimitOffset(rows, stmt.Limit, stmt.Offset)
-		return &Result{Columns: columns, Rows: rows, Tag: constants.ResultSelectTag(len(rows))}, nil
-	}
-
-	// Project specific columns.
-	columns := make([]string, len(stmt.Columns))
-	colIdxs := make([]int, len(stmt.Columns))
-	for i, id := range stmt.Columns {
-		outputName := id.Name
-		if id.Alias != "" {
-			outputName = id.Alias
-		}
-		columns[i] = outputName
-		if id.Name == "" {
-			if !stmt.AllowMissing {
-				return nil, fmt.Errorf("column %s not found", outputName)
-			}
-			colIdxs[i] = -1
-			continue
-		}
-		idx, err := resolveJoinColumn(accCols, id.Name)
-		if err != nil {
-			return nil, err
-		}
-		colIdxs[i] = idx
-	}
-	projected := make([][]interface{}, 0, len(accRows))
-	for _, row := range accRows {
-		out := make([]interface{}, len(colIdxs))
-		for i, idx := range colIdxs {
-			if idx < 0 || idx >= len(row) {
-				out[i] = nil
-				continue
-			}
-			out[i] = row[idx]
-		}
-		projected = append(projected, out)
-	}
-	if stmt.Distinct {
-		projected = queryutil.RemoveDuplicateRows(projected)
-	}
-	projected = queryutil.ApplyLimitOffset(projected, stmt.Limit, stmt.Offset)
-	return &Result{Columns: columns, Rows: projected, Tag: constants.ResultSelectTag(len(projected))}, nil
+	return e.finishSelect(ctx, stmt, &rowset{cols: accCols, rows: accRows, qualified: true})
 }
 
 // refName returns the reference used to qualify a table's columns (alias if set).
@@ -567,13 +250,13 @@ func resolveJoinColumn(cols []joinColumn, ref string) (int, error) {
 	for i, c := range cols {
 		if strings.EqualFold(c.name, colName) {
 			if found != -1 {
-				return -1, fmt.Errorf("ambiguous column reference %s (exists in multiple tables)", colName)
+				return -1, fmt.Errorf("%w %s (exists in multiple tables)", errAmbiguousColumn, colName)
 			}
 			found = i
 		}
 	}
 	if found == -1 {
-		return -1, fmt.Errorf("column %s not found in either table", colName)
+		return -1, fmt.Errorf("column %s not found", colName)
 	}
 	return found, nil
 }
@@ -776,31 +459,6 @@ func concatRow(l, r []interface{}) []interface{} {
 	return out
 }
 
-func joinVirtualTable(cols []joinColumn, rows [][]interface{}) *catalog.Table {
-	cc := make([]catalog.Column, len(cols))
-	for i, c := range cols {
-		cc[i] = catalog.Column{Name: c.ref + "." + c.name, Type: c.typ}
-	}
-	return &catalog.Table{Name: "__join_virtual__", Columns: cc, Rows: rows}
-}
-
-// applyJoinOrderBy sorts joined rows, rewriting each ORDER BY column to its
-// qualified "ref.name" form so queryutil.ApplyOrderBy (exact-name match) resolves it.
-func applyJoinOrderBy(rows [][]interface{}, orderBy []ast.OrderByClause, cols []joinColumn) [][]interface{} {
-	cc := make([]catalog.Column, len(cols))
-	for i, c := range cols {
-		cc[i] = catalog.Column{Name: c.ref + "." + c.name, Type: c.typ}
-	}
-	rewritten := make([]ast.OrderByClause, len(orderBy))
-	for i, ob := range orderBy {
-		rewritten[i] = ob
-		if idx := firstJoinColumnMatch(cols, ob.Column.Name); idx >= 0 {
-			rewritten[i].Column = ast.Identifier{Name: cc[idx].Name}
-		}
-	}
-	return queryutil.ApplyOrderBy(rows, rewritten, cc)
-}
-
 // Helper functions
 
 func (e *Executor) cleanupCTEs(cteTables []string) {
@@ -842,15 +500,6 @@ func (e *Executor) fetchRows(table *catalog.Table, where *ast.WhereClause) ([][]
 		}
 	}
 	return filtered, nil
-}
-
-func (e *Executor) hasAggregates(stmt *ast.Select) bool {
-	for _, col := range stmt.Columns {
-		if _, _, ok := parseAggregate(col.Name); ok {
-			return true
-		}
-	}
-	return false
 }
 
 // executeSelectFunction handles special SELECT function calls (e.g., pg_catalog queries).

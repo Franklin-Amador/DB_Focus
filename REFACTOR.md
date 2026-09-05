@@ -66,7 +66,7 @@ en 9 archivos, que además hace de motor de grafo de FKs y registro de usuarios.
 El patrón (marker interfaces) es bueno; la expresividad no:
 - `WhereClause` = un solo `Column = Value`: sin AND/OR, sin operadores `<`/`>`/`LIKE`, sin expresiones.
 - `Insert.Values` = una fila; `Update` = una columna; `JoinClause` = una igualdad.
-- Agregados por `strings.HasPrefix(..., "COUNT(")`: no hay SUM/AVG/MIN/MAX ni HAVING.
+- Agregados detectados por texto (`parseAggregate`); hay COUNT/SUM/AVG/MIN/MAX, ventanas (`OVER`) y `QUALIFY`, pero no `HAVING` (encajaría como filtro post-`groupRows` en `select_pipeline.go`).
 - `catalog → ast` fuerza `gob.Register` de nodos AST → cambiar un nodo rompe datos en disco.
 
 ### 🟡 6. `validator` desconectado y con lógica triplicada
@@ -75,7 +75,7 @@ Solo lo usa el executor (el parser no valida). Existencia de columnas chequeada 
 
 ### 🟢 7. Otros focos internos
 - `parseSelectItem` (~150 líneas) con 6 flags booleanos e inferencia de alias por heurística.
-- Rutas JOIN vs no-JOIN duplican DISTINCT+ORDER BY+LIMIT en 4 lugares; 4 JOINs O(n·m) casi idénticos.
+- ~~Rutas JOIN vs no-JOIN duplican DISTINCT+ORDER BY+LIMIT en 4 lugares~~ (resuelto: `finishSelect` en `executor/select_pipeline.go` es el único post-procesado); 4 JOINs O(n·m) casi idénticos.
 - Password hardcodeado `"4444"` en `server/conn.go`.
 
 ---

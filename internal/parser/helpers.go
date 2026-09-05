@@ -249,8 +249,11 @@ func (p *Parser) parseWhereAnd() (*ast.WhereClause, error) {
 }
 
 // parseWherePredicate parses a parenthesized sub-expression or a single
-// `column OP literal` comparison (the leaf).
+// `column OP literal` comparison (the leaf). Inside QUALIFY the left operand
+// may also be an aggregate expression (SUM(x)) or a window-function call
+// (ROW_NUMBER() OVER (...)).
 func (p *Parser) parseWherePredicate() (*ast.WhereClause, error) {
+	clause := p.predicateClauseName()
 	if p.cur.Type == TokenLParen {
 		p.next()
 		inner, err := p.parseWhereOr()
@@ -258,19 +261,32 @@ func (p *Parser) parseWherePredicate() (*ast.WhereClause, error) {
 			return nil, err
 		}
 		if !p.expect(TokenRParen) {
-			return nil, p.errorf("expected ) in WHERE")
+			return nil, p.errorf("expected ) in %s", clause)
 		}
 		return inner, nil
 	}
 
-	if p.cur.Type != TokenIdent {
-		return nil, p.errorf("expected column in WHERE")
+	var col ast.Identifier
+	switch {
+	case p.inQualify && p.isFunctionCallStart():
+		w, text, err := p.parseWindowCall()
+		if err != nil {
+			return nil, err
+		}
+		if w != nil {
+			col = ast.Identifier{Window: w}
+		} else {
+			col = ast.Identifier{Name: text}
+		}
+	case p.cur.Type == TokenIdent:
+		col = ast.Identifier{Name: p.cur.Literal}
+		p.next()
+	default:
+		return nil, p.errorf("expected column in %s", clause)
 	}
-	col := ast.Identifier{Name: p.cur.Literal}
-	p.next()
 	op, ok := whereOperator(p.cur.Type)
 	if !ok {
-		return nil, p.errorf("expected comparison operator (=, <>, <, >, <=, >=) in WHERE")
+		return nil, p.errorf("expected comparison operator (=, <>, <, >, <=, >=) in %s", clause)
 	}
 	p.next()
 	lit, err := p.parseLiteral()
@@ -278,6 +294,164 @@ func (p *Parser) parseWherePredicate() (*ast.WhereClause, error) {
 		return nil, err
 	}
 	return &ast.WhereClause{Column: col, Operator: op, Value: lit}, nil
+}
+
+// predicateClauseName names the clause whose predicate is being parsed, for
+// error messages.
+func (p *Parser) predicateClauseName() string {
+	if p.inQualify {
+		return "QUALIFY"
+	}
+	return "WHERE"
+}
+
+// parseQualifyClause parses an optional QUALIFY predicate. The predicate tree
+// is the same as WHERE, but leaves may reference window functions (inline or
+// by alias) and aggregate expressions.
+func (p *Parser) parseQualifyClause() (*ast.WhereClause, error) {
+	if p.cur.Type != TokenQualify {
+		return nil, nil
+	}
+	p.next()
+	p.inQualify = true
+	defer func() { p.inQualify = false }()
+	return p.parseWhereOr()
+}
+
+// isFunctionCallStart reports whether the current token starts an aggregate or
+// ranking function call: FUNC followed by "(".
+func (p *Parser) isFunctionCallStart() bool {
+	if p.peek.Type != TokenLParen {
+		return false
+	}
+	if p.cur.Type == TokenCount {
+		return true
+	}
+	if p.cur.Type != TokenIdent {
+		return false
+	}
+	upper := strings.ToUpper(p.cur.Literal)
+	return isAggregateFunc(upper) || isRankingFunc(upper)
+}
+
+// parseColumnRef parses a column reference usable in ORDER BY / PARTITION BY /
+// GROUP BY: either a plain (possibly qualified) identifier or an aggregate call
+// such as SUM(monto), which is kept as canonical text so the executor can match
+// it against the select list.
+func (p *Parser) parseColumnRef(clause string) (ast.Identifier, error) {
+	if p.isFunctionCallStart() {
+		w, text, err := p.parseWindowCall()
+		if err != nil {
+			return ast.Identifier{}, err
+		}
+		if w != nil {
+			return ast.Identifier{}, p.errorf("window functions are not allowed in %s", clause)
+		}
+		return ast.Identifier{Name: text}, nil
+	}
+	if p.cur.Type != TokenIdent {
+		return ast.Identifier{}, p.errorf("expected column name in %s", clause)
+	}
+	id := ast.Identifier{Name: p.cur.Literal}
+	p.next()
+	return id, nil
+}
+
+// parseColumnRefList parses a comma-separated list of column references.
+func (p *Parser) parseColumnRefList(clause string) ([]ast.Identifier, error) {
+	var out []ast.Identifier
+	for {
+		id, err := p.parseColumnRef(clause)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+		if p.cur.Type != TokenComma {
+			break
+		}
+		p.next()
+	}
+	return out, nil
+}
+
+// parseWindowCall parses FUNC(arg) and, when followed by OVER, the window
+// specification. The current token must be the function name and peek "(".
+//
+// It returns (window, text, err): window is non-nil for a window-function call;
+// otherwise text holds the canonical aggregate expression ("SUM(monto)",
+// "COUNT(*)") for a plain aggregate.
+func (p *Parser) parseWindowCall() (*ast.WindowFunc, string, error) {
+	funcName := p.cur.Literal
+	upper := strings.ToUpper(funcName)
+	p.next() // function name
+	if !p.expect(TokenLParen) {
+		return nil, "", p.errorf("expected ( after %s", funcName)
+	}
+
+	arg := ""
+	switch {
+	case p.cur.Type == TokenStar:
+		arg = "*"
+		p.next()
+	case p.cur.Type == TokenRParen:
+		// no argument (ranking functions)
+	case p.isFunctionCallStart():
+		// nested aggregate, e.g. SUM(SUM(monto)) OVER () on grouped rows
+		w, text, err := p.parseWindowCall()
+		if err != nil {
+			return nil, "", err
+		}
+		if w != nil {
+			return nil, "", p.errorf("window function calls cannot be nested")
+		}
+		arg = text
+	case p.cur.Type == TokenIdent:
+		arg = p.cur.Literal
+		p.next()
+	default:
+		return nil, "", p.errorf("unexpected %s in %s(...) argument", p.cur.Type, funcName)
+	}
+	if !p.expect(TokenRParen) {
+		return nil, "", p.errorf("expected ) after %s argument", funcName)
+	}
+
+	if isRankingFunc(upper) && arg != "" {
+		return nil, "", p.errorf("%s takes no arguments", upper)
+	}
+
+	text := funcName + "(" + arg + ")"
+	if p.cur.Type != TokenOver {
+		if isRankingFunc(upper) {
+			return nil, "", p.errorf("%s requires an OVER clause", upper)
+		}
+		return nil, text, nil
+	}
+	p.next() // OVER
+
+	w := &ast.WindowFunc{Func: upper, Arg: arg}
+	if !p.expect(TokenLParen) {
+		return nil, "", p.errorf("expected ( after OVER")
+	}
+	if p.cur.Type == TokenPartition {
+		p.next()
+		if !p.expect(TokenBy) {
+			return nil, "", p.errorf("expected BY after PARTITION")
+		}
+		parts, err := p.parseColumnRefList("PARTITION BY")
+		if err != nil {
+			return nil, "", err
+		}
+		w.PartitionBy = parts
+	}
+	ob, err := p.parseOrderByClause()
+	if err != nil {
+		return nil, "", err
+	}
+	w.OrderBy = ob
+	if !p.expect(TokenRParen) {
+		return nil, "", p.errorf("expected ) to close OVER clause")
+	}
+	return w, "", nil
 }
 
 // sliceFrom returns the original source text from byte offset start up to the
@@ -305,6 +479,16 @@ func isAggregateFunc(upper string) bool {
 	return false
 }
 
+// isRankingFunc reports whether an (already upper-cased) identifier is a
+// ranking window function (one that only makes sense with OVER).
+func isRankingFunc(upper string) bool {
+	switch upper {
+	case "ROW_NUMBER", "RANK", "DENSE_RANK":
+		return true
+	}
+	return false
+}
+
 // whereOperator maps a comparison token to its canonical operator string,
 // reporting whether the token is a recognized comparison operator.
 func whereOperator(t TokenType) (string, bool) {
@@ -326,26 +510,14 @@ func whereOperator(t TokenType) (string, bool) {
 }
 
 func (p *Parser) parseGroupByClause() ([]ast.Identifier, error) {
-	var groupBy []ast.Identifier
 	if p.cur.Type != TokenGroup {
-		return groupBy, nil
+		return nil, nil
 	}
 	p.next()
 	if !p.expect(TokenBy) {
 		return nil, p.errorf("expected BY after GROUP")
 	}
-	for {
-		if p.cur.Type != TokenIdent {
-			return nil, p.errorf("expected column name in GROUP BY")
-		}
-		groupBy = append(groupBy, ast.Identifier{Name: p.cur.Literal})
-		p.next()
-		if p.cur.Type != TokenComma {
-			break
-		}
-		p.next()
-	}
-	return groupBy, nil
+	return p.parseColumnRefList("GROUP BY")
 }
 
 func (p *Parser) parseOrderByClause() ([]ast.OrderByClause, error) {
@@ -358,11 +530,11 @@ func (p *Parser) parseOrderByClause() ([]ast.OrderByClause, error) {
 		return nil, p.errorf("expected BY after ORDER")
 	}
 	for {
-		if p.cur.Type != TokenIdent {
-			return nil, p.errorf("expected column name in ORDER BY")
+		col, err := p.parseColumnRef("ORDER BY")
+		if err != nil {
+			return nil, err
 		}
-		orderCol := ast.OrderByClause{Column: ast.Identifier{Name: p.cur.Literal}, Direction: "ASC"}
-		p.next()
+		orderCol := ast.OrderByClause{Column: col, Direction: "ASC"}
 		switch p.cur.Type {
 		case TokenAsc:
 			orderCol.Direction = "ASC"
@@ -424,8 +596,22 @@ func (p *Parser) parseSelectItem(depth *int, exprIdx int) (ast.Identifier, bool,
 	itemHasColumn := false
 	itemHasComplexExpr := false
 	expectAlias := false
+	var window *ast.WindowFunc
 
 	appendItem := func() ast.Identifier {
+		// A window call wrapped in a larger expression (ROW_NUMBER() OVER () * 2)
+		// is not supported: fall through to the NULL placeholder like any other
+		// unsupported expression instead of silently projecting the bare window.
+		if window != nil && itemHasComplexExpr {
+			window = nil
+		}
+		if window != nil {
+			outputName := alias
+			if outputName == "" {
+				outputName = fmt.Sprintf("expr%d", exprIdx)
+			}
+			return ast.Identifier{Alias: outputName, Window: window}
+		}
 		sourceName := ""
 		if itemHasColumn {
 			sourceName = lastIdent
@@ -525,32 +711,22 @@ func (p *Parser) parseSelectItem(depth *int, exprIdx int) (ast.Identifier, bool,
 				}
 			}
 
-			// Handle aggregate functions like COUNT(*), SUM(col), AVG/MIN/MAX(col)
-			if p.peek.Type == TokenLParen && (isAggregateFunc(upper) || p.cur.Type == TokenCount) {
-				funcName := lit
-				p.next() // consume function name
-				p.next() // consume (
-				*depth++
-
-				// Capture arguments
-				argStart := ""
-				switch p.cur.Type {
-				case TokenStar:
-					argStart = "*"
-					p.next()
-				case TokenIdent:
-					argStart = p.cur.Literal
-					p.next()
+			// Aggregate calls (COUNT(*), SUM(col), ...) and window-function calls
+			// (ROW_NUMBER() OVER (...), SUM(col) OVER (...)).
+			if p.isFunctionCallStart() {
+				w, text, err := p.parseWindowCall()
+				if err != nil {
+					return ast.Identifier{}, false, false, err
 				}
-
-				if p.cur.Type == TokenRParen {
-					*depth--
-					p.next()
-					lastIdent = funcName + "(" + argStart + ")"
+				if w != nil {
+					window = w
 					itemHasExpr = true
-					itemHasColumn = true
 					continue
 				}
+				lastIdent = text
+				itemHasExpr = true
+				itemHasColumn = true
+				continue
 			}
 
 			lastIdent = lit

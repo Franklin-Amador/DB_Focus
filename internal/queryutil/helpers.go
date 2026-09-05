@@ -173,55 +173,57 @@ func RemoveDuplicateRows(rows [][]interface{}) [][]interface{} {
 	return result
 }
 
-// ApplyOrderBy sorts rows based on ORDER BY clause
-func ApplyOrderBy(rows [][]interface{}, orderBy []ast.OrderByClause, columns []catalog.Column) [][]interface{} {
-	if len(orderBy) == 0 || len(rows) == 0 {
+// OrderKey is a resolved ORDER BY term: the row index to compare and its
+// direction. Callers resolve column names to indexes themselves, which lets the
+// same comparator serve ORDER BY, window partitions and peer detection.
+type OrderKey struct {
+	Index int
+	Desc  bool
+}
+
+// CompareByKeys orders two rows by the given keys and returns -1, 0 or 1.
+// NULL sorts before every other value in ascending order (and therefore after
+// them in descending order). Rows that are equal on every key compare 0, which
+// window functions use to detect peers.
+func CompareByKeys(a, b []interface{}, keys []OrderKey) int {
+	for _, k := range keys {
+		if k.Index < 0 || k.Index >= len(a) || k.Index >= len(b) {
+			continue
+		}
+		va, vb := a[k.Index], b[k.Index]
+		var cmp int
+		switch {
+		case va == nil && vb == nil:
+			continue
+		case va == nil:
+			cmp = -1
+		case vb == nil:
+			cmp = 1
+		default:
+			cmp = compareValues(va, vb)
+		}
+		if cmp == 0 {
+			continue
+		}
+		if k.Desc {
+			return -cmp
+		}
+		return cmp
+	}
+	return 0
+}
+
+// SortRowsByKeys returns a stably sorted copy of rows ordered by keys.
+func SortRowsByKeys(rows [][]interface{}, keys []OrderKey) [][]interface{} {
+	if len(keys) == 0 || len(rows) == 0 {
 		return rows
 	}
-
-	// Create a copy to avoid modifying original
-	sortedRows := make([][]interface{}, len(rows))
-	copy(sortedRows, rows)
-
-	sort.Slice(sortedRows, func(i, j int) bool {
-		for _, order := range orderBy {
-			colIdx := IndexOfColumn(columns, order.Column.Name)
-			if colIdx == -1 {
-				continue // Skip if column not found
-			}
-
-			if colIdx >= len(sortedRows[i]) || colIdx >= len(sortedRows[j]) {
-				continue
-			}
-
-			valI := sortedRows[i][colIdx]
-			valJ := sortedRows[j][colIdx]
-
-			// Handle nil values (NULL sorts first)
-			switch {
-			case valI == nil && valJ == nil:
-				continue
-			case valI == nil:
-				return order.Direction == "ASC"
-			case valJ == nil:
-				return order.Direction == "DESC"
-			}
-
-			// Compare values based on type
-			cmp := compareValues(valI, valJ)
-			if cmp != 0 {
-				switch order.Direction {
-				case "DESC":
-					return cmp > 0
-				default:
-					return cmp < 0
-				}
-			}
-		}
-		return false // Equal
+	sorted := make([][]interface{}, len(rows))
+	copy(sorted, rows)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return CompareByKeys(sorted[i], sorted[j], keys) < 0
 	})
-
-	return sortedRows
+	return sorted
 }
 
 // compareValues compares two values and returns -1, 0, or 1

@@ -119,6 +119,9 @@ const (
 	TokenTo         TokenType = "TO"
 	TokenCascade    TokenType = "CASCADE"
 	TokenRestrict   TokenType = "RESTRICT"
+	TokenQualify    TokenType = "QUALIFY"
+	TokenOver       TokenType = "OVER"
+	TokenPartition  TokenType = "PARTITION"
 )
 
 type Token struct {
@@ -225,4 +228,7 @@ var keywords = map[string]TokenType{
 	"TO":         TokenTo,
 	"CASCADE":    TokenCascade,
 	"RESTRICT":   TokenRestrict,
+	"QUALIFY":    TokenQualify,
+	"OVER":       TokenOver,
+	"PARTITION":  TokenPartition,
 }

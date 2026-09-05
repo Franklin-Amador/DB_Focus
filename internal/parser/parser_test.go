@@ -493,3 +493,156 @@ func TestDropViewIfExistsCascade(t *testing.T) {
 		t.Fatalf("Expected Behavior=CASCADE, got %s", dv.Behavior)
 	}
 }
+
+// parseSelectT parses a single SELECT and fails the test on error.
+func parseSelectT(t *testing.T, input string) *ast.Select {
+	t.Helper()
+	p := NewParser(input)
+	stmt, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("parse %q: %v", input, err)
+	}
+	sel, ok := stmt.(*ast.Select)
+	if !ok {
+		t.Fatalf("expected *ast.Select, got %T", stmt)
+	}
+	return sel
+}
+
+func TestParseWindowFunction(t *testing.T) {
+	sel := parseSelectT(t, "SELECT categoria, monto, ROW_NUMBER() OVER (PARTITION BY categoria ORDER BY monto DESC) AS rn FROM ventas")
+	if len(sel.Columns) != 3 {
+		t.Fatalf("expected 3 columns, got %d", len(sel.Columns))
+	}
+	w := sel.Columns[2]
+	if w.Window == nil {
+		t.Fatalf("expected window column, got %+v", w)
+	}
+	if w.Alias != "rn" || w.Name != "" {
+		t.Errorf("expected alias rn and empty name, got name=%q alias=%q", w.Name, w.Alias)
+	}
+	if w.Window.Func != "ROW_NUMBER" || w.Window.Arg != "" {
+		t.Errorf("unexpected window func %+v", w.Window)
+	}
+	if len(w.Window.PartitionBy) != 1 || w.Window.PartitionBy[0].Name != "categoria" {
+		t.Errorf("unexpected partition by %+v", w.Window.PartitionBy)
+	}
+	if len(w.Window.OrderBy) != 1 || w.Window.OrderBy[0].Column.Name != "monto" || w.Window.OrderBy[0].Direction != "DESC" {
+		t.Errorf("unexpected order by %+v", w.Window.OrderBy)
+	}
+	if sel.Table.Name != "ventas" {
+		t.Errorf("expected table ventas, got %q", sel.Table.Name)
+	}
+	if sel.AllowMissing {
+		t.Errorf("window columns must not enable AllowMissing")
+	}
+}
+
+func TestParseAggregateOver(t *testing.T) {
+	sel := parseSelectT(t, "SELECT SUM(monto) OVER () total, COUNT(*) OVER (PARTITION BY categoria) AS n, SUM(monto) AS plain FROM ventas")
+	if len(sel.Columns) != 3 {
+		t.Fatalf("expected 3 columns, got %d", len(sel.Columns))
+	}
+	if sel.Columns[0].Window == nil || sel.Columns[0].Window.Func != "SUM" || sel.Columns[0].Window.Arg != "monto" || sel.Columns[0].Alias != "total" {
+		t.Errorf("unexpected first column %+v", sel.Columns[0])
+	}
+	if sel.Columns[1].Window == nil || sel.Columns[1].Window.Func != "COUNT" || sel.Columns[1].Window.Arg != "*" || len(sel.Columns[1].Window.PartitionBy) != 1 {
+		t.Errorf("unexpected second column %+v", sel.Columns[1])
+	}
+	if sel.Columns[2].Window != nil || sel.Columns[2].Name != "SUM(monto)" || sel.Columns[2].Alias != "plain" {
+		t.Errorf("plain aggregate must stay textual, got %+v", sel.Columns[2])
+	}
+}
+
+func TestParseQualifyAlias(t *testing.T) {
+	sel := parseSelectT(t, "SELECT categoria, ROW_NUMBER() OVER (PARTITION BY categoria ORDER BY monto DESC) AS rn FROM ventas QUALIFY rn <= 2 ORDER BY categoria LIMIT 5")
+	if sel.Qualify == nil || !sel.Qualify.IsLeaf() {
+		t.Fatalf("expected leaf QUALIFY, got %+v", sel.Qualify)
+	}
+	if sel.Qualify.Column.Name != "rn" || sel.Qualify.Operator != "<=" || sel.Qualify.Value.Value != "2" {
+		t.Errorf("unexpected QUALIFY leaf %+v", sel.Qualify)
+	}
+	if len(sel.OrderBy) != 1 || sel.Limit != 5 {
+		t.Errorf("clauses after QUALIFY not parsed: order=%+v limit=%d", sel.OrderBy, sel.Limit)
+	}
+}
+
+func TestParseQualifyInlineWindow(t *testing.T) {
+	sel := parseSelectT(t, "SELECT categoria, monto FROM ventas WHERE monto > 0 QUALIFY ROW_NUMBER() OVER (PARTITION BY categoria ORDER BY monto DESC) = 1 AND monto > 10")
+	if sel.Where == nil {
+		t.Fatalf("WHERE lost")
+	}
+	if sel.Qualify == nil || sel.Qualify.Conj != "AND" {
+		t.Fatalf("expected AND QUALIFY, got %+v", sel.Qualify)
+	}
+	left := sel.Qualify.Left
+	if left.Column.Window == nil || left.Column.Window.Func != "ROW_NUMBER" || left.Operator != "=" || left.Value.Value != "1" {
+		t.Errorf("unexpected inline window leaf %+v", left)
+	}
+	if sel.Qualify.Right.Column.Name != "monto" {
+		t.Errorf("unexpected right leaf %+v", sel.Qualify.Right)
+	}
+}
+
+func TestParseQualifyWithGroupBy(t *testing.T) {
+	sel := parseSelectT(t, "SELECT categoria, SUM(monto) AS total, RANK() OVER (ORDER BY SUM(monto) DESC) AS pos FROM ventas GROUP BY categoria QUALIFY pos <= 3")
+	if len(sel.GroupBy) != 1 || sel.GroupBy[0].Name != "categoria" {
+		t.Errorf("unexpected group by %+v", sel.GroupBy)
+	}
+	w := sel.Columns[2].Window
+	if w == nil || w.Func != "RANK" || len(w.OrderBy) != 1 || w.OrderBy[0].Column.Name != "SUM(monto)" || w.OrderBy[0].Direction != "DESC" {
+		t.Errorf("unexpected window over aggregate %+v", w)
+	}
+	if sel.Qualify == nil || sel.Qualify.Column.Name != "pos" {
+		t.Errorf("unexpected qualify %+v", sel.Qualify)
+	}
+}
+
+func TestParseOrderByAggregate(t *testing.T) {
+	sel := parseSelectT(t, "SELECT categoria, SUM(monto) FROM ventas GROUP BY categoria ORDER BY SUM(monto) DESC, categoria")
+	if len(sel.OrderBy) != 2 || sel.OrderBy[0].Column.Name != "SUM(monto)" || sel.OrderBy[0].Direction != "DESC" || sel.OrderBy[1].Column.Name != "categoria" {
+		t.Errorf("unexpected order by %+v", sel.OrderBy)
+	}
+}
+
+func TestParseQualifyAggregateLeaf(t *testing.T) {
+	sel := parseSelectT(t, "SELECT categoria FROM ventas GROUP BY categoria QUALIFY SUM(monto) > 100")
+	if sel.Qualify == nil || sel.Qualify.Column.Name != "SUM(monto)" || sel.Qualify.Column.Window != nil {
+		t.Errorf("unexpected qualify %+v", sel.Qualify)
+	}
+}
+
+func TestParseWindowInExpressionIsPlaceholder(t *testing.T) {
+	sel := parseSelectT(t, "SELECT ROW_NUMBER() OVER (ORDER BY id) * 2 AS x, monto FROM ventas")
+	if len(sel.Columns) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(sel.Columns))
+	}
+	first := sel.Columns[0]
+	if first.Window != nil || first.Name != "" || first.Alias != "x" {
+		t.Errorf("expected NULL placeholder for wrapped window, got %+v", first)
+	}
+	if !sel.AllowMissing {
+		t.Errorf("placeholder item must enable AllowMissing")
+	}
+	if sel.Columns[1].Name != "monto" {
+		t.Errorf("following item lost: %+v", sel.Columns[1])
+	}
+}
+
+func TestParseWindowErrors(t *testing.T) {
+	bad := []string{
+		"SELECT ROW_NUMBER() FROM ventas",                             // ranking without OVER
+		"SELECT ROW_NUMBER() OVER PARTITION BY x FROM ventas",         // missing parens
+		"SELECT RANK(monto) OVER () FROM ventas",                      // ranking with argument
+		"SELECT categoria FROM ventas QUALIFY",                        // empty predicate
+		"SELECT categoria FROM ventas QUALIFY rn",                     // missing operator
+		"SELECT categoria FROM ventas WHERE ROW_NUMBER() OVER () = 1", // window in WHERE
+		"SELECT SUM(monto) OVER (ORDER BY monto FROM ventas",          // unclosed OVER
+	}
+	for _, sql := range bad {
+		p := NewParser(sql)
+		if _, err := p.ParseStatement(); err == nil && p.AtEOF() {
+			t.Errorf("expected parse error for %q", sql)
+		}
+	}
+}

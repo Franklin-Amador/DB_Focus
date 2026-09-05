@@ -12,6 +12,9 @@ type Parser struct {
 	l    *Lexer
 	cur  Token
 	peek Token
+	// inQualify is set while parsing a QUALIFY predicate so that predicate
+	// leaves may reference window-function calls and aggregate expressions.
+	inQualify bool
 }
 
 func NewParser(input string) *Parser {
@@ -110,7 +113,7 @@ func (p *Parser) parseSelect() (ast.Statement, error) {
 	// Zero-argument scalar function call like SELECT version(). Aggregate calls
 	// (SUM(col), etc.) are excluded so they fall through to normal column
 	// parsing, which handles their arguments.
-	if p.cur.Type == TokenIdent && p.peek.Type == TokenLParen && !isAggregateFunc(strings.ToUpper(p.cur.Literal)) {
+	if p.cur.Type == TokenIdent && p.peek.Type == TokenLParen && !p.isFunctionCallStart() {
 		name := p.cur.Literal
 		p.next()
 		if !p.expect(TokenLParen) {
@@ -169,6 +172,12 @@ func (p *Parser) parseSelect() (ast.Statement, error) {
 		return nil, err
 	}
 	stmt.GroupBy = grp
+
+	qual, err := p.parseQualifyClause()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Qualify = qual
 
 	ob, err := p.parseOrderByClause()
 	if err != nil {

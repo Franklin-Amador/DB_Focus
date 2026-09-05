@@ -7,6 +7,21 @@ type Statement interface {
 type Identifier struct {
 	Name  string
 	Alias string
+	// Window is set when the identifier denotes a window-function call
+	// (e.g. ROW_NUMBER() OVER (...)). Name is then empty and Alias carries the
+	// output column name.
+	Window *WindowFunc
+}
+
+// WindowFunc is a window-function call: FUNC(arg) OVER (PARTITION BY ... ORDER BY ...).
+// Func is upper-case (ROW_NUMBER, RANK, DENSE_RANK, COUNT, SUM, AVG, MIN, MAX).
+// Arg is "" for ranking functions, "*" for COUNT(*), a column reference, or the
+// canonical text of an aggregate ("SUM(monto)") when used over grouped rows.
+type WindowFunc struct {
+	Func        string
+	Arg         string
+	PartitionBy []Identifier
+	OrderBy     []OrderByClause
 }
 
 type Literal struct {
@@ -156,6 +171,7 @@ type Select struct {
 	Joins        []*JoinClause // full chain of joins (supports N-way joins)
 	Where        *WhereClause
 	GroupBy      []Identifier
+	Qualify      *WhereClause // QUALIFY predicate, evaluated after window functions
 	OrderBy      []OrderByClause
 	Limit        int
 	Offset       int
@@ -212,6 +228,18 @@ func (w *WhereClause) LeafColumns() []string {
 		return []string{w.Column.Name}
 	}
 	return append(w.Left.LeafColumns(), w.Right.LeafColumns()...)
+}
+
+// Leaves returns every leaf predicate of the tree in left-to-right order. The
+// executor uses it to find window-function calls embedded in QUALIFY.
+func (w *WhereClause) Leaves() []*WhereClause {
+	if w == nil {
+		return nil
+	}
+	if w.Conj == "" {
+		return []*WhereClause{w}
+	}
+	return append(w.Left.Leaves(), w.Right.Leaves()...)
 }
 
 type Update struct {

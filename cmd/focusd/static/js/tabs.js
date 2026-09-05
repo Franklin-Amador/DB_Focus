@@ -34,8 +34,12 @@ function persist() {
   }, 500);
 }
 
+// MIME registrado en editor.js (modo SQL + keywords del motor). Literal a
+// propósito: editor.js importa este módulo y un import inverso sería circular.
+const SQL_MIME = 'text/x-focusdb';
+
 function newDoc(sql) {
-  return CodeMirror.Doc(sql || '', 'text/x-sql');
+  return CodeMirror.Doc(sql || '', SQL_MIME);
 }
 
 function nextTitle() {

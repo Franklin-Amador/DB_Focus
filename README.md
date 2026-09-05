@@ -81,14 +81,19 @@ postgresql://postgres:4444@localhost:4444/postgres
 
 ## SQL soportado
 
-- `SELECT` [DISTINCT] columnas FROM tabla [WHERE predicado] [GROUP BY columna] [ORDER BY columna [ASC|DESC]] [LIMIT n] [OFFSET n]
+- `SELECT` [DISTINCT] columnas FROM tabla [WHERE predicado] [GROUP BY columna] [QUALIFY predicado] [ORDER BY columna [ASC|DESC]] [LIMIT n] [OFFSET n]
   - `predicado`: `columna OP literal` combinable con `AND`/`OR` y paréntesis. `OP` puede ser `=`, `<>` (o `!=`), `<`, `>`, `<=`, `>=`.
+  - Orden lógico de evaluación: `FROM/JOIN → WHERE → GROUP BY + agregados → funciones de ventana → QUALIFY → ORDER BY → proyección → DISTINCT → LIMIT/OFFSET`.
 - `SELECT` [DISTINCT] ... FROM tabla [NATURAL] [INNER|LEFT|RIGHT|FULL [OUTER]|CROSS] JOIN tabla2 [ON tabla.col = tabla2.col | USING (col, ...)] [JOIN tabla3 ...] ... [WHERE ...] [ORDER BY columna [ASC|DESC]] [LIMIT n]
   - Soporta **cadenas de N joins** (3+ tablas): `FROM a JOIN b ON ... JOIN c ON ...`. Las columnas se referencian calificadas (`tabla.col`) o sin calificar si son inequívocas.
   - `NATURAL JOIN`: une por **todas** las columnas con el mismo nombre en ambos lados; las comunes aparecen una sola vez (coalesce). Sin columnas comunes se comporta como `CROSS JOIN`.
   - `JOIN ... USING (col, ...)`: une por las columnas nombradas (que deben existir en ambos lados); esas columnas aparecen una sola vez (coalesce).
-- `SELECT` agg(...) FROM tabla [GROUP BY columna] [ORDER BY columna [ASC|DESC]] [LIMIT n]
-  - Funciones de agregado: `COUNT(*)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`.
+- `SELECT` agg(...) FROM tabla [GROUP BY columna] [ORDER BY columna | agg(...) [ASC|DESC]] [LIMIT n]
+  - Funciones de agregado: `COUNT(*)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`. `ORDER BY` y `QUALIFY` pueden referenciar un agregado por su texto (`ORDER BY SUM(monto) DESC`, `QUALIFY SUM(monto) > 100`) aunque no esté proyectado.
+- `SELECT` ... fn() OVER ([PARTITION BY col, ...] [ORDER BY col [ASC|DESC], ...]) [AS alias] ... FROM tabla [...] [QUALIFY predicado]
+  - **Funciones de ventana**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()` y los agregados `COUNT(*|col)`, `SUM`, `AVG`, `MIN`, `MAX` seguidos de `OVER (...)`. `OVER ()` vacío es válido (toda la tabla es una partición).
+  - `QUALIFY`: filtra **después** de calcular las ventanas. El predicado tiene la misma forma que `WHERE` y el lado izquierdo puede ser una columna, un alias del `SELECT`, un agregado o una ventana inline: `QUALIFY ROW_NUMBER() OVER (PARTITION BY categoria ORDER BY monto DESC) = 1`.
+  - Funciona sobre tablas, JOINs (columnas calificadas), CTEs, vistas y consultas con `GROUP BY` — en ese caso la ventana opera sobre las filas ya agrupadas y puede referenciar agregados: `RANK() OVER (ORDER BY SUM(monto) DESC)`.
 - `WITH` cte_name AS (SELECT ...) [, cte_name2 AS (SELECT ...)] SELECT ...
 - `CREATE TABLE` tabla (columna tipo [IDENTITY] [PRIMARY KEY], ...)
 - `CREATE VIEW` vista AS SELECT ...
@@ -122,6 +127,11 @@ postgresql://postgres:4444@localhost:4444/postgres
 **Notas:**
 - `WHERE` soporta operadores de comparación: `=`, `<>`/`!=`, `<`, `>`, `<=`, `>=` (en SELECT, UPDATE y DELETE). La igualdad (`=`) usa índice cuando existe. **Todos** los operadores comparan por forma canónica: numéricamente si ambos lados son números, lexicográficamente en caso contrario. Esto hace que `WHERE id = 1` funcione igual sobre una columna `IDENTITY` (valor `int`) que sobre una columna con valores literales (`string`) — importante en `UPDATE`/`DELETE`, que recorren la tabla en vez de usar el índice.
 - `WHERE` soporta predicados compuestos con `AND` y `OR`, precedencia estándar (`AND` liga más fuerte que `OR`) y paréntesis para agrupar: `WHERE a > 10 AND (b = 'x' OR c <= 5)`. Funciona también sobre JOINs (columnas calificadas, ej. `pedidos.total > 80`).
+- **Funciones de ventana**: dentro de cada partición (`PARTITION BY`, o toda la tabla si se omite) las filas se ordenan por el `ORDER BY` de la ventana; las filas iguales en todas las claves son *pares*. `ROW_NUMBER` numera 1..n; `RANK` deja huecos tras un empate (1,1,3); `DENSE_RANK` no (1,1,2). Los agregados `OVER` sin `ORDER BY` cubren toda la partición; con `ORDER BY` usan el frame por defecto del estándar (`RANGE UNBOUNDED PRECEDING → CURRENT ROW`): acumulado hasta la fila actual incluyendo sus pares. No hay frames explícitos (`ROWS BETWEEN ...`) ni `LAG/LEAD`.
+- `QUALIFY` se evalúa después de las ventanas y antes de `ORDER BY`/`LIMIT`, así que `QUALIFY rn <= 3 ORDER BY monto DESC LIMIT 5` filtra primero y recorta después. Si la consulta no tiene ventanas, `QUALIFY` actúa como un filtro sobre alias/columnas de salida (extensión permisiva). Una ventana usada solo en `QUALIFY` no aparece en el resultado (tampoco con `SELECT *`).
+- `ORDER BY` acepta alias del `SELECT` y agregados (`ORDER BY total DESC`, `ORDER BY SUM(monto) DESC`) y ahora falla con `ORDER BY: column X not found` si la columna no existe (antes se ignoraba en silencio). Un agregado en `ORDER BY`/`QUALIFY`/`OVER` exige `GROUP BY` o un agregado en el `SELECT`; en consultas agrupadas, una columna referenciada fuera del `SELECT` debe ser clave de `GROUP BY` o ir dentro de un agregado (`column X must appear in GROUP BY ...`).
+- `QUALIFY`, `OVER` y `PARTITION` son palabras reservadas desde esta versión (igual que `ORDER`, `LIMIT`, etc.). Una columna o tabla con ese nombre debe escribirse entre comillas dobles: `SELECT "partition" FROM logs`.
+- Un agregado con argumento que no sea `*`, una columna o un agregado anidado (`COUNT(DISTINCT x)`, `SUM(a * 2)`) es un error de sintaxis explícito; antes parseaba y devolvía `NULL`. Una ventana envuelta en una expresión (`ROW_NUMBER() OVER () * 2`) se proyecta como `NULL`, como cualquier otra expresión no soportada.
 - Columnas con `IDENTITY` se auto-incrementan automáticamente en cada INSERT.
 - `INSERT` sin lista de columnas ahora soporta correctamente tablas con `IDENTITY`: si envías solo los valores de columnas no-IDENTITY, el motor autogenera el ID y preserva el resto de valores en su columna correcta.
 - Los procedimientos almacenados pueden tener parámetros y ejecutar múltiples sentencias.
@@ -221,11 +231,12 @@ go run ./cmd/test-self-fk
 go run ./cmd/test-fk-identity
 go run ./cmd/test-identity-insert
 
-# Consultas: WHERE, agregados, JOINs
+# Consultas: WHERE, agregados, JOINs, ventanas + QUALIFY
 go run ./cmd/test-where-operators
 go run ./cmd/test-aggregates
 go run ./cmd/test-multi-join
 go run ./cmd/test-natural-join
+go run ./cmd/test-qualify
 
 # Vistas
 go run ./cmd/test-views
@@ -324,6 +335,31 @@ SELECT MAX(precio) FROM productos;
 SELECT user_id, COUNT(*) FROM orders GROUP BY user_id;
 SELECT categoria, SUM(precio) FROM productos GROUP BY categoria;
 SELECT categoria, MAX(precio) FROM productos GROUP BY categoria;
+SELECT categoria, SUM(precio) FROM productos GROUP BY categoria ORDER BY SUM(precio) DESC;
+
+-- Funciones de ventana: ranking por partición y agregados OVER
+SELECT categoria, nombre, precio,
+       ROW_NUMBER() OVER (PARTITION BY categoria ORDER BY precio DESC) AS rn,
+       SUM(precio)  OVER (PARTITION BY categoria) AS total_categoria
+FROM productos;
+
+-- QUALIFY: el producto más caro de cada categoría (top-N por grupo)
+SELECT categoria, nombre, precio
+FROM productos
+QUALIFY ROW_NUMBER() OVER (PARTITION BY categoria ORDER BY precio DESC) = 1;
+
+-- QUALIFY por alias + ORDER BY + LIMIT
+SELECT categoria, nombre, precio, RANK() OVER (PARTITION BY categoria ORDER BY precio DESC) AS pos
+FROM productos
+QUALIFY pos <= 3
+ORDER BY categoria, pos
+LIMIT 20;
+
+-- Ventana sobre GROUP BY: ranking de categorías por ventas totales
+SELECT categoria, SUM(precio) AS total, RANK() OVER (ORDER BY SUM(precio) DESC) AS pos
+FROM productos
+GROUP BY categoria
+QUALIFY pos <= 2;
 
 -- INNER JOIN: solo filas con coincidencias
 SELECT * FROM users INNER JOIN orders ON users.id = orders.user_id;
