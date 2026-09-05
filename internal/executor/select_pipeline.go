@@ -23,8 +23,8 @@ var errAmbiguousColumn = errors.New("ambiguous column reference")
 //
 // Logical evaluation order implemented by finishSelect:
 //
-//	FROM/JOIN → WHERE → GROUP BY + aggregates → window functions → QUALIFY
-//	→ ORDER BY → projection → DISTINCT → LIMIT/OFFSET
+//	FROM/JOIN → WHERE → GROUP BY + aggregates → HAVING → window functions
+//	→ QUALIFY → ORDER BY → projection → DISTINCT → LIMIT/OFFSET
 type rowset struct {
 	cols      []joinColumn
 	rows      [][]interface{}
@@ -120,6 +120,15 @@ func (e *Executor) finishSelect(ctx context.Context, stmt *ast.Select, rs *rowse
 		rs = g
 	}
 
+	// HAVING: filter the grouped rows (aggregates, GROUP BY keys, aliases).
+	if stmt.Having != nil {
+		rows, err := filterRows(rs, stmt, stmt.Having, "HAVING")
+		if err != nil {
+			return nil, err
+		}
+		rs.rows = rows
+	}
+
 	// Select-list items are bound to column indexes once, before window
 	// columns are appended, so an alias can never shadow a source column.
 	itemIdx, err := selectItemIndexes(stmt, rs, grouped)
@@ -135,32 +144,11 @@ func (e *Executor) finishSelect(ctx context.Context, stmt *ast.Select, rs *rowse
 
 	// QUALIFY.
 	if qualify != nil {
-		cache := map[string]int{}
-		resolve := func(name string) (int, bool) {
-			if idx, ok := hidden[name]; ok {
-				return idx, true
-			}
-			if idx, ok := cache[name]; ok {
-				return idx, idx >= 0
-			}
-			idx, err := rs.resolveWithAliases(stmt, name)
-			if err != nil {
-				idx = -1
-			}
-			cache[name] = idx
-			return idx, err == nil
+		rows, err := filterRows(rs, stmt, qualify, "QUALIFY", hidden)
+		if err != nil {
+			return nil, err
 		}
-		filtered := make([][]interface{}, 0, len(rs.rows))
-		for _, row := range rs.rows {
-			ok, err := evalWhere(qualify, row, resolve)
-			if err != nil {
-				return nil, fmt.Errorf("QUALIFY: %w", err)
-			}
-			if ok {
-				filtered = append(filtered, row)
-			}
-		}
-		rs.rows = filtered
+		rs.rows = rows
 	}
 
 	// ORDER BY on the full rows, before projection, so it may reference any
@@ -185,6 +173,40 @@ func (e *Executor) finishSelect(ctx context.Context, stmt *ast.Select, rs *rowse
 		Rows:    rows,
 		Tag:     constants.ResultSelectTag(len(rows)),
 	}, nil
+}
+
+// filterRows keeps the rows of rs that satisfy pred. References resolve
+// against the rowset and the select-list aliases (memoized per query);
+// extra maps names to indexes that take precedence (hidden window columns).
+func filterRows(rs *rowset, stmt *ast.Select, pred *ast.WhereClause, clause string, extra ...map[string]int) ([][]interface{}, error) {
+	cache := map[string]int{}
+	resolve := func(name string) (int, bool) {
+		for _, m := range extra {
+			if idx, ok := m[name]; ok {
+				return idx, true
+			}
+		}
+		if idx, ok := cache[name]; ok {
+			return idx, idx >= 0
+		}
+		idx, err := rs.resolveWithAliases(stmt, name)
+		if err != nil {
+			idx = -1
+		}
+		cache[name] = idx
+		return idx, err == nil
+	}
+	filtered := make([][]interface{}, 0, len(rs.rows))
+	for _, row := range rs.rows {
+		ok, err := evalWhere(pred, row, resolve)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", clause, err)
+		}
+		if ok {
+			filtered = append(filtered, row)
+		}
+	}
+	return filtered, nil
 }
 
 // selectItemIndexes binds every non-window select-list item to its column in
@@ -317,9 +339,10 @@ func isAggregateExpr(ref string) bool {
 }
 
 // needsGrouping reports whether the query goes through the GROUP BY /
-// aggregate stage: an explicit GROUP BY or an aggregate in the select list.
+// aggregate stage: an explicit GROUP BY or HAVING, or an aggregate in the
+// select list.
 func needsGrouping(stmt *ast.Select) bool {
-	if len(stmt.GroupBy) > 0 {
+	if len(stmt.GroupBy) > 0 || stmt.Having != nil {
 		return true
 	}
 	for _, c := range stmt.Columns {
@@ -331,9 +354,12 @@ func needsGrouping(stmt *ast.Select) bool {
 }
 
 // outerRefs lists every reference made outside the select list: window
-// specifications, QUALIFY leaves (non-window) and ORDER BY terms.
+// specifications, HAVING and QUALIFY leaves (non-window) and ORDER BY terms.
 func outerRefs(stmt *ast.Select) []string {
 	refs := windowRefs(stmt)
+	for _, leaf := range stmt.Having.Leaves() {
+		refs = append(refs, leaf.Column.Name)
+	}
 	for _, leaf := range stmt.Qualify.Leaves() {
 		if leaf.Column.Window == nil {
 			refs = append(refs, leaf.Column.Name)
@@ -368,8 +394,8 @@ type groupCol struct {
 
 // groupRows reduces rs to one row per group. The output rowset carries every
 // select-list item (in order) plus hidden columns for aggregates and GROUP BY
-// keys referenced by window functions, QUALIFY or ORDER BY that the select
-// list does not already provide, so later stages can resolve them.
+// keys referenced by HAVING, window functions, QUALIFY or ORDER BY that the
+// select list does not already provide, so later stages can resolve them.
 //
 // Select-list columns that are neither aggregated nor grouped keep the
 // engine's historical leniency (first value of the group); a hidden column

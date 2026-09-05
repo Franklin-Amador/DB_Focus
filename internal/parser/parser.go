@@ -12,9 +12,10 @@ type Parser struct {
 	l    *Lexer
 	cur  Token
 	peek Token
-	// inQualify is set while parsing a QUALIFY predicate so that predicate
-	// leaves may reference window-function calls and aggregate expressions.
-	inQualify bool
+	// predClause names the clause whose predicate is being parsed ("WHERE" by
+	// default). HAVING leaves may reference aggregate expressions; QUALIFY
+	// leaves may additionally reference window-function calls.
+	predClause string
 }
 
 func NewParser(input string) *Parser {
@@ -172,6 +173,12 @@ func (p *Parser) parseSelect() (ast.Statement, error) {
 		return nil, err
 	}
 	stmt.GroupBy = grp
+
+	having, err := p.parseHavingClause()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Having = having
 
 	qual, err := p.parseQualifyClause()
 	if err != nil {

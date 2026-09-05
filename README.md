@@ -81,15 +81,16 @@ postgresql://postgres:4444@localhost:4444/postgres
 
 ## SQL soportado
 
-- `SELECT` [DISTINCT] columnas FROM tabla [WHERE predicado] [GROUP BY columna] [QUALIFY predicado] [ORDER BY columna [ASC|DESC]] [LIMIT n] [OFFSET n]
+- `SELECT` [DISTINCT] columnas FROM tabla [WHERE predicado] [GROUP BY columna] [HAVING predicado] [QUALIFY predicado] [ORDER BY columna [ASC|DESC]] [LIMIT n] [OFFSET n]
   - `predicado`: `columna OP literal` combinable con `AND`/`OR` y paréntesis. `OP` puede ser `=`, `<>` (o `!=`), `<`, `>`, `<=`, `>=`.
-  - Orden lógico de evaluación: `FROM/JOIN → WHERE → GROUP BY + agregados → funciones de ventana → QUALIFY → ORDER BY → proyección → DISTINCT → LIMIT/OFFSET`.
+  - Orden lógico de evaluación: `FROM/JOIN → WHERE → GROUP BY + agregados → HAVING → funciones de ventana → QUALIFY → ORDER BY → proyección → DISTINCT → LIMIT/OFFSET`.
 - `SELECT` [DISTINCT] ... FROM tabla [NATURAL] [INNER|LEFT|RIGHT|FULL [OUTER]|CROSS] JOIN tabla2 [ON tabla.col = tabla2.col | USING (col, ...)] [JOIN tabla3 ...] ... [WHERE ...] [ORDER BY columna [ASC|DESC]] [LIMIT n]
   - Soporta **cadenas de N joins** (3+ tablas): `FROM a JOIN b ON ... JOIN c ON ...`. Las columnas se referencian calificadas (`tabla.col`) o sin calificar si son inequívocas.
   - `NATURAL JOIN`: une por **todas** las columnas con el mismo nombre en ambos lados; las comunes aparecen una sola vez (coalesce). Sin columnas comunes se comporta como `CROSS JOIN`.
   - `JOIN ... USING (col, ...)`: une por las columnas nombradas (que deben existir en ambos lados); esas columnas aparecen una sola vez (coalesce).
-- `SELECT` agg(...) FROM tabla [GROUP BY columna] [ORDER BY columna | agg(...) [ASC|DESC]] [LIMIT n]
-  - Funciones de agregado: `COUNT(*)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`. `ORDER BY` y `QUALIFY` pueden referenciar un agregado por su texto (`ORDER BY SUM(monto) DESC`, `QUALIFY SUM(monto) > 100`) aunque no esté proyectado.
+- `SELECT` agg(...) FROM tabla [GROUP BY columna] [HAVING predicado] [ORDER BY columna | agg(...) [ASC|DESC]] [LIMIT n]
+  - Funciones de agregado: `COUNT(*)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`.
+  - `HAVING` filtra los grupos: `HAVING SUM(monto) > 100 AND n >= 2` (agregados, alias del `SELECT` o claves de `GROUP BY`; sin `GROUP BY`, toda la tabla es un grupo). Las funciones de ventana no se permiten en `HAVING` (usar `QUALIFY`). `ORDER BY` y `QUALIFY` pueden referenciar un agregado por su texto (`ORDER BY SUM(monto) DESC`, `QUALIFY SUM(monto) > 100`) aunque no esté proyectado.
 - `SELECT` ... fn() OVER ([PARTITION BY col, ...] [ORDER BY col [ASC|DESC], ...]) [AS alias] ... FROM tabla [...] [QUALIFY predicado]
   - **Funciones de ventana**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()` y los agregados `COUNT(*|col)`, `SUM`, `AVG`, `MIN`, `MAX` seguidos de `OVER (...)`. `OVER ()` vacío es válido (toda la tabla es una partición).
   - `QUALIFY`: filtra **después** de calcular las ventanas. El predicado tiene la misma forma que `WHERE` y el lado izquierdo puede ser una columna, un alias del `SELECT`, un agregado o una ventana inline: `QUALIFY ROW_NUMBER() OVER (PARTITION BY categoria ORDER BY monto DESC) = 1`.

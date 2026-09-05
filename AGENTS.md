@@ -1352,6 +1352,11 @@ integración de SELECT ✅.
 - Limpieza: `queryutil.ApplyOrderBy` eliminado (sin llamadores); `parseSelect` usa
   `isFunctionCallStart`. Documentado en README que QUALIFY/OVER/PARTITION son reservadas.
 
-**Fuera de alcance / follow-ups**: `HAVING` (filtro post-`groupRows`, misma infraestructura),
-`LAG/LEAD/NTILE/FIRST_VALUE`, frames explícitos `ROWS/RANGE BETWEEN`, `SELECT *, ventana`
+**HAVING (commit aparte, misma sesión)**: `TokenHaving`, `Select.Having`, `parseHavingClause`
+sobre `parsePredicateClause` (flag `p.predClause` reemplaza `inQualify`; HAVING admite agregados
+y alias, rechaza ventanas). Executor: `filterRows` compartido por HAVING y QUALIFY; HAVING corre
+justo después de `groupRows` y activa la agrupación aunque no haya GROUP BY. Casos en
+`cmd/test-qualify` (+8) y `TestParseHaving`.
+
+**Fuera de alcance / follow-ups**: `LAG/LEAD/NTILE/FIRST_VALUE`, frames explícitos `ROWS/RANGE BETWEEN`, `SELECT *, ventana`
 (limitación previa del parser con `*`), cláusula `WINDOW w AS (...)`.

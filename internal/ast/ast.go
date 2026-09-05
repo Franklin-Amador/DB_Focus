@@ -171,6 +171,7 @@ type Select struct {
 	Joins        []*JoinClause // full chain of joins (supports N-way joins)
 	Where        *WhereClause
 	GroupBy      []Identifier
+	Having       *WhereClause // HAVING predicate, evaluated over the grouped rows
 	Qualify      *WhereClause // QUALIFY predicate, evaluated after window functions
 	OrderBy      []OrderByClause
 	Limit        int

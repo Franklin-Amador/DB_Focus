@@ -120,6 +120,7 @@ const (
 	TokenCascade    TokenType = "CASCADE"
 	TokenRestrict   TokenType = "RESTRICT"
 	TokenQualify    TokenType = "QUALIFY"
+	TokenHaving     TokenType = "HAVING"
 	TokenOver       TokenType = "OVER"
 	TokenPartition  TokenType = "PARTITION"
 )
@@ -229,6 +230,7 @@ var keywords = map[string]TokenType{
 	"CASCADE":    TokenCascade,
 	"RESTRICT":   TokenRestrict,
 	"QUALIFY":    TokenQualify,
+	"HAVING":     TokenHaving,
 	"OVER":       TokenOver,
 	"PARTITION":  TokenPartition,
 }

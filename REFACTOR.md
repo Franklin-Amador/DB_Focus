@@ -66,7 +66,7 @@ en 9 archivos, que además hace de motor de grafo de FKs y registro de usuarios.
 El patrón (marker interfaces) es bueno; la expresividad no:
 - `WhereClause` = un solo `Column = Value`: sin AND/OR, sin operadores `<`/`>`/`LIKE`, sin expresiones.
 - `Insert.Values` = una fila; `Update` = una columna; `JoinClause` = una igualdad.
-- Agregados detectados por texto (`parseAggregate`); hay COUNT/SUM/AVG/MIN/MAX, ventanas (`OVER`) y `QUALIFY`, pero no `HAVING` (encajaría como filtro post-`groupRows` en `select_pipeline.go`).
+- Agregados detectados por texto (`parseAggregate`); hay COUNT/SUM/AVG/MIN/MAX, `HAVING`, ventanas (`OVER`) y `QUALIFY` sobre el pipeline unificado de `select_pipeline.go`.
 - `catalog → ast` fuerza `gob.Register` de nodos AST → cambiar un nodo rompe datos en disco.
 
 ### 🟡 6. `validator` desconectado y con lógica triplicada

@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"strings"
 	"testing"
 
 	"dbf/internal/ast"
@@ -609,6 +610,32 @@ func TestParseQualifyAggregateLeaf(t *testing.T) {
 	sel := parseSelectT(t, "SELECT categoria FROM ventas GROUP BY categoria QUALIFY SUM(monto) > 100")
 	if sel.Qualify == nil || sel.Qualify.Column.Name != "SUM(monto)" || sel.Qualify.Column.Window != nil {
 		t.Errorf("unexpected qualify %+v", sel.Qualify)
+	}
+}
+
+func TestParseHaving(t *testing.T) {
+	sel := parseSelectT(t, "SELECT categoria, COUNT(*) AS n FROM ventas WHERE monto > 0 GROUP BY categoria HAVING SUM(monto) > 100 AND n >= 2 QUALIFY ROW_NUMBER() OVER (ORDER BY n DESC) <= 5 ORDER BY categoria")
+	if sel.Having == nil || sel.Having.Conj != "AND" {
+		t.Fatalf("expected AND HAVING, got %+v", sel.Having)
+	}
+	if sel.Having.Left.Column.Name != "SUM(monto)" || sel.Having.Left.Operator != ">" || sel.Having.Left.Value.Value != "100" {
+		t.Errorf("unexpected HAVING left leaf %+v", sel.Having.Left)
+	}
+	if sel.Having.Right.Column.Name != "n" || sel.Having.Right.Operator != ">=" {
+		t.Errorf("unexpected HAVING right leaf %+v", sel.Having.Right)
+	}
+	if sel.Where == nil || sel.Qualify == nil || len(sel.OrderBy) != 1 || len(sel.GroupBy) != 1 {
+		t.Errorf("surrounding clauses lost: where=%v qualify=%v order=%v group=%v", sel.Where != nil, sel.Qualify != nil, sel.OrderBy, sel.GroupBy)
+	}
+	// HAVING without GROUP BY is valid (whole table is one group).
+	sel = parseSelectT(t, "SELECT COUNT(*) FROM ventas HAVING COUNT(*) > 3")
+	if sel.Having == nil || sel.Having.Column.Name != "COUNT(*)" {
+		t.Errorf("unexpected HAVING %+v", sel.Having)
+	}
+	// Window functions are rejected in HAVING.
+	p := NewParser("SELECT categoria FROM ventas GROUP BY categoria HAVING ROW_NUMBER() OVER () = 1")
+	if _, err := p.ParseStatement(); err == nil || !strings.Contains(err.Error(), "HAVING") {
+		t.Errorf("expected HAVING error for window function, got %v", err)
 	}
 }
 

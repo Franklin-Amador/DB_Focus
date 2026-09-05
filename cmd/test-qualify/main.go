@@ -1,8 +1,8 @@
 // Command test-qualify exercises window functions (ROW_NUMBER, RANK,
-// DENSE_RANK, aggregates OVER) and the QUALIFY clause end to end against an
-// in-memory catalog: partitions, ordering, peers, the default cumulative
-// frame, QUALIFY by alias and inline, combination with GROUP BY, JOINs, CTEs
-// and error reporting.
+// DENSE_RANK, aggregates OVER), the QUALIFY clause and HAVING end to end
+// against an in-memory catalog: partitions, ordering, peers, the default
+// cumulative frame, QUALIFY by alias and inline, combination with GROUP BY,
+// JOINs, CTEs and error reporting.
 package main
 
 import (
@@ -206,6 +206,28 @@ func main() {
 	expectRows(ctx, exe, "SELECT categoria, monto FROM mejores ORDER BY categoria", []string{"A|200", "B|300", "C|50"})
 	expectRows(ctx, exe, "SELECT categoria, monto FROM mejores ORDER BY categoria", []string{"A|200", "B|300", "C|50"}) // view AST reused: must not be mutated
 
+	fmt.Println("\n--- HAVING ---")
+	expectRows(ctx, exe,
+		"SELECT categoria, SUM(monto) AS total FROM ventas GROUP BY categoria HAVING SUM(monto) > 100 ORDER BY categoria",
+		[]string{"A|300", "B|700"})
+	// Alias, unprojected aggregate, compound predicate.
+	expectRows(ctx, exe,
+		"SELECT categoria, COUNT(*) AS n FROM ventas GROUP BY categoria HAVING n >= 2 AND MAX(monto) < 250 ORDER BY categoria",
+		[]string{"A|2"})
+	// HAVING without GROUP BY: the whole table is one group.
+	expectRows(ctx, exe, "SELECT COUNT(*) FROM ventas HAVING COUNT(*) > 3", []string{"6"})
+	expectRows(ctx, exe, "SELECT COUNT(*) FROM ventas HAVING COUNT(*) > 30", []string{})
+	// HAVING on a GROUP BY key, then window + QUALIFY over the surviving groups.
+	expectRows(ctx, exe,
+		"SELECT categoria, SUM(monto) AS total, RANK() OVER (ORDER BY SUM(monto) DESC) AS pos FROM ventas GROUP BY categoria HAVING categoria <> 'B' QUALIFY pos = 1",
+		[]string{"A|300|1"})
+	// HAVING over a JOIN with qualified refs, then ORDER BY + LIMIT.
+	expectRows(ctx, exe,
+		"SELECT c.region, SUM(v.monto) AS total FROM ventas AS v INNER JOIN categorias AS c ON v.categoria = c.nombre GROUP BY c.region HAVING SUM(v.monto) >= 350 ORDER BY total DESC LIMIT 1",
+		[]string{"sur|700"})
+	expectErr(ctx, exe, "SELECT categoria, SUM(monto) FROM ventas GROUP BY categoria HAVING monto > 100", "must appear in GROUP BY")
+	expectErr(ctx, exe, "SELECT categoria FROM ventas GROUP BY categoria HAVING zzz > 1", "column zzz not found")
+
 	fmt.Println("\n--- Review regressions ---")
 	// An alias equal to a source column must not shadow it (positional projection).
 	expectRows(ctx, exe,
@@ -245,5 +267,5 @@ func main() {
 	expectErr(ctx, exe, "SELECT categoria FROM ventas ORDER BY nope", "nope")
 	expectErr(ctx, exe, "SELECT ROW_NUMBER() AS rn FROM ventas", "OVER")
 
-	fmt.Println("\n=== All window/QUALIFY tests passed! ===")
+	fmt.Println("\n=== All window/QUALIFY/HAVING tests passed! ===")
 }

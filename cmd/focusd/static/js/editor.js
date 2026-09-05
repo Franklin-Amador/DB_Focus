@@ -102,7 +102,7 @@ function aliasTables(base) {
   const { sql } = getCurrentStatement();
   const out = {};
   const re = /(?:FROM|JOIN)\s+([A-Za-z_][\w]*)(?:\s+(?:AS\s+)?([A-Za-z_][\w]*))?/gi;
-  const KEYWORDS = new Set(['ON','WHERE','INNER','LEFT','RIGHT','FULL','CROSS','NATURAL','JOIN','GROUP','ORDER','LIMIT','USING','AS','SET','QUALIFY','OVER','PARTITION']);
+  const KEYWORDS = new Set(['ON','WHERE','INNER','LEFT','RIGHT','FULL','CROSS','NATURAL','JOIN','GROUP','ORDER','LIMIT','USING','AS','SET','HAVING','QUALIFY','OVER','PARTITION']);
   let m;
   while ((m = re.exec(sql)) !== null) {
     const table = m[1], alias = m[2];

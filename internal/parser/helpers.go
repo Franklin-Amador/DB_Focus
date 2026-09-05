@@ -268,14 +268,17 @@ func (p *Parser) parseWherePredicate() (*ast.WhereClause, error) {
 
 	var col ast.Identifier
 	switch {
-	case p.inQualify && p.isFunctionCallStart():
+	case p.predClause != "" && p.isFunctionCallStart():
 		w, text, err := p.parseWindowCall()
 		if err != nil {
 			return nil, err
 		}
-		if w != nil {
+		switch {
+		case w != nil && clause != "QUALIFY":
+			return nil, p.errorf("window functions are not allowed in %s", clause)
+		case w != nil:
 			col = ast.Identifier{Window: w}
-		} else {
+		default:
 			col = ast.Identifier{Name: text}
 		}
 	case p.cur.Type == TokenIdent:
@@ -299,23 +302,35 @@ func (p *Parser) parseWherePredicate() (*ast.WhereClause, error) {
 // predicateClauseName names the clause whose predicate is being parsed, for
 // error messages.
 func (p *Parser) predicateClauseName() string {
-	if p.inQualify {
-		return "QUALIFY"
+	if p.predClause != "" {
+		return p.predClause
 	}
 	return "WHERE"
 }
 
-// parseQualifyClause parses an optional QUALIFY predicate. The predicate tree
-// is the same as WHERE, but leaves may reference window functions (inline or
-// by alias) and aggregate expressions.
-func (p *Parser) parseQualifyClause() (*ast.WhereClause, error) {
-	if p.cur.Type != TokenQualify {
+// parsePredicateClause parses an optional predicate introduced by keyword
+// (HAVING, QUALIFY): same tree as WHERE, with the leaf grammar widened
+// according to the clause name.
+func (p *Parser) parsePredicateClause(keyword TokenType, clause string) (*ast.WhereClause, error) {
+	if p.cur.Type != keyword {
 		return nil, nil
 	}
 	p.next()
-	p.inQualify = true
-	defer func() { p.inQualify = false }()
+	p.predClause = clause
+	defer func() { p.predClause = "" }()
 	return p.parseWhereOr()
+}
+
+// parseHavingClause parses an optional HAVING predicate, whose leaves may be
+// columns, select-list aliases or aggregate expressions (SUM(x) > 10).
+func (p *Parser) parseHavingClause() (*ast.WhereClause, error) {
+	return p.parsePredicateClause(TokenHaving, "HAVING")
+}
+
+// parseQualifyClause parses an optional QUALIFY predicate, whose leaves may
+// additionally be window-function calls (inline or by alias).
+func (p *Parser) parseQualifyClause() (*ast.WhereClause, error) {
+	return p.parsePredicateClause(TokenQualify, "QUALIFY")
 }
 
 // isFunctionCallStart reports whether the current token starts an aggregate or
