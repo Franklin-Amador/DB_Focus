@@ -9,16 +9,14 @@ import (
 	"testing"
 
 	"dbf/internal/catalog"
-	"dbf/internal/executor"
 )
 
-// newTestAPI wires an in-memory catalog + executor behind the GUI mux.
+// newTestAPI wires an in-memory cluster + handler behind the GUI mux.
 func newTestAPI(t *testing.T) *httptest.Server {
 	t.Helper()
-	cat := catalog.New()
-	exe := executor.New(cat, nil)
-	h := executeHandler{executor: exe, catalog: cat}
-	srv := httptest.NewServer(withRecover(newGUIMux(h, cat, 0, nil)))
+	cl := catalog.NewCluster()
+	h := newExecuteHandler(nil, cl, nil)
+	srv := httptest.NewServer(withRecover(newGUIMux(h, cl, 0, nil)))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -170,22 +168,109 @@ func TestAPISchemasListAndActiveSchema(t *testing.T) {
 	}
 }
 
-func TestAPIDropDatabaseRemovesSchema(t *testing.T) {
-	srv := newTestAPI(t)
-	mustOK(t, srv, "CREATE DATABASE analytics", "")
-	mustOK(t, srv, "CREATE TABLE hechos (id INT)", "analytics")
-	var schemas []apiSchemaInfo
-	getJSON(t, srv, "/api/schemas", &schemas)
-	if len(schemas) != 2 || schemas[1].Name != "analytics" {
-		t.Fatalf("CREATE DATABASE should create the schema, got %+v", schemas)
+// mustOKIn runs a statement inside a database (and schema) via /api/query.
+func mustOKIn(t *testing.T, srv *httptest.Server, sql, database, schema string) map[string]interface{} {
+	t.Helper()
+	out := postQuery(t, srv, "/api/query", map[string]interface{}{"sql": sql, "database": database, "schema": schema})
+	if e, _ := out["error"].(string); e != "" {
+		t.Fatalf("%q (db %q, schema %q): unexpected error %s", sql, database, schema, e)
 	}
-	mustOK(t, srv, "DROP DATABASE analytics", "")
+	return out
+}
+
+func TestAPIDatabasesAreIsolatedContainers(t *testing.T) {
+	srv := newTestAPI(t)
+
+	var dbs []apiDatabaseInfo
+	getJSON(t, srv, "/api/databases", &dbs)
+	if len(dbs) != 1 || dbs[0].Name != "postgres" || !dbs[0].IsDefault {
+		t.Fatalf("fresh cluster should list only postgres, got %+v", dbs)
+	}
+
+	out := mustOK(t, srv, "CREATE DATABASE ventas", "")
+	if out["tag"] != "CREATE DATABASE" {
+		t.Errorf("expected CREATE DATABASE tag, got %v", out["tag"])
+	}
+	// Objects live inside the database: schema, table, view, procedure.
+	mustOKIn(t, srv, "CREATE SCHEMA reportes", "ventas", "")
+	mustOKIn(t, srv, "CREATE TABLE pedidos (id INT IDENTITY PRIMARY KEY, total INT)", "ventas", "reportes")
+	mustOKIn(t, srv, "INSERT INTO pedidos (total) VALUES (10)", "ventas", "reportes")
+	mustOKIn(t, srv, "CREATE TABLE clientes (id INT)", "ventas", "")
+
+	getJSON(t, srv, "/api/databases", &dbs)
+	if len(dbs) != 2 || dbs[1].Name != "ventas" || dbs[1].Schemas != 2 || dbs[1].Tables != 2 {
+		t.Fatalf("expected ventas with 2 schemas + 2 tables, got %+v", dbs)
+	}
+	var schemas []apiSchemaInfo
+	getJSON(t, srv, "/api/schemas?database=ventas", &schemas)
+	if len(schemas) != 2 || schemas[1].Name != "reportes" || schemas[1].Tables != 1 {
+		t.Fatalf("expected [public reportes] in ventas, got %+v", schemas)
+	}
 	getJSON(t, srv, "/api/schemas", &schemas)
 	if len(schemas) != 1 {
-		t.Fatalf("DROP DATABASE should remove the schema, got %+v", schemas)
+		t.Fatalf("schemas of ventas must not leak into postgres, got %+v", schemas)
 	}
-	out := postQuery(t, srv, "/api/query", map[string]interface{}{"sql": "DROP DATABASE postgres"})
+
+	// Metadata endpoints are scoped by database + schema.
+	var tables []apiTableInfo
+	getJSON(t, srv, "/api/schema?database=ventas&schema=reportes", &tables)
+	if len(tables) != 1 || tables[0].Name != "pedidos" {
+		t.Fatalf("expected pedidos in ventas.reportes, got %+v", tables)
+	}
+	var errResp map[string]string
+	if code := getJSON(t, srv, "/api/schema?schema=reportes", &errResp); code != http.StatusNotFound {
+		t.Fatalf("reportes must not exist in postgres, got %d", code)
+	}
+	if code := getJSON(t, srv, "/api/schema?database=nope", &errResp); code != http.StatusNotFound {
+		t.Fatalf("unknown database should be 404, got %d", code)
+	}
+	var td apiTableDataResponse
+	if code := getJSON(t, srv, "/api/table-data?database=ventas&schema=reportes&table=pedidos", &td); code != 200 || td.Total != 1 {
+		t.Fatalf("table-data in ventas.reportes: code=%d resp=%+v", code, td)
+	}
+
+	// Isolation: the same names do not resolve from another database.
+	out = postQuery(t, srv, "/api/query", map[string]interface{}{"sql": "SELECT * FROM clientes"})
+	if e, _ := out["error"].(string); !strings.Contains(e, "not found") {
+		t.Fatalf("clientes must not resolve in postgres, got %v", out)
+	}
+	out = mustOKIn(t, srv, "SELECT total FROM reportes.pedidos", "ventas", "")
+	if rows := out["rows"].([]interface{}); len(rows) != 1 {
+		t.Fatalf("qualified query inside ventas failed: %v", out)
+	}
+	// information_schema reports the request's database as table_catalog.
+	out = mustOKIn(t, srv, "SELECT * FROM information_schema.tables", "ventas", "")
+	rows := out["rows"].([]interface{})
+	if len(rows) != 1 || rows[0].([]interface{})[0] != "ventas" || rows[0].([]interface{})[2] != "clientes" {
+		t.Fatalf("information_schema.tables in ventas should list clientes with catalog ventas, got %v", rows)
+	}
+
+	// Script path honours the database too.
+	script := postQuery(t, srv, "/api/script", map[string]interface{}{
+		"sql": "INSERT INTO clientes (id) VALUES (1); SELECT COUNT(*) FROM clientes;", "database": "ventas",
+	})
+	if e, _ := script["error"].(string); e != "" {
+		t.Fatalf("script error: %s", e)
+	}
+
+	// Protection and drop.
+	out = postQuery(t, srv, "/api/query", map[string]interface{}{"sql": "DROP DATABASE postgres"})
 	if e, _ := out["error"].(string); !strings.Contains(e, "default database") {
 		t.Fatalf("DROP DATABASE postgres must be rejected, got %v", out)
+	}
+	out = postQuery(t, srv, "/api/query", map[string]interface{}{"sql": "DROP DATABASE ventas", "database": "ventas"})
+	if e, _ := out["error"].(string); !strings.Contains(e, "currently open") {
+		t.Fatalf("dropping the open database must be rejected, got %v", out)
+	}
+	out = mustOK(t, srv, "DROP DATABASE ventas", "")
+	if out["tag"] != "DROP DATABASE" {
+		t.Errorf("expected DROP DATABASE tag, got %v", out["tag"])
+	}
+	getJSON(t, srv, "/api/databases", &dbs)
+	if len(dbs) != 1 {
+		t.Fatalf("ventas should be gone, got %+v", dbs)
+	}
+	if code := getJSON(t, srv, "/api/schemas?database=ventas", &errResp); code != http.StatusNotFound {
+		t.Fatalf("dropped database should be 404, got %d", code)
 	}
 }

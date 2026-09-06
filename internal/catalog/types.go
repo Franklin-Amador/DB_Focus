@@ -74,6 +74,8 @@ type Job struct {
 }
 
 type Catalog struct {
+	name       string                       // database this catalog belongs to
+	cluster    *Cluster                     // owning cluster (nil when detached)
 	tables     map[string]map[string]*Table // schema -> table -> *Table
 	views      map[string]map[string]*View  // schema -> view -> *View
 	procedures map[string]*Procedure

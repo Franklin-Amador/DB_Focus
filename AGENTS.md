@@ -28,7 +28,7 @@ DB_F/
 │   └── test-*/            # Integration test programs
 ├── internal/               # Private packages
 │   ├── ast/               # Abstract Syntax Tree definitions
-│   ├── catalog/           # Table/schema metadata management
+│   ├── catalog/           # Cluster (bases de datos) → Catalog por base (schemas/tablas/vistas/rutinas)
 │   ├── constants/         # Shared constants
 │   ├── executor/          # SQL execution engine
 │   ├── parser/            # SQL lexer and parser
@@ -56,7 +56,7 @@ clásico y se usa vía el global `window.CodeMirror`.
 | `tabs.js` | Pestañas de consulta (`CodeMirror.Doc` + `swapDoc`) |
 | `results.js` | Resultados: filtro/orden/paginación, export CSV-JSON, modal de celda, script runner |
 | `sidebar.js` | Árbol de objetos (sección Schemas + objetos del esquema activo) |
-| `schemas.js` | Esquema activo (`state.schema`, selector del header) y modales crear/eliminar esquema |
+| `schemas.js` | Base y esquema activos (`state.database`/`state.schema`, selectores del header) y modales crear/eliminar base y esquema |
 | `explorer.js` | Grilla CRUD (`/api/table-data` + escrituras por `/api/query`) |
 | `diagram.js` | Diagrama ER (layout, drag, minimapa, export) |
 
@@ -316,6 +316,18 @@ Desde el refactor (Fase 2) el dispatch es **por datos, con auto-registro**: no h
    (`apiQueryRequest.Schema` → `guiDatabase`) y catálogo (`CreateView`/`LoadView`, para que
    una vista siga resolviendo sus tablas en su esquema tras el re-parseo de `QueryText`).
    Los nombres de CTE nunca se califican (viven en `public` como tablas temporales).
+7. **Jerarquía de contenedores.** `catalog.Cluster` agrupa un `*catalog.Catalog` por base de datos
+   (`postgres` por defecto, `catalog.DefaultDatabase`); el `Catalog` sigue siendo la unidad por base
+   (schemas, tablas, vistas, procedures, triggers, jobs). `catalog.New()` devuelve el default de un
+   clúster nuevo, así que tests y programas de una sola base no cambian. Cada base tiene su
+   **executor y su scheduler de jobs** (`cmd/focusd/handler.go: executorFor`, creado on demand y
+   descartado en `pruneExecutors` tras `DROP DATABASE`). Una consulta nunca cruza bases.
+8. **Claves de Pebble con base de datos.** Formato `db:<base>:table:<schema>:<t>` (ídem `view:`,
+   `proc:`, `trig:`, `job:`); metadata `meta:schema` → `databases[<base>].tables`. Un
+   `storage.Backend` está **ligado a una base** (`ForDatabase(name)` da la vista de otra). El formato
+   antiguo sin prefijo se migra una sola vez en `NewPebbleStorage` (`migrateLegacyLayout`) a
+   `postgres`; `LoadAll(cat)` carga la base ligada en `cat` y, si `cat` tiene clúster, el resto de
+   bases persistidas (creando sus catálogos).
 
 ## Work Log - Feature Integration Backlog
 
@@ -1414,3 +1426,46 @@ clave del diagrama versionada a `focusdb.diagram.v2.<schema>.<sig>`.
 **Tests**: `internal/ast/schema_test.go`, `internal/catalog/schemas_test.go`, parser
 (`TestParseCreateSchemaIfNotExists`, `TestParseTableRefSchemaAndAlias`), `cmd/focusd/gui_api_test.go`,
 `cmd/test-schemas` (incluye recarga desde Pebble). Regresión de integración completa ✅.
+
+### Session: September 6, 2026 - Bases de datos como contenedores reales (servidor → bases → esquemas)
+
+**Objetivo**: que una base de datos contenga esquemas, como en un gestor real, en vez de ser un
+alias de esquema. Decisión del usuario: jerarquía real, base por defecto `postgres`.
+
+**Catálogo**: `catalog.Cluster` (`cluster.go`: `NewCluster`, `Default`, `Database`, `Create/DropDatabase`,
+`ListDatabases`, `DatabaseExists`, `RegisterUser`, `HandleSystemQueryForDatabase`) y `Catalog.name/cluster`
+(`Name()`, `Cluster()`). `catalog.New()` = default de un clúster nuevo. `DatabaseExists` consulta el
+clúster (antes: cualquier schema no-sistema "era" una base); `pg_database`/`\l` listan el clúster;
+`information_schema.table_catalog` = nombre de la base. El segundo argumento de
+`HandleSystemQueryForDatabase` en `Catalog` pasa a ser el **esquema** de sesión (el clúster enruta
+por base y pasa `public`).
+
+**Storage**: `PebbleStorage{core *pebbleCore, dbName}`; claves `db:<base>:…`; metadata
+`Databases[<base>].Tables` (campo `Tables` legado se migra); `DatabaseStore` en `Backend`
+(`CreateDatabase`, `DeleteDatabase`, `ForDatabase`, `DatabaseName`); `migrateLegacyLayout` mueve
+claves y metadata antiguas a `postgres` una sola vez; `LoadAll` carga todas las bases en el clúster.
+`Meta().Tables` sigue devolviendo las tablas de la base ligada (compat con `cmd/test-create-schema`).
+
+**Executor**: `CREATE DATABASE` = `cluster.CreateDatabase` + `storage.CreateDatabase` (se eliminó la
+manipulación de filas de `pg_catalog.pg_database` y `calculateNextDatabaseOID`); `DROP DATABASE`
+protege la default y la base en uso, borra catálogo + claves.
+
+**Server wire**: `server.CatalogProvider` (interfaz: `DatabaseExists`, `RegisterUser`,
+`HandleSystemQueryForDatabase`); `main.go` pasa el clúster, así `psql -d otra` y `\c otra`
+seleccionan la base real y las consultas de sistema se responden dentro de ella.
+
+**cmd/focusd**: `executeHandler` (puntero) con `executorFor(db)` (executor + scheduler por base,
+lazy), `pruneExecutors` tras `DROP DATABASE`, `HandleQueryCtx(ctx, sql, database, schema)`,
+`HandleScript(..., database, schema)`. API: `apiQueryRequest.Database`, `GET /api/databases`,
+`?database=` en todos los endpoints de metadatos (`requestCatalog` → 404). Frontend:
+`state.database` (`focusdb.database.v1`; cambiar de base reinicia el esquema a `public`), selectores
+base › esquema en el header, sección Databases con `+`/`×` (modal con casilla de confirmación;
+`DROP DATABASE` se ejecuta desde `postgres`), explorador captura base+esquema, diagrama con clave
+`focusdb.diagram.v3.<base>.<schema>.<sig>`.
+
+**Tests**: `internal/storage/migration_test.go` (migración legado → `db:postgres:`; dos bases
+persisten por separado y `DeleteDatabase` borra solo una), `cmd/focusd/gui_api_test.go`
+(`TestAPIDatabasesAreIsolatedContainers`), `cmd/test-schemas` (base `analytics` con schema/tabla/
+procedure homónimos, aislamiento, `DROP DATABASE` protegido, recarga con dos bases),
+`system_handler_test.go` adaptado (base ≠ schema). Regresión de integración 30/30 y E2E en navegador
+sobre una copia del directorio `data/` real (migración verificada).

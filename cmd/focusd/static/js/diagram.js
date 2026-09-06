@@ -58,9 +58,9 @@ function schemaSig(data) {
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
   return h.toString(36);
 }
-// v2: la clave incluye el esquema activo (tablas homónimas en distintos esquemas
-// no comparten posiciones).
-function persistKey() { return 'focusdb.diagram.v2.' + state.schema + '.' + (diagData ? schemaSig(diagData) : '0'); }
+// v3: la clave incluye base y esquema activos (tablas homónimas en distintos
+// contenedores no comparten posiciones).
+function persistKey() { return 'focusdb.diagram.v3.' + state.database + '.' + state.schema + '.' + (diagData ? schemaSig(diagData) : '0'); }
 
 let persistTimer = null;
 function persistDiagram() {
@@ -77,7 +77,7 @@ function persistDiagram() {
 
 function loadPersisted(data) {
   try {
-    const raw = localStorage.getItem('focusdb.diagram.v2.' + state.schema + '.' + schemaSig(data));
+    const raw = localStorage.getItem('focusdb.diagram.v3.' + state.database + '.' + state.schema + '.' + schemaSig(data));
     if (!raw) return null;
     const st = JSON.parse(raw);
     if (!st || typeof st.positions !== 'object') return null;

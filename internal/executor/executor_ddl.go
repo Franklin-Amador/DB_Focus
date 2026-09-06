@@ -3,7 +3,6 @@ package executor
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"dbf/internal/ast"
@@ -310,155 +309,61 @@ func (e *Executor) executeDropView(ctx context.Context, stmt *ast.DropView) (*Re
 	return &Result{Tag: constants.ResultDropView}, nil
 }
 
-// executeCreateDatabase handles CREATE DATABASE statements
+// executeCreateDatabase handles CREATE DATABASE: a new, empty database in the
+// cluster (own schemas, procedures, triggers and jobs) plus its storage entry.
 func (e *Executor) executeCreateDatabase(ctx context.Context, stmt *ast.CreateDatabase) (*Result, error) {
 	dbName := stmt.Name.Name
 	if dbName == "" {
 		return nil, fmt.Errorf("database name cannot be empty")
 	}
-
-	// Check context cancellation
 	if err := checkCtx(ctx); err != nil {
 		return nil, err
 	}
-
-	// Check if database already exists
-	dbTable, err := e.catalog.GetTable(constants.CatalogDatabase)
-	if err != nil {
-		return nil, fmt.Errorf("failed to access catalog: %w", err)
+	cl := e.catalog.Cluster()
+	if cl == nil {
+		return nil, fmt.Errorf("CREATE DATABASE requires a cluster-backed catalog")
 	}
-
-	if rows, err := dbTable.SelectWhere("datname", dbName); err == nil && len(rows) > 0 {
-		return nil, fmt.Errorf("database %s already exists", dbName)
+	if _, err := cl.CreateDatabase(dbName); err != nil {
+		return nil, err
 	}
-
-	// Create database entry
-	nextOid := calculateNextDatabaseOID(dbTable)
-	row := []interface{}{
-		nextOid,                // oid
-		dbName,                 // datname
-		constants.DefaultOwner, // datdba (owner)
-		6,                      // encoding (UTF8)
-		"C",                    // datcollate
-		"C",                    // datctype
-		"c",                    // datlocprovider
-		"",                     // daticulocale
-		"",                     // daticurules
-		"",                     // datacl
-		"",                     // datcollversion
-		true,                   // datallowconn
-		false,                  // datistemplate
-	}
-
-	if err := dbTable.InsertRowUnsafe(row); err != nil {
-		return nil, fmt.Errorf("failed to insert database: %w", err)
-	}
-
-	// Keep user objects isolated per database by mapping each DB to its own schema namespace.
-	if dbName != "postgres" {
-		if err := e.catalog.CreateSchema(dbName); err != nil {
-			if !strings.Contains(err.Error(), "already exists") {
-				return nil, fmt.Errorf("failed to create schema for database %s: %w", dbName, err)
-			}
-		}
-		if e.storage != nil {
-			if err := e.storage.CreateSchema(dbName); err != nil && !strings.Contains(err.Error(), "already exists") {
-				fmt.Printf("warning: failed to persist schema for database %s: %v\n", dbName, err)
-			}
-		}
-	}
-
-	// Persist to storage
 	if e.storage != nil {
-		if err := e.storage.SaveTable(dbTable); err != nil {
-			fmt.Printf("warning: failed to persist pg_database: %v\n", err)
+		if err := e.storage.CreateDatabase(dbName); err != nil && !strings.Contains(err.Error(), "already exists") {
+			fmt.Printf("warning: failed to persist database %s: %v\n", dbName, err)
 		}
 	}
-
 	return &Result{Tag: constants.ResultCreateDatabase}, nil
 }
 
-// executeDropDatabase handles DROP DATABASE statements
+// executeDropDatabase handles DROP DATABASE: removes the database and every
+// object inside it. The default database and the database the statement runs
+// in are protected.
 func (e *Executor) executeDropDatabase(ctx context.Context, stmt *ast.DropDatabase) (*Result, error) {
 	dbName := stmt.Name
 	if dbName == "" {
 		return nil, fmt.Errorf("database name cannot be empty")
 	}
-
-	// Check context cancellation
 	if err := checkCtx(ctx); err != nil {
 		return nil, err
 	}
-
-	// Check if database exists
-	dbTable, err := e.catalog.GetTable(constants.CatalogDatabase)
-	if err != nil {
-		return nil, fmt.Errorf("failed to access catalog: %w", err)
+	cl := e.catalog.Cluster()
+	if cl == nil {
+		return nil, fmt.Errorf("DROP DATABASE requires a cluster-backed catalog")
 	}
-
-	rows, err := dbTable.SelectWhere("datname", dbName)
-	if err != nil || len(rows) == 0 {
-		return nil, fmt.Errorf("database %s does not exist", dbName)
-	}
-
-	// A database is a schema namespace in FocusDB: dropping it removes the
-	// namespace and every object inside (like DROP DATABASE would). The
-	// default database maps to "public", which can never be dropped.
-	if catalog.IsProtectedSchema(dbName) || dbName == "postgres" {
+	if dbName == catalog.DefaultDatabase {
 		return nil, fmt.Errorf("cannot drop database %s: it is the default database", dbName)
 	}
-	if e.catalog.SchemaExists(dbName) {
-		if err := e.dropSchemaEverywhere(dbName); err != nil {
-			return nil, fmt.Errorf("failed to drop database %s: %w", dbName, err)
-		}
+	if dbName == e.catalog.Name() {
+		return nil, fmt.Errorf("cannot drop database %s: it is currently open", dbName)
 	}
-
-	// Delete the database entry
-	if err := dbTable.DeleteWhere("datname", dbName); err != nil {
-		return nil, fmt.Errorf("failed to delete database: %w", err)
+	if err := cl.DropDatabase(dbName); err != nil {
+		return nil, err
 	}
-
-	// Persist to storage
 	if e.storage != nil {
-		if err := e.storage.SaveTable(dbTable); err != nil {
-			fmt.Printf("warning: failed to persist pg_database after DELETE: %v\n", err)
+		if err := e.storage.DeleteDatabase(dbName); err != nil {
+			fmt.Printf("warning: failed to delete persisted database %s: %v\n", dbName, err)
 		}
 	}
-
 	return &Result{Tag: constants.ResultDropDatabase}, nil
-}
-
-// calculateNextDatabaseOID calculates the next available OID for a database
-func calculateNextDatabaseOID(table *catalog.Table) int {
-	maxOID := 0
-	rows := table.SelectAll()
-
-	for _, row := range rows {
-		if len(row) == 0 {
-			continue
-		}
-
-		switch v := row[0].(type) {
-		case int:
-			if v > maxOID {
-				maxOID = v
-			}
-		case int64:
-			if int(v) > maxOID {
-				maxOID = int(v)
-			}
-		case string:
-			if parsed, err := strconv.Atoi(v); err == nil && parsed > maxOID {
-				maxOID = parsed
-			}
-		}
-	}
-
-	if maxOID < 1 {
-		maxOID = 1
-	}
-
-	return maxOID + 1
 }
 
 // executeCreateSchema handles CREATE SCHEMA statements

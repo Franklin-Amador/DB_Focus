@@ -59,7 +59,7 @@ func withMethod(method string, next http.HandlerFunc) http.HandlerFunc {
 // newGUIMux mounts the API routes (and, when static is non-nil, the embedded
 // GUI files). Separated from startGUIServer so tests can drive the API with
 // httptest without opening a port.
-func newGUIMux(h executeHandler, cat *catalog.Catalog, queryTimeout time.Duration, static fs.FS) *http.ServeMux {
+func newGUIMux(h *executeHandler, cl *catalog.Cluster, queryTimeout time.Duration, static fs.FS) *http.ServeMux {
 	mux := http.NewServeMux()
 	if static != nil {
 		mux.Handle("/", withStaticHeaders(http.FileServer(http.FS(static))))
@@ -67,21 +67,22 @@ func newGUIMux(h executeHandler, cat *catalog.Catalog, queryTimeout time.Duratio
 	mux.HandleFunc("/api/query", withMethod(http.MethodPost, handleAPIQuery(h, queryTimeout)))
 	mux.HandleFunc("/api/script", withMethod(http.MethodPost, handleAPIScript(h, queryTimeout)))
 	mux.HandleFunc("/api/validate", withMethod(http.MethodPost, handleAPIValidate()))
-	mux.HandleFunc("/api/schemas", withMethod(http.MethodGet, handleAPISchemas(cat)))
-	mux.HandleFunc("/api/schema", withMethod(http.MethodGet, handleAPISchema(cat)))
-	mux.HandleFunc("/api/objects", withMethod(http.MethodGet, handleAPIObjects(cat)))
-	mux.HandleFunc("/api/diagram", withMethod(http.MethodGet, handleAPIDiagram(cat)))
-	mux.HandleFunc("/api/table-data", withMethod(http.MethodGet, handleAPITableData(cat)))
+	mux.HandleFunc("/api/databases", withMethod(http.MethodGet, handleAPIDatabases(cl)))
+	mux.HandleFunc("/api/schemas", withMethod(http.MethodGet, handleAPISchemas(cl)))
+	mux.HandleFunc("/api/schema", withMethod(http.MethodGet, handleAPISchema(cl)))
+	mux.HandleFunc("/api/objects", withMethod(http.MethodGet, handleAPIObjects(cl)))
+	mux.HandleFunc("/api/diagram", withMethod(http.MethodGet, handleAPIDiagram(cl)))
+	mux.HandleFunc("/api/table-data", withMethod(http.MethodGet, handleAPITableData(cl)))
 	return mux
 }
 
-func startGUIServer(addr string, h executeHandler, cat *catalog.Catalog, queryTimeout time.Duration) {
+func startGUIServer(addr string, h *executeHandler, cl *catalog.Cluster, queryTimeout time.Duration) {
 	sub, err := fs.Sub(staticFiles, "static")
 	if err != nil {
 		log.Printf("focus: gui: failed to mount static files: %v", err)
 		return
 	}
-	mux := newGUIMux(h, cat, queryTimeout, sub)
+	mux := newGUIMux(h, cl, queryTimeout, sub)
 
 	srv := &http.Server{
 		Addr:              addr,

@@ -2,8 +2,8 @@
 // schema (ast.ApplyDefaultSchema, as used by the GUI and the wire protocol),
 // schema-qualified table references with aliases, views bound to their
 // schema, cross-schema JOINs, CREATE SCHEMA IF NOT EXISTS, protected schemas,
-// DROP DATABASE as a schema drop, and persistence of a schema + view across a
-// storage reload.
+// databases as isolated containers (own schemas, executor and storage), and
+// persistence of schemas, views and databases across a storage reload.
 package main
 
 import (
@@ -132,12 +132,41 @@ func main() {
 	expectErr(ctx, exe, "", "DROP SCHEMA public", "system schema")
 	expectErr(ctx, exe, "", "DROP SCHEMA pg_catalog CASCADE", "system schema")
 	expectErr(ctx, exe, "", "DROP SCHEMA tienda", "not empty")
-	expectTag(ctx, exe, "", "CREATE DATABASE analytics", "CREATE DATABASE")
-	query(ctx, exe, "analytics", "CREATE TABLE hechos (id INT)")
-	expectTag(ctx, exe, "", "DROP DATABASE analytics", "DROP DATABASE")
-	expectErr(ctx, exe, "analytics", "SELECT * FROM hechos", "does not exist")
 	expectErr(ctx, exe, "", "DROP DATABASE postgres", "default database")
+
+	fmt.Println("\n--- Databases as isolated containers ---")
+	cl := cat.Cluster()
+	expectTag(ctx, exe, "", "CREATE DATABASE analytics", "CREATE DATABASE")
+	expectErr(ctx, exe, "", "CREATE DATABASE analytics", "already exists")
+	anCat, ok := cl.Database("analytics")
+	if !ok {
+		log.Fatal("analytics database missing from cluster")
+	}
+	anExe := executor.New(anCat, st.ForDatabase("analytics"))
+	// Same names, different databases: no interference.
+	query(ctx, anExe, "", "CREATE SCHEMA tienda")
+	query(ctx, anExe, "tienda", "CREATE TABLE productos (id INT IDENTITY PRIMARY KEY, nombre TEXT, precio INT)")
+	query(ctx, anExe, "tienda", "INSERT INTO productos (nombre, precio) VALUES ('cuaderno', 30)")
+	expectRows(ctx, anExe, "tienda", "SELECT nombre FROM productos", []string{"cuaderno"})
+	expectRows(ctx, exe, "tienda", "SELECT nombre FROM productos ORDER BY nombre", []string{"lapiz", "tinta"})
+	query(ctx, anExe, "", "CREATE TABLE hechos (id INT)")
+	expectErr(ctx, exe, "", "SELECT * FROM hechos", "not found")
+	// Procedures are per database too.
+	query(ctx, anExe, "", "CREATE PROCEDURE limpiar() AS BEGIN DELETE FROM hechos WHERE id = 0; END")
+	if _, err := cat.GetProcedure("limpiar"); err == nil {
+		log.Fatal("procedure of analytics leaked into postgres")
+	}
+	fmt.Println("OK  procedure limpiar only exists in analytics")
+	expectErr(ctx, anExe, "", "DROP DATABASE analytics", "currently open")
 	names := []string{}
+	for _, d := range cl.ListDatabases() {
+		names = append(names, fmt.Sprintf("%s(%d schemas)", d.Name, d.Schemas))
+	}
+	fmt.Println("OK  ListDatabases ->", names)
+	if len(names) != 2 || names[1] != "analytics(2 schemas)" {
+		log.Fatalf("unexpected database listing %v", names)
+	}
+	names = names[:0]
 	for _, s := range cat.ListSchemas() {
 		names = append(names, s.Name)
 	}
@@ -160,6 +189,20 @@ func main() {
 		log.Fatal(err)
 	}
 	exe2 := executor.New(cat2, st2)
+	// The second database came back with its own schema, table and procedure.
+	an2, ok := cat2.Cluster().Database("analytics")
+	if !ok {
+		log.Fatal("analytics database not reloaded")
+	}
+	anExe2 := executor.New(an2, st2.ForDatabase("analytics"))
+	expectRows(ctx, anExe2, "tienda", "SELECT nombre FROM productos", []string{"cuaderno"})
+	if _, err := an2.GetProcedure("limpiar"); err != nil {
+		log.Fatalf("procedure not reloaded in analytics: %v", err)
+	}
+	expectTag(ctx, exe2, "", "DROP DATABASE analytics", "DROP DATABASE")
+	if cat2.Cluster().DatabaseExists("analytics") {
+		log.Fatal("analytics still exists after DROP DATABASE")
+	}
 	expectRows(ctx, exe2, "tienda", "SELECT nombre FROM productos ORDER BY nombre", []string{"lapiz", "tinta"})
 	expectRows(ctx, exe2, "tienda", "SELECT * FROM caros", []string{"tinta|20"})
 	expectRows(ctx, exe2, "", "SELECT * FROM tienda.caros", []string{"tinta|20"})

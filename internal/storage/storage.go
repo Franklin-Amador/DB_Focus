@@ -57,9 +57,25 @@ type SchemaStore interface {
 	DeleteSchema(name string) error
 }
 
+// DatabaseStore persists database namespaces. A Backend value is bound to one
+// database; ForDatabase returns the same backend bound to another one.
+type DatabaseStore interface {
+	// CreateDatabase registers an empty database in persistent storage.
+	CreateDatabase(name string) error
+	// DeleteDatabase removes a database and every object inside it.
+	DeleteDatabase(name string) error
+	// ForDatabase returns a view of the backend bound to the named database.
+	ForDatabase(name string) Backend
+	// DatabaseName returns the database this backend value is bound to.
+	DatabaseName() string
+}
+
 // Backend is the full storage contract, composing every per-responsibility
 // store plus lifecycle operations. Implementations (e.g. PebbleStorage) satisfy
 // the whole interface; callers may depend on a narrower store where possible.
+//
+// LoadAll loads the bound database into cat and, when cat belongs to a
+// cluster, every other persisted database into that cluster.
 type Backend interface {
 	TableStore
 	ViewStore
@@ -67,6 +83,7 @@ type Backend interface {
 	TriggerStore
 	JobStore
 	SchemaStore
+	DatabaseStore
 	LoadAll(cat *catalog.Catalog) error
 	Close() error
 }

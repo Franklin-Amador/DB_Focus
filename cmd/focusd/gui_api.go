@@ -23,9 +23,21 @@ import (
 type apiQueryRequest struct {
 	SQL     string `json:"sql"`
 	MaxRows int    `json:"maxRows,omitempty"`
+	// Database is the GUI's active database (the statements run inside it).
+	// Empty means the default database.
+	Database string `json:"database,omitempty"`
 	// Schema is the GUI's active schema: unqualified object names in the SQL
 	// resolve inside it (like a session search_path). Empty means "public".
 	Schema string `json:"schema,omitempty"`
+}
+
+// apiDatabaseInfo describes one database for the sidebar/selector.
+type apiDatabaseInfo struct {
+	Name      string `json:"name"`
+	Schemas   int    `json:"schemas"`
+	Tables    int    `json:"tables"`
+	Views     int    `json:"views"`
+	IsDefault bool   `json:"isDefault"`
 }
 
 // apiSchemaInfo describes one user-visible schema for the sidebar/selector.
@@ -239,7 +251,7 @@ func (m *tableMeta) apiColumns() []apiColumnInfo {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
-func handleAPIQuery(h executeHandler, timeout time.Duration) http.HandlerFunc {
+func handleAPIQuery(h *executeHandler, timeout time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req apiQueryRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -255,7 +267,7 @@ func handleAPIQuery(h executeHandler, timeout time.Duration) http.HandlerFunc {
 		defer cancel()
 
 		start := time.Now()
-		result, err := h.HandleWithDatabaseCtx(ctx, req.SQL, guiDatabase(req.Schema))
+		result, err := h.HandleQueryCtx(ctx, req.SQL, req.Database, req.Schema)
 		elapsed := time.Since(start).Milliseconds()
 
 		if err != nil {
@@ -279,7 +291,7 @@ func handleAPIQuery(h executeHandler, timeout time.Duration) http.HandlerFunc {
 	}
 }
 
-func handleAPIScript(h executeHandler, timeout time.Duration) http.HandlerFunc {
+func handleAPIScript(h *executeHandler, timeout time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req apiQueryRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -294,7 +306,7 @@ func handleAPIScript(h executeHandler, timeout time.Duration) http.HandlerFunc {
 		ctx, cancel := queryContext(r, timeout)
 		defer cancel()
 
-		res := h.HandleScript(ctx, req.SQL, req.MaxRows, guiDatabase(req.Schema))
+		res := h.HandleScript(ctx, req.SQL, req.MaxRows, req.Database, req.Schema)
 
 		resp := apiScriptResponse{
 			Results:     make([]apiScriptStatement, 0, len(res.Results)),
@@ -319,9 +331,25 @@ func handleAPIScript(h executeHandler, timeout time.Duration) http.HandlerFunc {
 	}
 }
 
-// handleAPISchemas lists the user-visible schemas with object counts.
-func handleAPISchemas(cat *catalog.Catalog) http.HandlerFunc {
+// handleAPIDatabases lists the databases of the cluster with object counts.
+func handleAPIDatabases(cl *catalog.Cluster) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		infos := cl.ListDatabases()
+		out := make([]apiDatabaseInfo, 0, len(infos))
+		for _, d := range infos {
+			out = append(out, apiDatabaseInfo{Name: d.Name, Schemas: d.Schemas, Tables: d.Tables, Views: d.Views, IsDefault: d.IsDefault})
+		}
+		writeJSON(w, out)
+	}
+}
+
+// handleAPISchemas lists the user-visible schemas of a database with object counts.
+func handleAPISchemas(cl *catalog.Cluster) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cat, ok := requestCatalog(w, r, cl)
+		if !ok {
+			return
+		}
 		infos := cat.ListSchemas()
 		out := make([]apiSchemaInfo, 0, len(infos))
 		for _, s := range infos {
@@ -331,8 +359,12 @@ func handleAPISchemas(cat *catalog.Catalog) http.HandlerFunc {
 	}
 }
 
-func handleAPISchema(cat *catalog.Catalog) http.HandlerFunc {
+func handleAPISchema(cl *catalog.Cluster) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		cat, ok := requestCatalog(w, r, cl)
+		if !ok {
+			return
+		}
 		schema, ok := requestSchema(w, r, cat)
 		if !ok {
 			return
@@ -378,8 +410,12 @@ func handleAPISchema(cat *catalog.Catalog) http.HandlerFunc {
 	}
 }
 
-func handleAPIObjects(cat *catalog.Catalog) http.HandlerFunc {
+func handleAPIObjects(cl *catalog.Cluster) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		cat, ok := requestCatalog(w, r, cl)
+		if !ok {
+			return
+		}
 		triggers := cat.GetAllTriggers()
 		jobs := cat.GetAllJobs()
 		procs := cat.GetAllProcedures()
@@ -458,8 +494,12 @@ func jobIntervalSeconds(interval int, unit string) int {
 	return interval
 }
 
-func handleAPIDiagram(cat *catalog.Catalog) http.HandlerFunc {
+func handleAPIDiagram(cl *catalog.Cluster) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		cat, ok := requestCatalog(w, r, cl)
+		if !ok {
+			return
+		}
 		schema, ok := requestSchema(w, r, cat)
 		if !ok {
 			return
@@ -547,8 +587,12 @@ func handleAPIValidate() http.HandlerFunc {
 // handleAPITableData sirve páginas de filas de una tabla para el explorador.
 // Las escrituras del explorador NO pasan por aquí: van por /api/query para
 // atravesar executor → triggers → persistencia.
-func handleAPITableData(cat *catalog.Catalog) http.HandlerFunc {
+func handleAPITableData(cl *catalog.Cluster) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		cat, ok := requestCatalog(w, r, cl)
+		if !ok {
+			return
+		}
 		name := r.URL.Query().Get("table")
 		if name == "" {
 			w.WriteHeader(http.StatusBadRequest)
@@ -628,13 +672,18 @@ func handleAPITableData(cat *catalog.Catalog) http.HandlerFunc {
 
 // ─── Utilidades ───────────────────────────────────────────────────────────────
 
-// guiDatabase maps the GUI's active schema to the "current database" the
-// execution path expects (empty/public → the default "postgres" namespace).
-func guiDatabase(schema string) string {
-	if schema == "" || schema == "public" {
-		return "postgres"
+// requestCatalog reads the optional ?database= parameter (default database)
+// and answers 404 when the database does not exist. ok=false means the
+// response was already written.
+func requestCatalog(w http.ResponseWriter, r *http.Request, cl *catalog.Cluster) (*catalog.Catalog, bool) {
+	name := r.URL.Query().Get("database")
+	cat, ok := cl.Database(name)
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		writeJSON(w, map[string]string{"error": "database not found: " + name})
+		return nil, false
 	}
-	return schema
+	return cat, true
 }
 
 // requestSchema reads the optional ?schema= parameter (default "public") and

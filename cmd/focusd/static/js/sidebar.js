@@ -4,7 +4,7 @@ import { icon } from './icons.js';
 import { render, escHtml, escAttr } from './dom.js';
 import { apiSchema, apiObjects } from './api.js';
 import { runQuery } from './editor.js';
-import { loadSchemas, getSchemas } from './schemas.js';
+import { loadDatabases, getDatabases, loadSchemas, getSchemas } from './schemas.js';
 
 let schemaData  = [];
 let objectsData = { triggers: [], jobs: [], procedures: [] };
@@ -12,7 +12,8 @@ let tableNames = [], colNames = [];
 
 export async function loadSidebar() {
   try {
-    // Primero los esquemas (puede corregir state.schema si el activo ya no existe).
+    // Primero base y esquemas (pueden corregir el activo si ya no existe).
+    await loadDatabases();
     await loadSchemas();
     const [schemaRes, objRes] = await Promise.all([apiSchema(), apiObjects()]);
     schemaData  = Array.isArray(schemaRes) ? schemaRes : [];
@@ -44,15 +45,32 @@ export function renderSidebar(filter) {
 
   let html = '';
 
-  // ── Schemas: el activo se resalta; click cambia el esquema activo.
+  // ── Databases: contenedores aislados; click cambia la base activa.
+  const dbItems = getDatabases().filter(d => !f || d.name.toLowerCase().includes(f));
+  html += sectionHTML(icon('schema'), 'Databases', 'sec-dbs', dbItems.map(d => {
+    const active = d.name === state.database;
+    const summary = `${d.schemas} esquema${d.schemas !== 1 ? 's' : ''} · ${d.tables} tabla${d.tables !== 1 ? 's' : ''} · ${d.views} vista${d.views !== 1 ? 's' : ''}`;
+    return `
+      <div class="t-item ${active ? 'selected' : ''}" onclick="setActiveDatabase('${escAttr(d.name)}')"
+           title="${escAttr(summary + (active ? ' · activa' : ' · click para activar'))}">
+        <span class="ico">${icon('schema', 13)}</span>
+        <span class="lbl">${escHtml(d.name)}</span>
+        <span class="cnt">${d.tables + d.views}</span>
+        ${d.isDefault ? '' : `<button class="t-act" title="Eliminar base de datos"
+          onclick="event.stopPropagation();databaseDropOpen('${escAttr(d.name)}')">×</button>`}
+      </div>`;
+  }), dbItems.length,
+    `<button class="sec-act" title="Nueva base de datos" onclick="event.stopPropagation();databaseCreateOpen()">+</button>`);
+
+  // ── Schemas (de la base activa): el activo se resalta; click cambia el esquema activo.
   const schemaItems = getSchemas().filter(s => !f || s.name.toLowerCase().includes(f));
-  html += sectionHTML(icon('schema'), 'Schemas', 'sec-schemas', schemaItems.map(s => {
+  html += sectionHTML(icon('folder'), `Schemas <span class="sec-sub">· ${escHtml(state.database)}</span>`, 'sec-schemas', schemaItems.map(s => {
     const active = s.name === state.schema;
     const summary = `${s.tables} tabla${s.tables !== 1 ? 's' : ''} · ${s.views} vista${s.views !== 1 ? 's' : ''}`;
     return `
       <div class="t-item ${active ? 'selected' : ''}" onclick="setActiveSchema('${escAttr(s.name)}')"
            title="${escAttr(summary + (active ? ' · activo' : ' · click para activar'))}">
-        <span class="ico">${icon('schema', 13)}</span>
+        <span class="ico">${icon('folder', 13)}</span>
         <span class="lbl">${escHtml(s.name)}</span>
         <span class="cnt">${s.tables + s.views}</span>
         ${s.isDefault ? '' : `<button class="t-act" title="Eliminar esquema"

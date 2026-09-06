@@ -9,11 +9,11 @@ import { state } from './state.js';
 
 const LIMIT = 100;
 
-let ex = null;  // {schema, table, offset, total, columns, pk, rows}
+let ex = null;  // {database, schema, table, offset, total, columns, pk, rows}
 
-// Las escrituras se califican con el esquema del explorador (capturado al
-// abrirlo), aunque el usuario cambie el esquema activo mientras tanto.
-function runWrite(sql) { return apiQuery(sql, { schema: ex.schema }); }
+// Las escrituras corren en la base y el esquema del explorador (capturados al
+// abrirlo), aunque el usuario cambie los activos mientras tanto.
+function runWrite(sql) { return apiQuery(sql, { database: ex.database, schema: ex.schema }); }
 
 function quoteIdent(name) {
   return /^[a-z_][a-z0-9_]*$/.test(name) ? name : '"' + name.replace(/"/g, '""') + '"';
@@ -38,7 +38,7 @@ function pkWhere(row) {
 export async function openExplorer(table) {
   const { showView } = await import('./app.js');
   showView('explorer');
-  ex = { schema: state.schema, table, offset: 0, total: 0, columns: [], pk: [], rows: [] };
+  ex = { database: state.database, schema: state.schema, table, offset: 0, total: 0, columns: [], pk: [], rows: [] };
   await loadExplorerPage(0);
 }
 
@@ -47,7 +47,7 @@ export async function loadExplorerPage(offset) {
   const statusEl = document.getElementById('explorer-status');
   if (statusEl) statusEl.textContent = 'Cargando…';
   try {
-    const data = await apiTableData(ex.table, offset, LIMIT, ex.schema);
+    const data = await apiTableData(ex.table, offset, LIMIT, ex.schema, ex.database);
     if (data.error) {
       showToast(data.error, 'err');
       if (statusEl) statusEl.textContent = data.error;
@@ -77,7 +77,10 @@ export function explorerPage(delta) {
 
 function renderExplorer() {
   const title = document.getElementById('explorer-title');
-  if (title) title.textContent = ex.schema === 'public' ? ex.table : `${ex.schema}.${ex.table}`;
+  if (title) {
+    const qualified = ex.schema === 'public' ? ex.table : `${ex.schema}.${ex.table}`;
+    title.textContent = ex.database === 'postgres' ? qualified : `${ex.database} › ${qualified}`;
+  }
 
   const editable = ex.pk.length > 0;
   const page = Math.floor(ex.offset / LIMIT) + 1;

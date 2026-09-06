@@ -23,6 +23,7 @@ import {
 } from './explorer.js';
 import {
   setActiveSchema, schemaCreateOpen, schemaCreateConfirm, schemaDropOpen, schemaDropConfirm,
+  setActiveDatabase, databaseCreateOpen, databaseCreateConfirm, databaseDropOpen, databaseDropConfirm,
 } from './schemas.js';
 
 // ─── Tabs (Resultados / Historial) ───────────────────────────────────────────
@@ -44,8 +45,8 @@ export function refreshSidebar() {
   }, 400);
 }
 
-// ─── Cambio de esquema activo ─────────────────────────────────────────────────
-// El árbol, el diagrama y el explorador dependen del esquema: se recargan.
+// ─── Cambio de base o esquema activos ─────────────────────────────────────────
+// El árbol, el diagrama y el explorador dependen de ambos: se recargan.
 export function onSchemaChanged() {
   loadSidebar();
   discardDiagram();
@@ -87,8 +88,9 @@ Object.assign(window, {
   // explorador de datos
   openExplorer, explorerPage, explorerRefresh, explorerEditCell,
   explorerDeleteRow, explorerDeleteConfirm, explorerInsertOpen, explorerInsertConfirm,
-  // esquemas (header + sidebar + modales)
+  // bases de datos y esquemas (header + sidebar + modales)
   setActiveSchema, schemaCreateOpen, schemaCreateConfirm, schemaDropOpen, schemaDropConfirm,
+  setActiveDatabase, databaseCreateOpen, databaseCreateConfirm, databaseDropOpen, databaseDropConfirm,
 });
 
 // ─── Bootstrap ────────────────────────────────────────────────────────────────

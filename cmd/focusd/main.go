@@ -10,21 +10,20 @@ import (
 	"time"
 
 	"dbf/internal/catalog"
-	"dbf/internal/executor"
 	"dbf/internal/server"
 	"dbf/internal/storage"
 )
 
 func main() {
-	addr     := flag.String("addr",    ":4444", "PostgreSQL wire protocol address")
-	guiAddr  := flag.String("gui",     ":9011", "GUI studio address")
-	dataDir  := flag.String("data",    "./data", "data directory for persistence")
-	maxConns := flag.Int("max-conns",  20,   "max concurrent connections")
-	bufSize  := flag.Int("buf-size",   4096, "buffer size per connection in bytes")
+	addr := flag.String("addr", ":4444", "PostgreSQL wire protocol address")
+	guiAddr := flag.String("gui", ":9011", "GUI studio address")
+	dataDir := flag.String("data", "./data", "data directory for persistence")
+	maxConns := flag.Int("max-conns", 20, "max concurrent connections")
+	bufSize := flag.Int("buf-size", 4096, "buffer size per connection in bytes")
 	queryTimeout := flag.Duration("query-timeout", 60*time.Second, "max duration for a GUI query (0 = no limit)")
 	flag.Parse()
 
-	cat := catalog.New()
+	cluster := catalog.NewCluster()
 
 	st, err := storage.NewPebbleStorage(*dataDir)
 	if err != nil {
@@ -32,19 +31,14 @@ func main() {
 	}
 	defer st.Close()
 
-	if err := st.LoadAll(cat); err != nil {
+	// Loads the default database and every other persisted database into the cluster.
+	if err := st.LoadAll(cluster.Default()); err != nil {
 		log.Printf("focus: warning: failed to load persisted data: %v", err)
 	}
-
-	exe := executor.New(cat, st)
 
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	// Start job scheduler
-	exe.StartJobScheduler(ctx)
-	log.Printf("focus: job scheduler started")
 
 	// Handle graceful shutdown
 	go func() {
@@ -58,10 +52,9 @@ func main() {
 	log.Printf("focus: starting on %s (data dir: %s) [pebble backend]", *addr, *dataDir)
 	log.Printf("focus: limits - max connections: %d, buffer size: %d bytes", *maxConns, *bufSize)
 
-	handler := executeHandler{
-		executor: exe,
-		catalog:  cat,
-	}
+	// One executor + job scheduler per database (created lazily for new ones).
+	handler := newExecuteHandler(ctx, cluster, st)
+	log.Printf("focus: %d database(s) online, job schedulers started", len(cluster.ListDatabases()))
 
 	// If $PORT is set (Render, Railway, Fly.io…) the GUI listens there so the
 	// platform can route external HTTP traffic to it. Otherwise use -gui flag.
@@ -69,9 +62,9 @@ func main() {
 	if envPort := os.Getenv("PORT"); envPort != "" {
 		guiListen = "0.0.0.0:" + envPort
 	}
-	go startGUIServer(guiListen, handler, cat, *queryTimeout)
+	go startGUIServer(guiListen, handler, cluster, *queryTimeout)
 
-	if err := server.ListenAndServeWithConfig(*addr, handler, cat, *maxConns, *bufSize); err != nil {
+	if err := server.ListenAndServeWithConfig(*addr, handler, cluster, *maxConns, *bufSize); err != nil {
 		log.Fatalf("focus: %v", err)
 	}
 }

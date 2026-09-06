@@ -220,62 +220,18 @@ func (c *Catalog) getSearchPath() *SystemResult {
 	}
 }
 
+// getPgDatabase lists the databases of the cluster (\l, pg_database).
 func (c *Catalog) getPgDatabase() *SystemResult {
 	columns := []string{"oid", "datname", "datdba", "encoding", "datcollate", "datctype", "datlocprovider", "daticulocale", "daticurules", "datacl", "datcollversion", "datallowconn", "datistemplate"}
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	rows := make([][]interface{}, 0)
-	seen := make(map[string]struct{})
-	maxOID := 1
-
-	if pgCatalog, ok := c.tables["pg_catalog"]; ok {
-		if table, ok := pgCatalog["pg_database"]; ok && table != nil {
-			rawRows := table.SelectAll()
-			for _, row := range rawRows {
-				normalized := make([]interface{}, len(columns))
-				copy(normalized, row)
-				rows = append(rows, normalized)
-
-				if len(row) > 0 {
-					switch v := row[0].(type) {
-					case int:
-						if v > maxOID {
-							maxOID = v
-						}
-					case int64:
-						if int(v) > maxOID {
-							maxOID = int(v)
-						}
-					}
-				}
-				if len(row) > 1 {
-					if name, ok := row[1].(string); ok && name != "" {
-						seen[name] = struct{}{}
-					}
-				}
-			}
-		}
+	infos := []DatabaseInfo{{Name: c.Name(), IsDefault: true}}
+	if c.cluster != nil {
+		infos = c.cluster.ListDatabases()
 	}
-
-	// Keep \l resilient: any non-system schema behaves like a user database namespace.
-	for schemaName := range c.tables {
-		if schemaName == "pg_catalog" || schemaName == "public" || schemaName == "information_schema" || schemaName == "pg_toast" {
-			continue
-		}
-		if _, exists := seen[schemaName]; exists {
-			continue
-		}
-		maxOID++
-		rows = append(rows, []interface{}{maxOID, schemaName, 10, 6, "C", "C", "c", "", "", "", "", true, false})
-		seen[schemaName] = struct{}{}
+	rows := make([][]interface{}, 0, len(infos))
+	for i, info := range infos {
+		rows = append(rows, []interface{}{i + 1, info.Name, 10, 6, "C", "C", "c", "", "", "", "", true, false})
 	}
-
-	if len(rows) == 0 {
-		rows = append(rows, []interface{}{1, "postgres", 10, 6, "C", "C", "c", "", "", "", "", true, false})
-	}
-
 	return &SystemResult{Columns: columns, Rows: rows, Tag: fmt.Sprintf("SELECT %d", len(rows))}
 }
 

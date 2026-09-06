@@ -90,6 +90,7 @@ const SNIPPETS = [
   { text: 'DELETE FROM  WHERE ',                     displayText: 'DELETE FROM … WHERE …' },
   { text: 'CREATE TABLE  (id INTEGER IDENTITY PRIMARY KEY)', displayText: 'CREATE TABLE …' },
   { text: 'CREATE SCHEMA ',                             displayText: 'CREATE SCHEMA …' },
+  { text: 'CREATE DATABASE ',                           displayText: 'CREATE DATABASE …' },
   { text: 'INNER JOIN  ON ',                         displayText: 'INNER JOIN … ON …' },
   { text: 'LEFT JOIN  ON ',                          displayText: 'LEFT JOIN … ON …' },
   { text: 'GROUP BY ',                               displayText: 'GROUP BY …' },

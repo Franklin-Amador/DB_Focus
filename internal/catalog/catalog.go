@@ -1,8 +1,17 @@
 package catalog
 
-
+// New returns the default database of a fresh cluster. Code that only needs
+// one database (tests, integration programs) keeps working unchanged, while
+// CREATE DATABASE and friends reach the cluster through Catalog.Cluster().
 func New() *Catalog {
+	return NewCluster().Default()
+}
+
+// newCatalog builds the catalog of one database: public schema + system catalog.
+func newCatalog(name string, cl *Cluster) *Catalog {
 	c := &Catalog{
+		name:       name,
+		cluster:    cl,
 		tables:     make(map[string]map[string]*Table),
 		views:      make(map[string]map[string]*View),
 		procedures: make(map[string]*Procedure),
@@ -16,8 +25,11 @@ func New() *Catalog {
 	return c
 }
 
+// resolveDatabaseSchema maps the session context passed to the system-query
+// handlers to a schema name. Callers pass the session schema ("public" by
+// default); the historical database aliases "" and "postgres" also mean public.
 func resolveDatabaseSchema(currentDatabase string) string {
-	if currentDatabase == "" || currentDatabase == "postgres" {
+	if currentDatabase == "" || currentDatabase == DefaultDatabase {
 		return "public"
 	}
 	return currentDatabase
@@ -47,10 +59,10 @@ func (c *Catalog) GetInformationSchemaTablesForDatabase(currentDatabase string) 
 				continue
 			}
 			rows = append(rows, []interface{}{
-				currentDatabase, // table_catalog
-				schema,          // table_schema
-				name,            // table_name
-				"BASE TABLE",    // table_type
+				c.Name(),     // table_catalog
+				schema,       // table_schema
+				name,         // table_name
+				"BASE TABLE", // table_type
 			})
 		}
 	}
@@ -58,10 +70,10 @@ func (c *Catalog) GetInformationSchemaTablesForDatabase(currentDatabase string) 
 	if views, ok := c.views[targetSchema]; ok {
 		for name := range views {
 			rows = append(rows, []interface{}{
-				currentDatabase, // table_catalog
-				targetSchema,    // table_schema
-				name,            // table_name
-				"VIEW",          // table_type
+				c.Name(),     // table_catalog
+				targetSchema, // table_schema
+				name,         // table_name
+				"VIEW",       // table_type
 			})
 		}
 	}
@@ -93,12 +105,12 @@ func (c *Catalog) GetInformationSchemaColumnsForDatabase(currentDatabase string)
 			}
 			for i, col := range table.Columns {
 				rows = append(rows, []interface{}{
-					currentDatabase, // table_catalog
-					schema,          // table_schema
-					tName,           // table_name
-					col.Name,        // column_name
-					int32(i + 1),    // ordinal_position
-					col.Type,        // data_type
+					c.Name(),     // table_catalog
+					schema,       // table_schema
+					tName,        // table_name
+					col.Name,     // column_name
+					int32(i + 1), // ordinal_position
+					col.Type,     // data_type
 				})
 			}
 		}
@@ -108,7 +120,7 @@ func (c *Catalog) GetInformationSchemaColumnsForDatabase(currentDatabase string)
 		for vName, view := range views {
 			for i, col := range view.Columns {
 				rows = append(rows, []interface{}{
-					currentDatabase,
+					c.Name(),
 					targetSchema,
 					vName,
 					col.Name,

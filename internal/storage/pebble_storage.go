@@ -51,14 +51,109 @@ func parseBody(text string) ([]ast.Statement, error) {
 	return body, nil
 }
 
-// PebbleStorage wraps Pebble DB for persistent table storage with WAL
-type PebbleStorage struct {
+// pebbleCore is the shared Pebble instance behind every database-bound
+// PebbleStorage value: one file set, one lock, one metadata document.
+type pebbleCore struct {
 	db    *pebble.DB
 	dir   string
 	mu    sync.RWMutex
 	wal   *pebble.WriteOptions
 	meta  *TableMetadata
 	cache *pebble.Cache
+}
+
+// PebbleStorage wraps Pebble DB for persistent table storage with WAL. A value
+// is bound to one database: every key it reads or writes is prefixed with
+// "db:<name>:" and its metadata lives under Databases[<name>].
+type PebbleStorage struct {
+	core   *pebbleCore
+	dbName string
+}
+
+// key namespaces a storage key under the bound database.
+func (ps *PebbleStorage) key(k string) []byte {
+	return []byte(ps.prefix() + k)
+}
+
+func (ps *PebbleStorage) prefix() string {
+	return "db:" + ps.dbName + ":"
+}
+
+// tables returns the bound database's table metadata (creating it if missing).
+// The caller must hold core.mu.
+func (ps *PebbleStorage) tables() map[string]map[string]*TableSchema {
+	dm, ok := ps.core.meta.Databases[ps.dbName]
+	if !ok {
+		dm = &DatabaseMeta{Tables: make(map[string]map[string]*TableSchema)}
+		ps.core.meta.Databases[ps.dbName] = dm
+	}
+	if dm.Tables == nil {
+		dm.Tables = make(map[string]map[string]*TableSchema)
+	}
+	return dm.Tables
+}
+
+// DatabaseName returns the database this storage value is bound to.
+func (ps *PebbleStorage) DatabaseName() string { return ps.dbName }
+
+// ForDatabase returns the same storage bound to another database.
+func (ps *PebbleStorage) ForDatabase(name string) Backend {
+	if name == "" {
+		name = catalog.DefaultDatabase
+	}
+	return &PebbleStorage{core: ps.core, dbName: name}
+}
+
+// CreateDatabase registers an empty database in the metadata.
+func (ps *PebbleStorage) CreateDatabase(name string) error {
+	if name == "" {
+		return fmt.Errorf("database name cannot be empty")
+	}
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
+	if _, ok := ps.core.meta.Databases[name]; ok {
+		return fmt.Errorf("database %s already exists", name)
+	}
+	ps.core.meta.Databases[name] = &DatabaseMeta{Tables: make(map[string]map[string]*TableSchema)}
+	return ps.saveMetadata()
+}
+
+// DeleteDatabase removes every key of a database plus its metadata.
+func (ps *PebbleStorage) DeleteDatabase(name string) error {
+	if name == "" {
+		return fmt.Errorf("database name cannot be empty")
+	}
+	if name == catalog.DefaultDatabase {
+		return fmt.Errorf("cannot delete the default database")
+	}
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
+	if err := ps.deletePrefixLocked("db:" + name + ":"); err != nil {
+		return err
+	}
+	delete(ps.core.meta.Databases, name)
+	return ps.saveMetadata()
+}
+
+// deletePrefixLocked deletes every key starting with prefix. Caller holds core.mu.
+func (ps *PebbleStorage) deletePrefixLocked(prefix string) error {
+	iter, err := ps.core.db.NewIter(&pebble.IterOptions{LowerBound: []byte(prefix), UpperBound: []byte(prefix + "\xff")})
+	if err != nil {
+		return err
+	}
+	var keys [][]byte
+	for iter.First(); iter.Valid(); iter.Next() {
+		keys = append(keys, append([]byte(nil), iter.Key()...))
+	}
+	if err := iter.Close(); err != nil {
+		return err
+	}
+	for _, k := range keys {
+		if err := ps.core.db.Delete(k, ps.core.wal); err != nil && err != pebble.ErrNotFound {
+			return fmt.Errorf("failed to delete %s: %w", k, err)
+		}
+	}
+	return nil
 }
 
 // gobBufPool reuses bytes.Buffer instances across gob encode/decode calls
@@ -68,8 +163,8 @@ var gobBufPool = sync.Pool{
 }
 
 func (ps *PebbleStorage) SaveProcedure(proc *catalog.Procedure) error {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
 	buf := gobBufPool.Get().(*bytes.Buffer)
 	buf.Reset()
@@ -86,27 +181,27 @@ func (ps *PebbleStorage) SaveProcedure(proc *catalog.Procedure) error {
 		return fmt.Errorf("failed to encode procedure %s: %w", proc.Name, err)
 	}
 
-	key := []byte("proc:" + proc.Name)
-	if err := ps.db.Set(key, buf.Bytes(), ps.wal); err != nil {
+	key := ps.key("proc:" + proc.Name)
+	if err := ps.core.db.Set(key, buf.Bytes(), ps.core.wal); err != nil {
 		return fmt.Errorf("failed to save procedure %s: %w", proc.Name, err)
 	}
 	return nil
 }
 
 func (ps *PebbleStorage) DeleteProcedure(name string) error {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
-	key := []byte("proc:" + name)
-	if err := ps.db.Delete(key, ps.wal); err != nil && err != pebble.ErrNotFound {
+	key := ps.key("proc:" + name)
+	if err := ps.core.db.Delete(key, ps.core.wal); err != nil && err != pebble.ErrNotFound {
 		return fmt.Errorf("failed to delete procedure %s: %w", name, err)
 	}
 	return nil
 }
 
 func (ps *PebbleStorage) SaveView(view *catalog.View, schema string) error {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
 	if schema == "" {
 		schema = "public"
@@ -126,31 +221,31 @@ func (ps *PebbleStorage) SaveView(view *catalog.View, schema string) error {
 		return fmt.Errorf("failed to encode view %s.%s: %w", schema, view.Name, err)
 	}
 
-	key := []byte("view:" + schema + ":" + view.Name)
-	if err := ps.db.Set(key, buf.Bytes(), ps.wal); err != nil {
+	key := ps.key("view:" + schema + ":" + view.Name)
+	if err := ps.core.db.Set(key, buf.Bytes(), ps.core.wal); err != nil {
 		return fmt.Errorf("failed to save view %s.%s: %w", schema, view.Name, err)
 	}
 	return nil
 }
 
 func (ps *PebbleStorage) DeleteView(name string, schema string) error {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
 	if schema == "" {
 		schema = "public"
 	}
 
-	key := []byte("view:" + schema + ":" + name)
-	if err := ps.db.Delete(key, ps.wal); err != nil && err != pebble.ErrNotFound {
+	key := ps.key("view:" + schema + ":" + name)
+	if err := ps.core.db.Delete(key, ps.core.wal); err != nil && err != pebble.ErrNotFound {
 		return fmt.Errorf("failed to delete view %s.%s: %w", schema, name, err)
 	}
 	return nil
 }
 
 func (ps *PebbleStorage) SaveTrigger(trigger *catalog.Trigger) error {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
 	buf := gobBufPool.Get().(*bytes.Buffer)
 	buf.Reset()
@@ -170,27 +265,27 @@ func (ps *PebbleStorage) SaveTrigger(trigger *catalog.Trigger) error {
 		return fmt.Errorf("failed to encode trigger %s: %w", trigger.Name, err)
 	}
 
-	key := []byte("trig:" + trigger.Name)
-	if err := ps.db.Set(key, buf.Bytes(), ps.wal); err != nil {
+	key := ps.key("trig:" + trigger.Name)
+	if err := ps.core.db.Set(key, buf.Bytes(), ps.core.wal); err != nil {
 		return fmt.Errorf("failed to save trigger %s: %w", trigger.Name, err)
 	}
 	return nil
 }
 
 func (ps *PebbleStorage) DeleteTrigger(name string) error {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
-	key := []byte("trig:" + name)
-	if err := ps.db.Delete(key, ps.wal); err != nil && err != pebble.ErrNotFound {
+	key := ps.key("trig:" + name)
+	if err := ps.core.db.Delete(key, ps.core.wal); err != nil && err != pebble.ErrNotFound {
 		return fmt.Errorf("failed to delete trigger %s: %w", name, err)
 	}
 	return nil
 }
 
 func (ps *PebbleStorage) SaveJob(job *catalog.Job) error {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
 	buf := gobBufPool.Get().(*bytes.Buffer)
 	buf.Reset()
@@ -209,27 +304,36 @@ func (ps *PebbleStorage) SaveJob(job *catalog.Job) error {
 		return fmt.Errorf("failed to encode job %s: %w", job.Name, err)
 	}
 
-	key := []byte("job:" + job.Name)
-	if err := ps.db.Set(key, buf.Bytes(), ps.wal); err != nil {
+	key := ps.key("job:" + job.Name)
+	if err := ps.core.db.Set(key, buf.Bytes(), ps.core.wal); err != nil {
 		return fmt.Errorf("failed to save job %s: %w", job.Name, err)
 	}
 	return nil
 }
 
 func (ps *PebbleStorage) DeleteJob(name string) error {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
-	key := []byte("job:" + name)
-	if err := ps.db.Delete(key, ps.wal); err != nil && err != pebble.ErrNotFound {
+	key := ps.key("job:" + name)
+	if err := ps.core.db.Delete(key, ps.core.wal); err != nil && err != pebble.ErrNotFound {
 		return fmt.Errorf("failed to delete job %s: %w", name, err)
 	}
 	return nil
 }
 
-// TableMetadata stores schema information
+// TableMetadata is the persisted schema document ("meta:schema").
+//
+// Tables is the legacy pre-database layout (schema -> table); it is migrated
+// into Databases["postgres"] on first open and left empty afterwards.
 type TableMetadata struct {
-	Tables map[string]map[string]*TableSchema `json:"tables"` // schema -> table -> TableSchema
+	Tables    map[string]map[string]*TableSchema `json:"tables,omitempty"`
+	Databases map[string]*DatabaseMeta           `json:"databases,omitempty"`
+}
+
+// DatabaseMeta holds one database's schema metadata: schema -> table -> TableSchema.
+type DatabaseMeta struct {
+	Tables map[string]map[string]*TableSchema `json:"tables"`
 }
 
 type TableSchema struct {
@@ -331,20 +435,94 @@ func NewPebbleStorage(dir string) (*PebbleStorage, error) {
 		return nil, fmt.Errorf("failed to open pebble database: %w", err)
 	}
 
-	ps := &PebbleStorage{
+	core := &pebbleCore{
 		db:    db,
 		dir:   dir,
 		wal:   &pebble.WriteOptions{Sync: true}, // WAL sync enabled
-		meta:  &TableMetadata{Tables: make(map[string]map[string]*TableSchema)},
+		meta:  &TableMetadata{Databases: make(map[string]*DatabaseMeta)},
 		cache: cache,
 	}
+	ps := &PebbleStorage{core: core, dbName: catalog.DefaultDatabase}
 
 	// Load existing metadata
 	if err := ps.loadMetadata(); err != nil {
 		log.Printf("[storage] warning: could not load metadata: %v", err)
 	}
+	if err := ps.migrateLegacyLayout(); err != nil {
+		log.Printf("[storage] warning: legacy layout migration failed: %v", err)
+	}
+	ps.tablesLocked()
 
 	return ps, nil
+}
+
+// tablesLocked makes sure the default database has a metadata entry.
+func (ps *PebbleStorage) tablesLocked() {
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
+	ps.tables()
+}
+
+// legacyPrefixes are the key families of the pre-database on-disk layout.
+var legacyPrefixes = []string{"table:", "view:", "proc:", "trig:", "job:"}
+
+// migrateLegacyLayout moves data persisted before databases existed (keys
+// "table:<schema>:<name>", "view:...", "proc:...", "trig:...", "job:..." and
+// the flat metadata Tables map) under the default database. It runs once: a
+// store that has already been migrated has no legacy keys left.
+func (ps *PebbleStorage) migrateLegacyLayout() error {
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
+
+	moved := 0
+	for _, prefix := range legacyPrefixes {
+		iter, err := ps.core.db.NewIter(&pebble.IterOptions{LowerBound: []byte(prefix), UpperBound: []byte(prefix + "\xff")})
+		if err != nil {
+			return err
+		}
+		type kv struct{ k, v []byte }
+		var pairs []kv
+		for iter.First(); iter.Valid(); iter.Next() {
+			pairs = append(pairs, kv{append([]byte(nil), iter.Key()...), append([]byte(nil), iter.Value()...)})
+		}
+		if err := iter.Close(); err != nil {
+			return err
+		}
+		for _, p := range pairs {
+			newKey := []byte("db:" + catalog.DefaultDatabase + ":" + string(p.k))
+			if err := ps.core.db.Set(newKey, p.v, ps.core.wal); err != nil {
+				return fmt.Errorf("migrate %s: %w", p.k, err)
+			}
+			if err := ps.core.db.Delete(p.k, ps.core.wal); err != nil && err != pebble.ErrNotFound {
+				return fmt.Errorf("migrate %s: %w", p.k, err)
+			}
+			moved++
+		}
+	}
+
+	if len(ps.core.meta.Tables) > 0 {
+		dm, ok := ps.core.meta.Databases[catalog.DefaultDatabase]
+		if !ok || dm == nil {
+			dm = &DatabaseMeta{Tables: make(map[string]map[string]*TableSchema)}
+			ps.core.meta.Databases[catalog.DefaultDatabase] = dm
+		}
+		for schema, tables := range ps.core.meta.Tables {
+			if _, ok := dm.Tables[schema]; !ok {
+				dm.Tables[schema] = make(map[string]*TableSchema)
+			}
+			for name, ts := range tables {
+				dm.Tables[schema][name] = ts
+			}
+		}
+		ps.core.meta.Tables = nil
+		moved++
+	}
+
+	if moved > 0 {
+		log.Printf("[storage] migrated legacy layout into database %s (%d entries)", catalog.DefaultDatabase, moved)
+		return ps.saveMetadata()
+	}
+	return nil
 }
 
 // SaveTable persists a table to Pebble
@@ -362,20 +540,20 @@ func (ps *PebbleStorage) SaveTableWithSchema(table *catalog.Table, schema string
 
 // DeleteTable removes a table from persistent storage and metadata.
 func (ps *PebbleStorage) DeleteTable(name string, schema string) error {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
 	if schema == "" {
 		schema = "public"
 	}
 
-	key := []byte("table:" + schema + ":" + name)
-	if err := ps.db.Delete(key, ps.wal); err != nil && err != pebble.ErrNotFound {
+	key := ps.key("table:" + schema + ":" + name)
+	if err := ps.core.db.Delete(key, ps.core.wal); err != nil && err != pebble.ErrNotFound {
 		return fmt.Errorf("failed to delete table %s.%s: %w", schema, name, err)
 	}
 
-	if _, ok := ps.meta.Tables[schema]; ok {
-		delete(ps.meta.Tables[schema], name)
+	if _, ok := ps.tables()[schema]; ok {
+		delete(ps.tables()[schema], name)
 	}
 	return ps.saveMetadata()
 }
@@ -385,13 +563,13 @@ func (ps *PebbleStorage) CreateSchema(name string) error {
 	if name == "" {
 		return fmt.Errorf("schema name cannot be empty")
 	}
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
-	if _, ok := ps.meta.Tables[name]; ok {
+	if _, ok := ps.tables()[name]; ok {
 		return fmt.Errorf("schema %s already exists", name)
 	}
-	ps.meta.Tables[name] = make(map[string]*TableSchema)
+	ps.tables()[name] = make(map[string]*TableSchema)
 	return ps.saveMetadata()
 }
 
@@ -400,33 +578,33 @@ func (ps *PebbleStorage) DeleteSchema(name string) error {
 	if name == "" {
 		return fmt.Errorf("schema name cannot be empty")
 	}
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
-	if _, ok := ps.meta.Tables[name]; !ok {
+	if _, ok := ps.tables()[name]; !ok {
 		return fmt.Errorf("schema %s does not exist", name)
 	}
 
 	// Delete all tables in this schema from Pebble
-	tablesInSchema := ps.meta.Tables[name]
+	tablesInSchema := ps.tables()[name]
 	for tableName := range tablesInSchema {
-		key := []byte("table:" + name + ":" + tableName)
-		if err := ps.db.Delete(key, ps.wal); err != nil && err != pebble.ErrNotFound {
+		key := ps.key("table:" + name + ":" + tableName)
+		if err := ps.core.db.Delete(key, ps.core.wal); err != nil && err != pebble.ErrNotFound {
 			return fmt.Errorf("failed to delete table %s.%s from pebble: %w", name, tableName, err)
 		}
 	}
 
 	// Remove schema from metadata
-	delete(ps.meta.Tables, name)
+	delete(ps.tables(), name)
 	return ps.saveMetadata()
 }
 
 // saveTableWithSchema persists a table with explicit schema
 func (ps *PebbleStorage) saveTableWithSchema(table *catalog.Table, schema string) error {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
-	key := []byte("table:" + schema + ":" + table.Name)
+	key := ps.key("table:" + schema + ":" + table.Name)
 
 	// Encode rows inside the table's read lock to avoid copying all rows into
 	// a separate slice. json.Marshal runs while the lock is held, preventing
@@ -447,15 +625,15 @@ func (ps *PebbleStorage) saveTableWithSchema(table *catalog.Table, schema string
 	}
 
 	// Write with WAL sync
-	if err := ps.db.Set(key, data, ps.wal); err != nil {
+	if err := ps.core.db.Set(key, data, ps.core.wal); err != nil {
 		return fmt.Errorf("failed to save table %s: %w", table.Name, err)
 	}
 
 	// Update metadata
-	if _, ok := ps.meta.Tables[schema]; !ok {
-		ps.meta.Tables[schema] = make(map[string]*TableSchema)
+	if _, ok := ps.tables()[schema]; !ok {
+		ps.tables()[schema] = make(map[string]*TableSchema)
 	}
-	ps.meta.Tables[schema][table.Name] = &TableSchema{
+	ps.tables()[schema][table.Name] = &TableSchema{
 		Name:        table.Name,
 		Columns:     convertColumns(table.Columns),
 		Constraints: convertConstraints(table.Constraints),
@@ -477,11 +655,11 @@ func (ps *PebbleStorage) loadTableInternal(cat *catalog.Catalog, name string, sc
 		return nil
 	}
 
-	ps.mu.RLock()
-	defer ps.mu.RUnlock()
+	ps.core.mu.RLock()
+	defer ps.core.mu.RUnlock()
 
-	key := []byte("table:" + schema + ":" + name)
-	val, closer, err := ps.db.Get(key)
+	key := ps.key("table:" + schema + ":" + name)
+	val, closer, err := ps.core.db.Get(key)
 	if err != nil {
 		if err == pebble.ErrNotFound {
 			return nil // Table not found, which is ok
@@ -545,13 +723,53 @@ func (ps *PebbleStorage) loadTableInternal(cat *catalog.Catalog, name string, sc
 	return nil
 }
 
-// LoadAll loads all tables from Pebble
+// LoadAll loads the bound database into cat and, when cat belongs to a
+// cluster, every other persisted database into that cluster (creating the
+// missing catalogs).
 func (ps *PebbleStorage) LoadAll(cat *catalog.Catalog) error {
-	ps.mu.RLock()
-	defer ps.mu.RUnlock()
+	if err := ps.loadDatabase(cat); err != nil {
+		return err
+	}
+	cl := cat.Cluster()
+	if cl == nil {
+		return nil
+	}
+	ps.core.mu.RLock()
+	names := make([]string, 0, len(ps.core.meta.Databases))
+	for name := range ps.core.meta.Databases {
+		if name != ps.dbName {
+			names = append(names, name)
+		}
+	}
+	ps.core.mu.RUnlock()
+	for _, name := range names {
+		dbCat, ok := cl.Database(name)
+		if !ok {
+			created, err := cl.CreateDatabase(name)
+			if err != nil {
+				log.Printf("[storage] warning: cannot recreate database %s: %v", name, err)
+				continue
+			}
+			dbCat = created
+		}
+		if err := ps.ForDatabase(name).(*PebbleStorage).loadDatabase(dbCat); err != nil {
+			log.Printf("[storage] warning: failed to load database %s: %v", name, err)
+		}
+	}
+	return nil
+}
+
+// loadDatabase loads every object of the bound database into cat.
+func (ps *PebbleStorage) loadDatabase(cat *catalog.Catalog) error {
+	ps.core.mu.Lock()
+	tables := ps.tables()
+	ps.core.mu.Unlock()
+
+	ps.core.mu.RLock()
+	defer ps.core.mu.RUnlock()
 
 	// Recreate persisted schemas first, including empty schemas (without tables)
-	for schema := range ps.meta.Tables {
+	for schema := range tables {
 		if schema == "" || schema == "public" {
 			continue
 		}
@@ -563,15 +781,16 @@ func (ps *PebbleStorage) LoadAll(cat *catalog.Catalog) error {
 		}
 	}
 
-	iter, err := ps.db.NewIter(&pebble.IterOptions{})
+	prefix := ps.prefix()
+	iter, err := ps.core.db.NewIter(&pebble.IterOptions{LowerBound: []byte(prefix), UpperBound: []byte(prefix + "\xff")})
 	if err != nil {
 		return fmt.Errorf("failed to create iterator: %w", err)
 	}
 	defer iter.Close()
 
-	// Iterate through all keys
+	// Iterate through the database's keys
 	for iter.First(); iter.Valid(); iter.Next() {
-		key := string(iter.Key())
+		key := strings.TrimPrefix(string(iter.Key()), prefix)
 		if strings.HasPrefix(key, "table:") {
 			// key format: table:schema:table
 			parts := strings.SplitN(key, ":", 3)
@@ -676,47 +895,53 @@ func (ps *PebbleStorage) LoadAll(cat *catalog.Catalog) error {
 
 // Close closes the Pebble database and releases cache
 func (ps *PebbleStorage) Close() error {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
 	var err error
-	if ps.db != nil {
-		err = ps.db.Close()
+	if ps.core.db != nil {
+		err = ps.core.db.Close()
 	}
-	if ps.cache != nil {
-		ps.cache.Unref()
+	if ps.core.cache != nil {
+		ps.core.cache.Unref()
 	}
 	return err
 }
 
-// Meta returns a copy of the current metadata (for inspection).
+// Meta returns the current metadata for inspection: Tables is the bound
+// database's schema map (legacy accessor), Databases the whole cluster.
 func (ps *PebbleStorage) Meta() *TableMetadata {
-	ps.mu.RLock()
-	defer ps.mu.RUnlock()
-	return ps.meta
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
+	return &TableMetadata{Tables: ps.tables(), Databases: ps.core.meta.Databases}
 }
 
 // Helper functions
 func (ps *PebbleStorage) saveMetadata() error {
-	data, err := json.Marshal(ps.meta)
+	data, err := json.Marshal(ps.core.meta)
 	if err != nil {
 		return err
 	}
-	return ps.db.Set([]byte("meta:schema"), data, ps.wal)
+	return ps.core.db.Set([]byte("meta:schema"), data, ps.core.wal)
 }
 
 func (ps *PebbleStorage) loadMetadata() error {
-	val, closer, err := ps.db.Get([]byte("meta:schema"))
+	val, closer, err := ps.core.db.Get([]byte("meta:schema"))
 	if err != nil {
 		if err == pebble.ErrNotFound {
-			ps.meta.Tables = make(map[string]map[string]*TableSchema)
 			return nil
 		}
 		return err
 	}
 	defer closer.Close()
 
-	return json.Unmarshal(val, ps.meta)
+	if err := json.Unmarshal(val, ps.core.meta); err != nil {
+		return err
+	}
+	if ps.core.meta.Databases == nil {
+		ps.core.meta.Databases = make(map[string]*DatabaseMeta)
+	}
+	return nil
 }
 
 func convertColumns(cols []catalog.Column) []ColumnData {
@@ -762,12 +987,12 @@ func convertIndexes(indexes map[string]*catalog.Index) []IndexData {
 
 // DropColumnData removes a column from all rows in a table
 func (ps *PebbleStorage) DropColumnData(tableName string, columnName string, schema string) error {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
 	// Load table data
-	key := []byte("table:" + schema + ":" + tableName)
-	val, closer, err := ps.db.Get(key)
+	key := ps.key("table:" + schema + ":" + tableName)
+	val, closer, err := ps.core.db.Get(key)
 	if err != nil {
 		if err == pebble.ErrNotFound {
 			return nil // Table not found, nothing to do
@@ -838,17 +1063,17 @@ func (ps *PebbleStorage) DropColumnData(tableName string, columnName string, sch
 		return fmt.Errorf("failed to marshal table %s: %w", tableName, err)
 	}
 
-	if err := ps.db.Set(key, data, ps.wal); err != nil {
+	if err := ps.core.db.Set(key, data, ps.core.wal); err != nil {
 		return fmt.Errorf("failed to save table %s: %w", tableName, err)
 	}
 
 	// Update metadata
-	if schemaMap, ok := ps.meta.Tables[schema]; ok {
+	if schemaMap, ok := ps.tables()[schema]; ok {
 		if _, ok := schemaMap[tableName]; ok {
-			ps.meta.Tables[schema][tableName].Columns = newColumns
-			if len(ps.meta.Tables[schema][tableName].Indexes) > 0 {
-				newIndexes := make([]IndexData, 0, len(ps.meta.Tables[schema][tableName].Indexes))
-				for _, idx := range ps.meta.Tables[schema][tableName].Indexes {
+			ps.tables()[schema][tableName].Columns = newColumns
+			if len(ps.tables()[schema][tableName].Indexes) > 0 {
+				newIndexes := make([]IndexData, 0, len(ps.tables()[schema][tableName].Indexes))
+				for _, idx := range ps.tables()[schema][tableName].Indexes {
 					idxCols := indexColumnsFromData(idx)
 					drop := false
 					for _, c := range idxCols {
@@ -861,7 +1086,7 @@ func (ps *PebbleStorage) DropColumnData(tableName string, columnName string, sch
 						newIndexes = append(newIndexes, idx)
 					}
 				}
-				ps.meta.Tables[schema][tableName].Indexes = newIndexes
+				ps.tables()[schema][tableName].Indexes = newIndexes
 			}
 			return ps.saveMetadata()
 		}
@@ -873,12 +1098,12 @@ func (ps *PebbleStorage) DropColumnData(tableName string, columnName string, sch
 // RenameColumnData renames a column in all rows in a table
 // Note: Since rows are stored as arrays, not maps, we only need to update the schema
 func (ps *PebbleStorage) RenameColumnData(tableName string, oldName string, newName string, schema string) error {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
 
 	// Load table data
-	key := []byte("table:" + schema + ":" + tableName)
-	val, closer, err := ps.db.Get(key)
+	key := ps.key("table:" + schema + ":" + tableName)
+	val, closer, err := ps.core.db.Get(key)
 	if err != nil {
 		if err == pebble.ErrNotFound {
 			return nil // Table not found, nothing to do
@@ -926,28 +1151,28 @@ func (ps *PebbleStorage) RenameColumnData(tableName string, oldName string, newN
 		return fmt.Errorf("failed to marshal table %s: %w", tableName, err)
 	}
 
-	if err := ps.db.Set(key, data, ps.wal); err != nil {
+	if err := ps.core.db.Set(key, data, ps.core.wal); err != nil {
 		return fmt.Errorf("failed to save table %s: %w", tableName, err)
 	}
 
 	// Update metadata
-	if schemaMap, ok := ps.meta.Tables[schema]; ok {
+	if schemaMap, ok := ps.tables()[schema]; ok {
 		if _, ok := schemaMap[tableName]; ok {
-			for i := range ps.meta.Tables[schema][tableName].Columns {
-				if ps.meta.Tables[schema][tableName].Columns[i].Name == oldName {
-					ps.meta.Tables[schema][tableName].Columns[i].Name = newName
+			for i := range ps.tables()[schema][tableName].Columns {
+				if ps.tables()[schema][tableName].Columns[i].Name == oldName {
+					ps.tables()[schema][tableName].Columns[i].Name = newName
 					break
 				}
 			}
-			for i := range ps.meta.Tables[schema][tableName].Indexes {
-				cols := indexColumnsFromData(ps.meta.Tables[schema][tableName].Indexes[i])
+			for i := range ps.tables()[schema][tableName].Indexes {
+				cols := indexColumnsFromData(ps.tables()[schema][tableName].Indexes[i])
 				for j := range cols {
 					if cols[j] == oldName {
 						cols[j] = newName
 					}
 				}
-				ps.meta.Tables[schema][tableName].Indexes[i].ColumnNames = cols
-				ps.meta.Tables[schema][tableName].Indexes[i].ColumnName = ""
+				ps.tables()[schema][tableName].Indexes[i].ColumnNames = cols
+				ps.tables()[schema][tableName].Indexes[i].ColumnName = ""
 			}
 			return ps.saveMetadata()
 		}

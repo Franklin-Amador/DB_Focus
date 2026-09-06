@@ -7,18 +7,16 @@ import (
 	"log"
 	"net"
 	"strings"
-
-	"dbf/internal/catalog"
 )
 
 // Default max connections to prevent OOM on limited memory systems
 const defaultMaxConnections = 20
 
-func ListenAndServe(addr string, handler QueryHandler, cat *catalog.Catalog) error {
+func ListenAndServe(addr string, handler QueryHandler, cat CatalogProvider) error {
 	return ListenAndServeWithConfig(addr, handler, cat, defaultMaxConnections, 4096)
 }
 
-func ListenAndServeWithConfig(addr string, handler QueryHandler, cat *catalog.Catalog, maxConns int, bufSize int) error {
+func ListenAndServeWithConfig(addr string, handler QueryHandler, cat CatalogProvider, maxConns int, bufSize int) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -48,7 +46,7 @@ func ListenAndServeWithConfig(addr string, handler QueryHandler, cat *catalog.Ca
 	}
 }
 
-func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Catalog, bufSize int) {
+func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat CatalogProvider, bufSize int) {
 	defer conn.Close()
 	remoteAddr := conn.RemoteAddr().String()
 	rw := bufio.NewReadWriter(
@@ -128,7 +126,7 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat *catalog.Cat
 	}
 }
 
-func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat *catalog.Catalog, payload []byte, currentDatabase string) error {
+func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogProvider, payload []byte, currentDatabase string) error {
 	query := strings.TrimRight(string(payload), "\x00")
 
 	if strings.TrimSpace(query) == "" {
@@ -340,7 +338,7 @@ func executeQuery(handler QueryHandler, query string, currentDatabase string) (*
 	return handler.Handle(query)
 }
 
-func authenticate(rw *bufio.ReadWriter, cat *catalog.Catalog) (string, string, error) {
+func authenticate(rw *bufio.ReadWriter, cat CatalogProvider) (string, string, error) {
 	params, err := readStartup(rw)
 	if err != nil {
 		return "", "", err

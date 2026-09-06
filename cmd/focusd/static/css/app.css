@@ -804,3 +804,7 @@ tr:hover .row-del{opacity:1}
 .chk-row input{accent-color:var(--accent)}
 .modal-note{font-size:11px;color:var(--dim);line-height:1.5}
 .modal-note code{font-family:var(--mono);color:var(--text)}
+.schema-pick.db select{color:var(--blue)}
+.pick-sep{color:var(--dim);font-size:13px;margin:0 -2px}
+.sec-hdr .sec-sub{font-weight:500;text-transform:none;letter-spacing:0;color:var(--dim);font-size:10px;margin-left:2px}
+@media (max-width:640px){ .pick-sep{display:none} }

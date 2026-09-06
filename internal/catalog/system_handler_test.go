@@ -186,8 +186,8 @@ ORDER BY 1,2;`
 func TestHandleSystemQueryPgDatabaseIncludesUserDatabases(t *testing.T) {
 	c := New()
 
-	if err := c.CreateSchema("testdb"); err != nil {
-		t.Fatalf("create schema testdb: %v", err)
+	if _, err := c.Cluster().CreateDatabase("testdb"); err != nil {
+		t.Fatalf("create database testdb: %v", err)
 	}
 
 	res, ok := c.HandleSystemQueryForDatabase("SELECT * FROM pg_catalog.pg_database", "postgres")
@@ -217,8 +217,8 @@ func TestHandleSystemQueryPgDatabaseIncludesUserDatabases(t *testing.T) {
 
 func TestHandleSystemQueryPgDatabaseUnqualified(t *testing.T) {
 	c := New()
-	if err := c.CreateSchema("testdb"); err != nil {
-		t.Fatalf("create schema testdb: %v", err)
+	if _, err := c.Cluster().CreateDatabase("testdb"); err != nil {
+		t.Fatalf("create database testdb: %v", err)
 	}
 
 	res, ok := c.HandleSystemQueryForDatabase("SELECT datname FROM pg_database", "postgres")
@@ -230,16 +230,19 @@ func TestHandleSystemQueryPgDatabaseUnqualified(t *testing.T) {
 	}
 }
 
-func TestDatabaseExistsAcceptsUserSchemaDatabase(t *testing.T) {
+func TestDatabaseExistsOnlyForClusterDatabases(t *testing.T) {
 	c := New()
-	if err := c.CreateSchema("testdb"); err != nil {
-		t.Fatalf("create schema testdb: %v", err)
+	if _, err := c.Cluster().CreateDatabase("testdb"); err != nil {
+		t.Fatalf("create database testdb: %v", err)
+	}
+	if err := c.CreateSchema("justaschema"); err != nil {
+		t.Fatalf("create schema: %v", err)
 	}
 
-	if !c.DatabaseExists("testdb") {
-		t.Fatalf("expected DatabaseExists(testdb)=true")
+	if !c.DatabaseExists("testdb") || !c.DatabaseExists("postgres") {
+		t.Fatalf("expected testdb and postgres to exist")
 	}
-	if c.DatabaseExists("pg_catalog") {
-		t.Fatalf("expected DatabaseExists(pg_catalog)=false")
+	if c.DatabaseExists("justaschema") || c.DatabaseExists("pg_catalog") {
+		t.Fatalf("schemas must not be reported as databases")
 	}
 }

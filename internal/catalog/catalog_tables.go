@@ -585,42 +585,14 @@ func (c *Catalog) RenameColumn(tableName string, oldName string, newName string,
 	return nil
 }
 
-// DatabaseExists checks if a database exists in pg_catalog.pg_database
+// DatabaseExists reports whether a database exists in the cluster this
+// catalog belongs to (a detached catalog only knows itself and the default).
 func (c *Catalog) DatabaseExists(name string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
 	if name == "" {
 		return false
 	}
-	if name == "postgres" {
-		return true
+	if c.cluster != nil {
+		return c.cluster.DatabaseExists(name)
 	}
-
-	// In FocusDB, non-system schemas represent database namespaces.
-	if _, exists := c.tables[name]; exists {
-		if name != "pg_catalog" && name != "information_schema" && name != "pg_toast" {
-			return true
-		}
-	}
-
-	// Get pg_database table
-	pgDatabase, exists := c.tables["pg_catalog"]["pg_database"]
-	if !exists {
-		return false
-	}
-
-	// Find column index for datname
-	for i, col := range pgDatabase.Columns {
-		if col.Name == "datname" {
-			// Check if any row has this database name
-			for _, row := range pgDatabase.Rows {
-				if row[i] == name {
-					return true
-				}
-			}
-			break
-		}
-	}
-	return false
+	return name == c.Name() || name == DefaultDatabase
 }

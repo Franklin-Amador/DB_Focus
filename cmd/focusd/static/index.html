@@ -22,8 +22,13 @@
   <span class="logo"><span class="leaf">🌿</span> focus<span class="logo-db">db</span></span>
   <span class="logo-port">studio · :9011</span>
   <span class="conn-badge" id="conn-badge">● conectado</span>
-  <label class="schema-pick" title="Esquema activo: las tablas sin calificar se resuelven aquí (como el search_path)">
+  <label class="schema-pick db" title="Base de datos activa: contenedor aislado con sus propios esquemas, procedimientos, triggers y jobs">
     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="8" cy="4" rx="5.5" ry="2.2"/><path d="M2.5 4v8c0 1.2 2.5 2.2 5.5 2.2s5.5-1 5.5-2.2V4"/><path d="M2.5 8c0 1.2 2.5 2.2 5.5 2.2s5.5-1 5.5-2.2"/></svg>
+    <select id="database-select" onchange="setActiveDatabase(this.value)"><option value="postgres">postgres</option></select>
+  </label>
+  <span class="pick-sep" aria-hidden="true">›</span>
+  <label class="schema-pick" title="Esquema activo dentro de la base: las tablas sin calificar se resuelven aquí (como el search_path)">
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><line x1="2" y1="6" x2="14" y2="6"/><line x1="6" y1="6" x2="6" y2="13.5"/></svg>
     <select id="schema-select" onchange="setActiveSchema(this.value)"><option value="public">public</option></select>
   </label>
   <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
