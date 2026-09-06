@@ -265,7 +265,12 @@ type Delete struct {
 
 func (Delete) stmtNode() {}
 
+// Set is a SET statement. Name is the variable (e.g. "search_path") and
+// Values the tokens of the value list ("tienda", "public"). The executor
+// ignores it; the wire server uses search_path for the session schema.
 type Set struct {
+	Name   string
+	Values []string
 }
 
 func (Set) stmtNode() {}

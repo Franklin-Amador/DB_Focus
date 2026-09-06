@@ -323,13 +323,21 @@ func (e *Executor) executeCreateDatabase(ctx context.Context, stmt *ast.CreateDa
 	if cl == nil {
 		return nil, fmt.Errorf("CREATE DATABASE requires a cluster-backed catalog")
 	}
-	if _, err := cl.CreateDatabase(dbName); err != nil {
-		return nil, err
+	if cl.DatabaseExists(dbName) {
+		return nil, fmt.Errorf("database %s already exists", dbName)
 	}
+	// Persist first: a database that exists only in memory would vanish on
+	// restart while the client saw a success tag.
 	if e.storage != nil {
 		if err := e.storage.CreateDatabase(dbName); err != nil && !strings.Contains(err.Error(), "already exists") {
-			fmt.Printf("warning: failed to persist database %s: %v\n", dbName, err)
+			return nil, fmt.Errorf("failed to persist database %s: %w", dbName, err)
 		}
+	}
+	if _, err := cl.CreateDatabase(dbName); err != nil {
+		if e.storage != nil {
+			_ = e.storage.DeleteDatabase(dbName)
+		}
+		return nil, err
 	}
 	return &Result{Tag: constants.ResultCreateDatabase}, nil
 }
@@ -355,13 +363,18 @@ func (e *Executor) executeDropDatabase(ctx context.Context, stmt *ast.DropDataba
 	if dbName == e.catalog.Name() {
 		return nil, fmt.Errorf("cannot drop database %s: it is currently open", dbName)
 	}
+	if !cl.DatabaseExists(dbName) {
+		return nil, fmt.Errorf("database %s does not exist", dbName)
+	}
+	// Storage first: if the on-disk delete fails the database stays, instead
+	// of reporting success for a drop that would come back on restart.
+	if e.storage != nil {
+		if err := e.storage.DeleteDatabase(dbName); err != nil && !strings.Contains(err.Error(), "does not exist") {
+			return nil, fmt.Errorf("failed to delete persisted database %s: %w", dbName, err)
+		}
+	}
 	if err := cl.DropDatabase(dbName); err != nil {
 		return nil, err
-	}
-	if e.storage != nil {
-		if err := e.storage.DeleteDatabase(dbName); err != nil {
-			fmt.Printf("warning: failed to delete persisted database %s: %v\n", dbName, err)
-		}
 	}
 	return &Result{Tag: constants.ResultDropDatabase}, nil
 }

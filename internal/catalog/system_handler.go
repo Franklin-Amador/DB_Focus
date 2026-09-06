@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"strings"
 )
@@ -15,12 +16,21 @@ type SystemResult struct {
 
 // HandleSystemQuery intercepts system catalog queries — generated from real PostgreSQL 17 responses
 func (c *Catalog) HandleSystemQuery(query string) (*SystemResult, bool) {
-	return c.HandleSystemQueryForDatabase(query, "postgres")
+	return c.HandleSystemQueryForDatabase(query, "public")
 }
 
+// HandleSystemQueryForSession answers a system-catalog query for a session on
+// this catalog's database; only the schema matters here (the database is the
+// catalog itself). Satisfies server.CatalogProvider for a single catalog.
+func (c *Catalog) HandleSystemQueryForSession(query, _ string, schema string) (*SystemResult, bool) {
+	return c.HandleSystemQueryForDatabase(query, schema)
+}
+
+// HandleSystemQueryForDatabase answers a system-catalog query; the second
+// argument is the session schema (search_path head), "" meaning public.
 func (c *Catalog) HandleSystemQueryForDatabase(query string, currentDatabase string) (*SystemResult, bool) {
 	if currentDatabase == "" {
-		currentDatabase = "postgres"
+		currentDatabase = "public"
 	}
 	upper := strings.ToUpper(strings.TrimSpace(query))
 	for _, route := range systemRoutes {
@@ -68,7 +78,8 @@ func canned(cols []string, row []interface{}, tag string) func(*Catalog, string,
 // extname='bdr', pg_stat_gssapi, "WHERE 1<>1" — act as a defensive fallback.
 var systemRoutes = []systemRoute{
 	{hasAny("CURRENT_SCHEMA()"), func(c *Catalog, _, db string) *SystemResult { return c.getCurrentSchema(db) }},
-	{hasAny("SHOW SEARCH_PATH"), func(c *Catalog, _, _ string) *SystemResult { return c.getSearchPath() }},
+	{hasAny("CURRENT_DATABASE()"), func(c *Catalog, _, _ string) *SystemResult { return c.getCurrentDatabase() }},
+	{hasAny("SHOW SEARCH_PATH"), func(c *Catalog, _, db string) *SystemResult { return c.getSearchPath(db) }},
 	{hasAny("SELECT VERSION()"), func(c *Catalog, _, _ string) *SystemResult { return c.getVersion() }},
 	{hasAny("FORMAT_TYPE(NULLIF"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgTypeFull() }},
 	{hasAny("PG_GET_KEYWORDS"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgKeywords() }},
@@ -210,27 +221,53 @@ func (c *Catalog) getPgNamespace() *SystemResult {
 	}
 }
 
-func (c *Catalog) getSearchPath() *SystemResult {
+// getCurrentDatabase answers SELECT current_database() with the catalog's
+// database name (the request/connection database).
+func (c *Catalog) getCurrentDatabase() *SystemResult {
+	return &SystemResult{
+		Columns: []string{"current_database"},
+		Rows:    [][]interface{}{{c.Name()}},
+		Tag:     "SELECT 1",
+	}
+}
+
+// getSearchPath answers SHOW search_path with the session schema first.
+func (c *Catalog) getSearchPath(currentSchema string) *SystemResult {
+	schema := resolveDatabaseSchema(currentSchema)
+	path := "\"$user\", public"
+	if schema != "public" {
+		path = schema + ", public"
+	}
 	return &SystemResult{
 		Columns: []string{"search_path"},
-		Rows: [][]interface{}{
-			{"\"$user\", public"},
-		},
-		Tag: "SELECT 1",
+		Rows:    [][]interface{}{{path}},
+		Tag:     "SELECT 1",
 	}
+}
+
+// databaseOID derives a stable object id from the database name, so clients
+// that cache pg_database.oid (pgAdmin, DBeaver) keep working across CREATE/DROP
+// of other databases and across restarts. The default database is 1.
+func databaseOID(name string) int {
+	if name == DefaultDatabase {
+		return 1
+	}
+	h := fnv.New32a()
+	h.Write([]byte(name))
+	return 16384 + int(h.Sum32()%1000000)
 }
 
 // getPgDatabase lists the databases of the cluster (\l, pg_database).
 func (c *Catalog) getPgDatabase() *SystemResult {
 	columns := []string{"oid", "datname", "datdba", "encoding", "datcollate", "datctype", "datlocprovider", "daticulocale", "daticurules", "datacl", "datcollversion", "datallowconn", "datistemplate"}
 
-	infos := []DatabaseInfo{{Name: c.Name(), IsDefault: true}}
+	names := []string{c.Name()}
 	if c.cluster != nil {
-		infos = c.cluster.ListDatabases()
+		names = c.cluster.DatabaseNames()
 	}
-	rows := make([][]interface{}, 0, len(infos))
-	for i, info := range infos {
-		rows = append(rows, []interface{}{i + 1, info.Name, 10, 6, "C", "C", "c", "", "", "", "", true, false})
+	rows := make([][]interface{}, 0, len(names))
+	for _, name := range names {
+		rows = append(rows, []interface{}{databaseOID(name), name, 10, 6, "C", "C", "c", "", "", "", "", true, false})
 	}
 	return &SystemResult{Columns: columns, Rows: rows, Tag: fmt.Sprintf("SELECT %d", len(rows))}
 }

@@ -1004,16 +1004,17 @@ func (p *Parser) parseSet() (ast.Statement, error) {
 	}
 	p.next()
 
-	// Consume value and anything until ; or EOF
-	// The value could be complex (e.g., "on", "off", "3", etc.)
-	// No limit - just consume until we hit statement boundary
+	// Collect the value tokens until ; or EOF (commas separate list items,
+	// e.g. SET search_path TO tienda, public). Values may be quoted.
+	var values []string
 	for p.cur.Type != TokenSemicolon && p.cur.Type != TokenEOF {
-		log.Printf("[parser] parseSet consuming token: %v (%s)", p.cur.Type, p.cur.Literal)
+		if p.cur.Type != TokenComma {
+			values = append(values, strings.Trim(p.cur.Literal, "\"'"))
+		}
 		p.next()
 	}
 
-	log.Printf("[parser] parseSet complete, now at: %v", p.cur.Type)
-	return &ast.Set{}, nil
+	return &ast.Set{Name: varName, Values: values}, nil
 }
 
 func (p *Parser) parseCall() (ast.Statement, error) {

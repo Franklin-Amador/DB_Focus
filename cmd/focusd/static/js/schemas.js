@@ -65,7 +65,7 @@ export async function databaseCreateConfirm() {
   const input = host?.querySelector('#db-new-name');
   const name = (input?.value || '').trim();
   if (!NAME_RE.test(name)) { showToast('Nombre inválido: usá letras, dígitos y _', 'err'); input?.focus(); return; }
-  if (databases.some(d => d.name.toLowerCase() === name.toLowerCase())) { showToast(`La base ${name} ya existe`, 'err'); return; }
+  if (databases.some(d => d.name === name)) { showToast(`La base ${name} ya existe`, 'err'); return; }
   const activate = !!host.querySelector('#db-new-activate')?.checked;
 
   const res = await apiQuery(`CREATE DATABASE ${name}`);
@@ -169,7 +169,7 @@ export async function schemaCreateConfirm() {
   const input = host?.querySelector('#schema-new-name');
   const name = (input?.value || '').trim();
   if (!NAME_RE.test(name)) { showToast('Nombre inválido: usá letras, dígitos y _', 'err'); input?.focus(); return; }
-  if (schemas.some(s => s.name.toLowerCase() === name.toLowerCase())) { showToast(`El esquema ${name} ya existe`, 'err'); return; }
+  if (schemas.some(s => s.name === name)) { showToast(`El esquema ${name} ya existe`, 'err'); return; }
   const activate = !!host.querySelector('#schema-new-activate')?.checked;
 
   const res = await apiQuery(`CREATE SCHEMA ${name}`);

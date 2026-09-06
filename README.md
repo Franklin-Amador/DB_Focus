@@ -11,7 +11,7 @@ Interfaz web incluida en el binario (`go:embed`), disponible en `http://localhos
 - Sección **Databases** en el árbol: click activa una base (el esquema vuelve a `public`); `+` crea una (modal, `CREATE DATABASE`); `×` la elimina con todo su contenido (modal con casilla de confirmación). `postgres` es la base por defecto y no se puede eliminar.
 - Sección **Schemas** (de la base activa): click activa un esquema; `+` crea uno (`CREATE SCHEMA`); `×` lo elimina (modal con opción `CASCADE` cuando no está vacío). `public` no se puede eliminar.
 - Cada base es un **contenedor aislado**: tiene sus propios esquemas, procedimientos, triggers, jobs y scheduler. Una consulta no puede cruzar bases; sí puede cruzar esquemas de la misma base calificando el nombre: `SELECT p.nombre, v.monto FROM tienda.productos p JOIN public.ventas v ON p.id = v.id`.
-- Por wire, el parámetro `database` de la conexión (`psql -d ventas`, `\c ventas`) elige la base; `\l` y `pg_database` listan las bases del clúster.
+- Por wire, el parámetro `database` de la conexión (`psql -d ventas`, `\c ventas`) elige la base; `\l` y `pg_database` listan las bases del clúster. `SET search_path TO esquema` cambia el esquema de la sesión (equivale al selector de esquema de la GUI); `SHOW search_path`, `current_schema()` y `current_database()` lo reflejan. `DROP DATABASE` no se puede ejecutar desde la base que se elimina.
 
 **Editor**
 - Pestañas múltiples de consulta (undo propio por pestaña; persisten en el navegador).
@@ -166,7 +166,8 @@ postgresql://postgres:4444@localhost:4444/postgres
 - Referencias a tablas: `FROM esquema.tabla [AS] alias`, también con alias sin `AS` (`FROM ventas v`). Las columnas pueden calificarse con el alias, el nombre de la tabla o `esquema.tabla` (`WHERE v.monto > 1`, `SELECT tienda.productos.nombre ...`). Sin calificar, una tabla se busca en el esquema de la sesión (parámetro `database` del wire protocol, o esquema activo de la GUI) y por defecto en `public`.
 - Una vista resuelve sus tablas sin calificar dentro de **su propio esquema**, también tras reiniciar el servidor (`CREATE VIEW caros AS SELECT ... FROM productos` creada con el esquema `tienda` activo lee `tienda.productos`).
 - `pg_catalog.pg_namespace` y `\dn` listan los esquemas de usuario de la base actual; `pg_database` y `\l`, las bases del clúster.
-- **Bases de datos**: cada una es un catálogo independiente. Los datos se guardan en Pebble con claves `db:<base>:...`; un directorio de datos creado antes de esta versión (claves sin prefijo) se **migra automáticamente** a la base `postgres` al arrancar, una sola vez.
+- **Bases de datos**: cada una es un catálogo independiente. Los datos se guardan en Pebble con claves `db:<base>:...`. Un directorio de datos creado antes de esta versión se **migra automáticamente** al arrancar, una sola vez: antes de tocar nada se copia el almacén a `pebble.db.backup-<fecha>` (junto al original; se puede borrar cuando todo esté verificado), los esquemas creados con el antiguo `CREATE DATABASE` pasan a ser bases reales (sus tablas quedan en su `public`, así `psql -d nombre` sigue funcionando), el resto de esquemas queda dentro de `postgres`, y procedimientos, triggers y jobs (antes globales) pertenecen a `postgres`.
+- Los nombres de base, esquema, tabla y vista no pueden contener `:` (separador de las claves de almacenamiento).
 - `ALTER JOB` permite habilitar/deshabilitar jobs sin eliminarlos. Los cambios persisten entre reinicios.
 - `ALTER TABLE` permite modificar la estructura de tablas existentes: agregar/eliminar columnas, cambiar tipos, renombrar columnas.
 - `CREATE INDEX` permite acelerar búsquedas por igualdad (`WHERE columna = valor`) en tablas con alto volumen de filas.

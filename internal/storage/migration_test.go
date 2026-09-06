@@ -2,6 +2,8 @@ package storage
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/cockroachdb/pebble"
@@ -59,6 +61,14 @@ func TestLegacyLayoutMigratesIntoDefaultDatabase(t *testing.T) {
 		t.Fatalf("migrated key missing: %v", err)
 	} else {
 		closer.Close()
+	}
+	// The migration first backs up the closed store next to it.
+	backups, _ := filepath.Glob(filepath.Join(dir, "pebble.db.backup-*"))
+	if len(backups) != 1 {
+		t.Fatalf("expected one pre-migration backup, got %v", backups)
+	}
+	if _, err := os.Stat(filepath.Join(backups[0], "CURRENT")); err != nil {
+		t.Fatalf("backup does not look like a Pebble store: %v", err)
 	}
 	meta := ps.Meta()
 	if len(meta.Tables["public"]) != 1 || meta.Databases["postgres"] == nil {
@@ -161,5 +171,77 @@ func TestDatabasesPersistSeparately(t *testing.T) {
 		t.Fatalf("default database data lost: %v", err)
 	} else {
 		closer.Close()
+	}
+}
+
+// TestLegacyDatabasesArePromoted: schemas that the old engine registered as
+// databases (rows of the persisted pg_database table) come back as real
+// databases with their tables under public; the pg_database table itself is
+// dropped instead of resurfacing as a user table.
+func TestLegacyDatabasesArePromoted(t *testing.T) {
+	dir := t.TempDir()
+	ps, err := NewPebbleStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(key string, td TableData) {
+		raw, _ := json.Marshal(td)
+		if err := ps.core.db.Set([]byte(key), raw, ps.core.wal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	idCol := []ColumnData{{Name: "id", Type: "INT"}}
+	put("table:analytics:hechos", TableData{Name: "hechos", Columns: idCol, Rows: [][]interface{}{{1}, {2}}})
+	put("table:fran:notas", TableData{Name: "notas", Columns: idCol, Rows: [][]interface{}{{7}}})
+	put("table:public:clientes", TableData{Name: "clientes", Columns: idCol, Rows: [][]interface{}{{1}}})
+	put("table:public:pg_database", TableData{
+		Name:    "pg_database",
+		Columns: []ColumnData{{Name: "oid", Type: "INTEGER"}, {Name: "datname", Type: "TEXT"}},
+		Rows:    [][]interface{}{{1, "postgres"}, {2, "analytics"}},
+	})
+	legacyMeta, _ := json.Marshal(map[string]interface{}{"tables": map[string]interface{}{
+		"public":    map[string]interface{}{"clientes": map[string]interface{}{"name": "clientes", "columns": idCol}, "pg_database": map[string]interface{}{"name": "pg_database"}},
+		"analytics": map[string]interface{}{"hechos": map[string]interface{}{"name": "hechos", "columns": idCol}},
+		"fran":      map[string]interface{}{"notas": map[string]interface{}{"name": "notas", "columns": idCol}},
+	}})
+	if err := ps.core.db.Set([]byte("meta:schema"), legacyMeta, ps.core.wal); err != nil {
+		t.Fatal(err)
+	}
+	if err := ps.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ps, err = NewPebbleStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ps.Close()
+	cl := catalog.NewCluster()
+	if err := ps.LoadAll(cl.Default()); err != nil {
+		t.Fatal(err)
+	}
+
+	an, ok := cl.Database("analytics")
+	if !ok {
+		t.Fatalf("legacy database analytics was not promoted: %v", cl.DatabaseNames())
+	}
+	if tbl, err := an.GetTable("hechos"); err != nil || len(tbl.SelectAll()) != 2 {
+		t.Fatalf("analytics.public.hechos not migrated: %v", err)
+	}
+	if cl.Default().SchemaExists("analytics") {
+		t.Fatal("analytics must not remain a schema of postgres")
+	}
+	// A plain schema stays a schema of the default database.
+	if tbl, err := cl.Default().GetTable("notas", "fran"); err != nil || len(tbl.SelectAll()) != 1 {
+		t.Fatalf("postgres.fran.notas not migrated: %v", err)
+	}
+	if cl.DatabaseExists("fran") {
+		t.Fatal("fran was a schema, not a database")
+	}
+	if _, err := cl.Default().GetTable("pg_database"); err == nil {
+		t.Fatal("legacy pg_database table must not resurface as a user table")
+	}
+	if _, ok := ps.Meta().Tables["public"]["pg_database"]; ok {
+		t.Fatal("pg_database metadata must be dropped")
 	}
 }

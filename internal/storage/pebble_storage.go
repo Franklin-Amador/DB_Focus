@@ -5,11 +5,13 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 
@@ -79,18 +81,38 @@ func (ps *PebbleStorage) prefix() string {
 	return "db:" + ps.dbName + ":"
 }
 
-// tables returns the bound database's table metadata (creating it if missing).
-// The caller must hold core.mu.
+// tables returns the bound database's table metadata for reading, or nil when
+// the database is not registered in storage. The caller must hold core.mu.
 func (ps *PebbleStorage) tables() map[string]map[string]*TableSchema {
-	dm, ok := ps.core.meta.Databases[ps.dbName]
-	if !ok {
-		dm = &DatabaseMeta{Tables: make(map[string]map[string]*TableSchema)}
-		ps.core.meta.Databases[ps.dbName] = dm
+	dm := ps.core.meta.Databases[ps.dbName]
+	if dm == nil {
+		return nil
+	}
+	return dm.Tables
+}
+
+// tablesForWrite returns the bound database's table metadata for mutation.
+// The database must have been registered (CreateDatabase / default at open):
+// a write against a dropped database is an error, never a silent re-creation.
+// The caller must hold core.mu.
+func (ps *PebbleStorage) tablesForWrite() (map[string]map[string]*TableSchema, error) {
+	dm := ps.core.meta.Databases[ps.dbName]
+	if dm == nil {
+		return nil, fmt.Errorf("database %s does not exist in storage", ps.dbName)
 	}
 	if dm.Tables == nil {
 		dm.Tables = make(map[string]map[string]*TableSchema)
 	}
-	return dm.Tables
+	return dm.Tables, nil
+}
+
+// ensureDefaultDatabase registers the default database's metadata entry.
+func (ps *PebbleStorage) ensureDefaultDatabase() {
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
+	if ps.core.meta.Databases[catalog.DefaultDatabase] == nil {
+		ps.core.meta.Databases[catalog.DefaultDatabase] = &DatabaseMeta{Tables: make(map[string]map[string]*TableSchema)}
+	}
 }
 
 // DatabaseName returns the database this storage value is bound to.
@@ -135,23 +157,11 @@ func (ps *PebbleStorage) DeleteDatabase(name string) error {
 	return ps.saveMetadata()
 }
 
-// deletePrefixLocked deletes every key starting with prefix. Caller holds core.mu.
+// deletePrefixLocked deletes every key starting with prefix in one range
+// tombstone (a single synced write). Caller holds core.mu.
 func (ps *PebbleStorage) deletePrefixLocked(prefix string) error {
-	iter, err := ps.core.db.NewIter(&pebble.IterOptions{LowerBound: []byte(prefix), UpperBound: []byte(prefix + "\xff")})
-	if err != nil {
-		return err
-	}
-	var keys [][]byte
-	for iter.First(); iter.Valid(); iter.Next() {
-		keys = append(keys, append([]byte(nil), iter.Key()...))
-	}
-	if err := iter.Close(); err != nil {
-		return err
-	}
-	for _, k := range keys {
-		if err := ps.core.db.Delete(k, ps.core.wal); err != nil && err != pebble.ErrNotFound {
-			return fmt.Errorf("failed to delete %s: %w", k, err)
-		}
+	if err := ps.core.db.DeleteRange([]byte(prefix), []byte(prefix+"\xff"), ps.core.wal); err != nil {
+		return fmt.Errorf("failed to delete keys under %s: %w", prefix, err)
 	}
 	return nil
 }
@@ -448,78 +458,247 @@ func NewPebbleStorage(dir string) (*PebbleStorage, error) {
 	if err := ps.loadMetadata(); err != nil {
 		log.Printf("[storage] warning: could not load metadata: %v", err)
 	}
-	if err := ps.migrateLegacyLayout(); err != nil {
-		log.Printf("[storage] warning: legacy layout migration failed: %v", err)
+
+	// A data directory written before databases existed is migrated once,
+	// after a file-level backup of the closed store (the SSTs and WAL are
+	// only consistent while Pebble is closed).
+	if ps.hasLegacyLayout() {
+		backup, err := ps.backupClosedStore(dbPath, opts)
+		if err != nil {
+			return nil, fmt.Errorf("legacy layout detected but backup failed (nothing migrated): %w", err)
+		}
+		log.Printf("[storage] legacy layout detected; backup written to %s", backup)
+		if err := ps.migrateLegacyLayout(); err != nil {
+			log.Printf("[storage] warning: legacy layout migration failed: %v", err)
+		}
 	}
-	ps.tablesLocked()
+	ps.ensureDefaultDatabase()
 
 	return ps, nil
 }
 
-// tablesLocked makes sure the default database has a metadata entry.
-func (ps *PebbleStorage) tablesLocked() {
+// hasLegacyLayout reports whether the store still holds pre-database keys or
+// the flat metadata map.
+func (ps *PebbleStorage) hasLegacyLayout() bool {
+	ps.core.mu.RLock()
+	defer ps.core.mu.RUnlock()
+	if len(ps.core.meta.Tables) > 0 {
+		return true
+	}
+	for _, prefix := range legacyPrefixes {
+		iter, err := ps.core.db.NewIter(&pebble.IterOptions{LowerBound: []byte(prefix), UpperBound: []byte(prefix + "\xff")})
+		if err != nil {
+			return false
+		}
+		found := iter.First()
+		iter.Close()
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+// backupClosedStore closes Pebble, copies the whole store directory to a
+// sibling "pebble.db.backup-<timestamp>" directory and reopens it. Returns the
+// backup path.
+func (ps *PebbleStorage) backupClosedStore(dbPath string, opts *pebble.Options) (string, error) {
 	ps.core.mu.Lock()
 	defer ps.core.mu.Unlock()
-	ps.tables()
+
+	if err := ps.core.db.Close(); err != nil {
+		return "", fmt.Errorf("close before backup: %w", err)
+	}
+	backup := dbPath + ".backup-" + time.Now().Format("20060102-150405")
+	if err := copyDir(dbPath, backup); err != nil {
+		// Reopen so the caller can still fail cleanly.
+		if db, openErr := pebble.Open(dbPath, opts); openErr == nil {
+			ps.core.db = db
+		}
+		return "", err
+	}
+	db, err := pebble.Open(dbPath, opts)
+	if err != nil {
+		return "", fmt.Errorf("reopen after backup: %w", err)
+	}
+	ps.core.db = db
+	return backup, nil
+}
+
+// copyDir copies a directory tree (regular files only; Pebble's LOCK file is
+// skipped so the backup can be opened independently).
+func copyDir(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0755)
+		}
+		if !info.Mode().IsRegular() || info.Name() == "LOCK" {
+			return nil
+		}
+		in, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		out, err := os.Create(target)
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(out, in); err != nil {
+			out.Close()
+			return err
+		}
+		return out.Close()
+	})
 }
 
 // legacyPrefixes are the key families of the pre-database on-disk layout.
 var legacyPrefixes = []string{"table:", "view:", "proc:", "trig:", "job:"}
 
+// legacyDatabases returns the names the pre-database engine registered with
+// CREATE DATABASE (rows of the persisted pg_catalog.pg_database table). Each
+// of them was materialized as a schema of the same name; the migration turns
+// those schemas back into real databases so "psql -d name" keeps working.
+// Caller holds core.mu.
+func (ps *PebbleStorage) legacyDatabases() map[string]bool {
+	out := map[string]bool{}
+	val, closer, err := ps.core.db.Get([]byte("table:public:pg_database"))
+	if err != nil {
+		return out
+	}
+	defer closer.Close()
+	var td TableData
+	if err := json.Unmarshal(val, &td); err != nil {
+		return out
+	}
+	nameIdx := -1
+	for i, c := range td.Columns {
+		if c.Name == "datname" {
+			nameIdx = i
+		}
+	}
+	if nameIdx < 0 {
+		return out
+	}
+	for _, row := range td.Rows {
+		if nameIdx < len(row) {
+			if name, ok := row[nameIdx].(string); ok && name != "" && name != catalog.DefaultDatabase {
+				out[name] = true
+			}
+		}
+	}
+	return out
+}
+
 // migrateLegacyLayout moves data persisted before databases existed (keys
 // "table:<schema>:<name>", "view:...", "proc:...", "trig:...", "job:..." and
-// the flat metadata Tables map) under the default database. It runs once: a
+// the flat metadata Tables map) into the database layout. It runs once: a
 // store that has already been migrated has no legacy keys left.
+//
+//   - Schemas created by the old CREATE DATABASE (listed in the persisted
+//     pg_database table) become databases: "table:x:t" → "db:x:table:public:t".
+//   - Everything else lands in the default database with its schema intact:
+//     "table:s:t" → "db:postgres:table:s:t"; procedures, triggers and jobs
+//     (global before) belong to the default database.
+//   - The persisted pg_database table is dropped: the cluster is the source
+//     of truth for databases now.
 func (ps *PebbleStorage) migrateLegacyLayout() error {
 	ps.core.mu.Lock()
 	defer ps.core.mu.Unlock()
 
+	legacyDBs := ps.legacyDatabases()
+	target := func(kind, key string) string {
+		// key is "kind:rest"; for table/view the rest is "<schema>:<name>".
+		if kind == "table" || kind == "view" {
+			parts := strings.SplitN(strings.TrimPrefix(key, kind+":"), ":", 2)
+			if len(parts) == 2 && legacyDBs[parts[0]] {
+				return "db:" + parts[0] + ":" + kind + ":public:" + parts[1]
+			}
+		}
+		return "db:" + catalog.DefaultDatabase + ":" + key
+	}
+
+	// Every key move goes into one batch: a single synced write instead of two
+	// fsyncs per object, and the migration is applied atomically.
+	batch := ps.core.db.NewBatch()
+	defer batch.Close()
 	moved := 0
 	for _, prefix := range legacyPrefixes {
 		iter, err := ps.core.db.NewIter(&pebble.IterOptions{LowerBound: []byte(prefix), UpperBound: []byte(prefix + "\xff")})
 		if err != nil {
 			return err
 		}
-		type kv struct{ k, v []byte }
-		var pairs []kv
+		kind := strings.TrimSuffix(prefix, ":")
 		for iter.First(); iter.Valid(); iter.Next() {
-			pairs = append(pairs, kv{append([]byte(nil), iter.Key()...), append([]byte(nil), iter.Value()...)})
+			key := string(iter.Key())
+			if key != "table:public:pg_database" {
+				if err := batch.Set([]byte(target(kind, key)), iter.Value(), nil); err != nil {
+					iter.Close()
+					return fmt.Errorf("migrate %s: %w", key, err)
+				}
+			}
+			if err := batch.Delete(iter.Key(), nil); err != nil {
+				iter.Close()
+				return fmt.Errorf("migrate %s: %w", key, err)
+			}
+			moved++
 		}
 		if err := iter.Close(); err != nil {
 			return err
 		}
-		for _, p := range pairs {
-			newKey := []byte("db:" + catalog.DefaultDatabase + ":" + string(p.k))
-			if err := ps.core.db.Set(newKey, p.v, ps.core.wal); err != nil {
-				return fmt.Errorf("migrate %s: %w", p.k, err)
-			}
-			if err := ps.core.db.Delete(p.k, ps.core.wal); err != nil && err != pebble.ErrNotFound {
-				return fmt.Errorf("migrate %s: %w", p.k, err)
-			}
-			moved++
+	}
+	if moved > 0 {
+		if err := ps.core.db.Apply(batch, ps.core.wal); err != nil {
+			return fmt.Errorf("apply migration batch: %w", err)
 		}
 	}
 
 	if len(ps.core.meta.Tables) > 0 {
-		dm, ok := ps.core.meta.Databases[catalog.DefaultDatabase]
-		if !ok || dm == nil {
-			dm = &DatabaseMeta{Tables: make(map[string]map[string]*TableSchema)}
-			ps.core.meta.Databases[catalog.DefaultDatabase] = dm
+		dbMeta := func(name string) *DatabaseMeta {
+			dm := ps.core.meta.Databases[name]
+			if dm == nil {
+				dm = &DatabaseMeta{Tables: make(map[string]map[string]*TableSchema)}
+				ps.core.meta.Databases[name] = dm
+			}
+			if dm.Tables == nil {
+				dm.Tables = make(map[string]map[string]*TableSchema)
+			}
+			return dm
 		}
 		for schema, tables := range ps.core.meta.Tables {
-			if _, ok := dm.Tables[schema]; !ok {
-				dm.Tables[schema] = make(map[string]*TableSchema)
+			dm, targetSchema := dbMeta(catalog.DefaultDatabase), schema
+			if legacyDBs[schema] {
+				dm, targetSchema = dbMeta(schema), "public"
+			}
+			if _, ok := dm.Tables[targetSchema]; !ok {
+				dm.Tables[targetSchema] = make(map[string]*TableSchema)
 			}
 			for name, ts := range tables {
-				dm.Tables[schema][name] = ts
+				if schema == "public" && name == "pg_database" {
+					continue
+				}
+				dm.Tables[targetSchema][name] = ts
 			}
 		}
 		ps.core.meta.Tables = nil
 		moved++
 	}
+	for name := range legacyDBs {
+		if ps.core.meta.Databases[name] == nil {
+			ps.core.meta.Databases[name] = &DatabaseMeta{Tables: make(map[string]map[string]*TableSchema)}
+		}
+	}
 
 	if moved > 0 {
-		log.Printf("[storage] migrated legacy layout into database %s (%d entries)", catalog.DefaultDatabase, moved)
+		log.Printf("[storage] migrated legacy layout: %d entries into database %s, %d legacy database(s) promoted", moved, catalog.DefaultDatabase, len(legacyDBs))
 		return ps.saveMetadata()
 	}
 	return nil
@@ -566,10 +745,14 @@ func (ps *PebbleStorage) CreateSchema(name string) error {
 	ps.core.mu.Lock()
 	defer ps.core.mu.Unlock()
 
-	if _, ok := ps.tables()[name]; ok {
+	tables, err := ps.tablesForWrite()
+	if err != nil {
+		return err
+	}
+	if _, ok := tables[name]; ok {
 		return fmt.Errorf("schema %s already exists", name)
 	}
-	ps.tables()[name] = make(map[string]*TableSchema)
+	tables[name] = make(map[string]*TableSchema)
 	return ps.saveMetadata()
 }
 
@@ -604,6 +787,9 @@ func (ps *PebbleStorage) saveTableWithSchema(table *catalog.Table, schema string
 	ps.core.mu.Lock()
 	defer ps.core.mu.Unlock()
 
+	if _, err := ps.tablesForWrite(); err != nil {
+		return err
+	}
 	key := ps.key("table:" + schema + ":" + table.Name)
 
 	// Encode rows inside the table's read lock to avoid copying all rows into
@@ -630,10 +816,14 @@ func (ps *PebbleStorage) saveTableWithSchema(table *catalog.Table, schema string
 	}
 
 	// Update metadata
-	if _, ok := ps.tables()[schema]; !ok {
-		ps.tables()[schema] = make(map[string]*TableSchema)
+	tables, err := ps.tablesForWrite()
+	if err != nil {
+		return err
 	}
-	ps.tables()[schema][table.Name] = &TableSchema{
+	if _, ok := tables[schema]; !ok {
+		tables[schema] = make(map[string]*TableSchema)
+	}
+	tables[schema][table.Name] = &TableSchema{
 		Name:        table.Name,
 		Columns:     convertColumns(table.Columns),
 		Constraints: convertConstraints(table.Constraints),
@@ -646,17 +836,18 @@ func (ps *PebbleStorage) saveTableWithSchema(table *catalog.Table, schema string
 
 // LoadTable retrieves a table from Pebble (implements Backend interface)
 func (ps *PebbleStorage) LoadTable(cat *catalog.Catalog, name string) error {
-	return ps.loadTableInternal(cat, name, "public")
+	ps.core.mu.RLock()
+	defer ps.core.mu.RUnlock()
+	return ps.loadTableLocked(cat, name, "public")
 }
 
-// loadTableInternal retrieves a table from Pebble with schema support
-func (ps *PebbleStorage) loadTableInternal(cat *catalog.Catalog, name string, schema string) error {
+// loadTableLocked retrieves a table from Pebble with schema support. The
+// caller must hold core.mu (read or write): it is never re-acquired here, so
+// loadDatabase can hold a single read lock for the whole load.
+func (ps *PebbleStorage) loadTableLocked(cat *catalog.Catalog, name string, schema string) error {
 	if strings.HasPrefix(name, "pg_catalog.") {
 		return nil
 	}
-
-	ps.core.mu.RLock()
-	defer ps.core.mu.RUnlock()
 
 	key := ps.key("table:" + schema + ":" + name)
 	val, closer, err := ps.core.db.Get(key)
@@ -759,14 +950,16 @@ func (ps *PebbleStorage) LoadAll(cat *catalog.Catalog) error {
 	return nil
 }
 
-// loadDatabase loads every object of the bound database into cat.
+// loadDatabase loads every object of the bound database into cat under a
+// single read lock (no nested locking on the load path).
 func (ps *PebbleStorage) loadDatabase(cat *catalog.Catalog) error {
-	ps.core.mu.Lock()
-	tables := ps.tables()
-	ps.core.mu.Unlock()
-
 	ps.core.mu.RLock()
 	defer ps.core.mu.RUnlock()
+
+	var tables map[string]map[string]*TableSchema
+	if dm := ps.core.meta.Databases[ps.dbName]; dm != nil {
+		tables = dm.Tables
+	}
 
 	// Recreate persisted schemas first, including empty schemas (without tables)
 	for schema := range tables {
@@ -802,7 +995,7 @@ func (ps *PebbleStorage) loadDatabase(cat *catalog.Catalog) error {
 
 			// Load ALL tables, including system catalog tables like pg_catalog.pg_database
 			// This ensures that user-created databases persist across restarts
-			if err := ps.loadTableInternal(cat, tableName, schema); err != nil {
+			if err := ps.loadTableLocked(cat, tableName, schema); err != nil {
 				log.Printf("[storage] warning: failed to load table %s.%s: %v", schema, tableName, err)
 			}
 		} else if strings.HasPrefix(key, "proc:") {
@@ -911,8 +1104,8 @@ func (ps *PebbleStorage) Close() error {
 // Meta returns the current metadata for inspection: Tables is the bound
 // database's schema map (legacy accessor), Databases the whole cluster.
 func (ps *PebbleStorage) Meta() *TableMetadata {
-	ps.core.mu.Lock()
-	defer ps.core.mu.Unlock()
+	ps.core.mu.RLock()
+	defer ps.core.mu.RUnlock()
 	return &TableMetadata{Tables: ps.tables(), Databases: ps.core.meta.Databases}
 }
 

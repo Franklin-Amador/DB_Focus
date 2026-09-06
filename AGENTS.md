@@ -1469,3 +1469,30 @@ persisten por separado y `DeleteDatabase` borra solo una), `cmd/focusd/gui_api_t
 procedure homónimos, aislamiento, `DROP DATABASE` protegido, recarga con dos bases),
 `system_handler_test.go` adaptado (base ≠ schema). Regresión de integración 30/30 y E2E en navegador
 sobre una copia del directorio `data/` real (migración verificada).
+
+**Revisión de código (4 ángulos) y correcciones aplicadas antes del push final**:
+- Storage: `loadDatabase` carga bajo **un solo** RLock (`loadTableLocked` ya no re-toma el lock);
+  `tables()` solo lee y `tablesForWrite()` **falla** si la base no está registrada — antes cualquier
+  escritura tardía (job, sesión abierta) sobre una base recién borrada la "resucitaba" en el metadata
+  y volvía tras reiniciar. Migración en **un batch** (un fsync en vez de dos por objeto) y
+  `DeleteRange` para borrar bases; **backup** del almacén cerrado a `pebble.db.backup-<ts>` antes
+  de migrar (`hasLegacyLayout` + `backupClosedStore`); las "bases" del motor antiguo (filas del
+  `pg_database` persistido) se **promueven a bases reales** (`table:x:t` → `db:x:table:public:t`)
+  y la tabla `pg_database` legada se descarta (`legacyDatabases`).
+- Executor: `CREATE/DROP DATABASE` persisten **antes** de mutar el clúster (sin tags de éxito para
+  cambios que no sobrevivirían un reinicio); DROP protege default y base en uso.
+- Clúster: `AddDropHook` (el handler desmonta executor + scheduler sin inspeccionar statements,
+  también si el DROP corre dentro de un procedure/job), `DatabaseNames()` barato para
+  `pg_database`; OIDs estables por nombre (`databaseOID`, FNV) para clientes que los cachean;
+  una sesión cuya base fue borrada recibe error en vez de respuestas de `postgres`.
+- Handler: `executorFor` resuelve el catálogo **bajo el lock** y retira executors cuyo catálogo ya
+  no es el del clúster (drop + recreate con el mismo nombre).
+- Catálogo: `resolveDatabaseSchema` ya no mapea `"postgres"` a `public` (un esquema puede llamarse
+  `postgres`); identificadores con `:` se rechazan (`checkIdentifier`) porque `:` separa las claves.
+- Wire: `SET search_path TO x` cambia el esquema de la sesión (`server.session`,
+  `SessionQueryHandler`, `CatalogProvider.HandleSystemQueryForSession`); `SHOW search_path`,
+  `current_schema()` y `current_database()` (nueva ruta de sistema) lo reflejan. `ast.Set` conserva
+  nombre y valores.
+- Se eliminó la tabla `pg_catalog.pg_database` de `initSystemCatalog` (el clúster es la fuente).
+- No abordado (documentado): `DROP DATABASE` no espera a otras sesiones conectadas a esa base; su
+  trabajo en curso sigue en memoria pero ya no puede persistir (`tablesForWrite`).

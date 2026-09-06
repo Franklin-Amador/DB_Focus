@@ -711,3 +711,20 @@ func TestParseTableRefSchemaAndAlias(t *testing.T) {
 		t.Errorf("unexpected bare alias parse %+v", sel.Table)
 	}
 }
+
+func TestParseSetKeepsPayload(t *testing.T) {
+	p := NewParser("SET search_path TO tienda, public")
+	stmt, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	set, ok := stmt.(*ast.Set)
+	if !ok || set.Name != "search_path" || len(set.Values) != 2 || set.Values[0] != "tienda" || set.Values[1] != "public" {
+		t.Fatalf("unexpected SET payload %+v", stmt)
+	}
+	p = NewParser("SET DateStyle = 'ISO'")
+	stmt, _ = p.ParseStatement()
+	if set := stmt.(*ast.Set); set.Name != "DateStyle" || len(set.Values) != 1 || set.Values[0] != "ISO" {
+		t.Fatalf("unexpected SET payload %+v", stmt)
+	}
+}

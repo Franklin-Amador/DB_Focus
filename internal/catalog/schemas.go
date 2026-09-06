@@ -1,6 +1,19 @@
 package catalog
 
-import "sort"
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// checkIdentifier rejects object names the storage layer cannot represent:
+// ':' separates the segments of every persisted key.
+func checkIdentifier(kind, name string) error {
+	if strings.Contains(name, ":") {
+		return fmt.Errorf("invalid %s name %q: ':' is not allowed", kind, name)
+	}
+	return nil
+}
 
 // systemSchemas are the namespaces owned by the engine. They are hidden from
 // schema listings and can never be dropped.

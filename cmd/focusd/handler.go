@@ -38,9 +38,12 @@ func newExecuteHandler(ctx context.Context, cl *catalog.Cluster, st storage.Back
 		execs:   map[string]*executor.Executor{},
 		cancels: map[string]context.CancelFunc{},
 	}
-	for _, info := range cl.ListDatabases() {
-		if _, _, err := h.executorFor(info.Name); err != nil {
-			fmt.Printf("warning: cannot start database %s: %v\n", info.Name, err)
+	// Whatever path drops a database (wire, GUI, a job or procedure body),
+	// its executor and scheduler go away with it.
+	cl.AddDropHook(func(string) { h.pruneExecutors() })
+	for _, name := range cl.DatabaseNames() {
+		if _, _, err := h.executorFor(name); err != nil {
+			fmt.Printf("warning: cannot start database %s: %v\n", name, err)
 		}
 	}
 	return h
@@ -52,14 +55,24 @@ func (h *executeHandler) executorFor(database string) (*executor.Executor, *cata
 	if database == "" {
 		database = catalog.DefaultDatabase
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// Resolved under the handler lock so a concurrent DROP DATABASE cannot
+	// slip between the existence check and the executor registration.
 	cat, ok := h.cluster.Database(database)
 	if !ok {
 		return nil, nil, fmt.Errorf("database %q does not exist", database)
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if exe, ok := h.execs[database]; ok {
+	if exe, ok := h.execs[database]; ok && exe.Catalog() == cat {
 		return exe, cat, nil
+	} else if ok {
+		// Same name, different catalog: the database was dropped and
+		// recreated; retire the stale executor.
+		if cancel, ok := h.cancels[database]; ok {
+			cancel()
+			delete(h.cancels, database)
+		}
+		delete(h.execs, database)
 	}
 	var st storage.Backend
 	if h.storage != nil {
@@ -101,6 +114,12 @@ func (h *executeHandler) Handle(query string) (*server.QueryResult, error) {
 func (h *executeHandler) HandleWithDatabase(query string, currentDatabase string) (*server.QueryResult, error) {
 	// Wire-protocol path: no request context available, keep prior behavior.
 	return h.HandleWithDatabaseCtx(context.Background(), query, currentDatabase)
+}
+
+// HandleWithSession executes inside a database with the session's schema as
+// search_path (wire protocol after SET search_path).
+func (h *executeHandler) HandleWithSession(query string, database string, schema string) (*server.QueryResult, error) {
+	return h.HandleQueryCtx(context.Background(), query, database, schema)
 }
 
 // HandleWithDatabaseCtx executes inside a database with the default "public"
@@ -156,9 +175,6 @@ func (h *executeHandler) HandleQueryCtx(ctx context.Context, query string, datab
 		result, err := exe.Execute(ctx, stmt)
 		if err != nil {
 			return nil, err
-		}
-		if _, dropped := stmt.(*ast.DropDatabase); dropped {
-			h.pruneExecutors()
 		}
 		lastResult = &server.QueryResult{
 			Columns: result.Columns,
@@ -243,9 +259,6 @@ func (h *executeHandler) HandleScript(ctx context.Context, sql string, maxRows i
 			out.FailedSQL = stmtSQL
 			out.Err = err
 			return out
-		}
-		if _, dropped := stmt.(*ast.DropDatabase); dropped {
-			h.pruneExecutors()
 		}
 
 		rows := result.Rows

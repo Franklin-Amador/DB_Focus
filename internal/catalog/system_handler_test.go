@@ -134,7 +134,7 @@ WHERE c.relkind IN ('v','')
   AND pg_catalog.pg_table_is_visible(c.oid)
 ORDER BY 1,2;`
 
-	res, ok := c.HandleSystemQueryForDatabase(dvQuery, "postgres")
+	res, ok := c.HandleSystemQueryForDatabase(dvQuery, "public")
 	if !ok {
 		t.Fatalf("dv query should be handled")
 	}
@@ -164,7 +164,7 @@ WHERE c.relkind IN ('r')
   AND pg_catalog.pg_table_is_visible(c.oid)
 ORDER BY 1,2;`
 
-	res, ok := c.HandleSystemQueryForDatabase(query, "postgres")
+	res, ok := c.HandleSystemQueryForDatabase(query, "public")
 	if !ok {
 		t.Fatalf("namespace-first dt query should be handled")
 	}

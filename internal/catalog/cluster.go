@@ -16,8 +16,9 @@ const DefaultDatabase = "postgres"
 // A database is a hard boundary: a query runs inside one Catalog and cannot
 // reach objects of another database, like PostgreSQL.
 type Cluster struct {
-	mu  sync.RWMutex
-	dbs map[string]*Catalog
+	mu        sync.RWMutex
+	dbs       map[string]*Catalog
+	dropHooks []func(name string)
 }
 
 // DatabaseInfo summarizes a database for listings (pg_database, GUI).
@@ -79,19 +80,50 @@ func (cl *Cluster) CreateDatabase(name string) (*Catalog, error) {
 	return c, nil
 }
 
-// DropDatabase removes a database and everything inside it. The default
-// database is protected.
+// DropDatabase removes a database and everything inside it, then notifies
+// the drop hooks (executors, schedulers). The default database is protected.
 func (cl *Cluster) DropDatabase(name string) error {
 	if name == DefaultDatabase {
 		return fmt.Errorf("cannot drop database %s: it is the default database", name)
 	}
 	cl.mu.Lock()
-	defer cl.mu.Unlock()
 	if _, exists := cl.dbs[name]; !exists {
+		cl.mu.Unlock()
 		return fmt.Errorf("database %s does not exist", name)
 	}
 	delete(cl.dbs, name)
+	hooks := append([]func(string){}, cl.dropHooks...)
+	cl.mu.Unlock()
+	for _, h := range hooks {
+		h(name)
+	}
 	return nil
+}
+
+// AddDropHook registers a function called (outside the cluster lock) after a
+// database is dropped, whatever code path dropped it.
+func (cl *Cluster) AddDropHook(fn func(name string)) {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	cl.dropHooks = append(cl.dropHooks, fn)
+}
+
+// DatabaseNames returns the database names, default first then sorted. It is
+// the cheap listing (no object counts) for pg_database and bookkeeping.
+func (cl *Cluster) DatabaseNames() []string {
+	cl.mu.RLock()
+	names := make([]string, 0, len(cl.dbs))
+	for name := range cl.dbs {
+		names = append(names, name)
+	}
+	cl.mu.RUnlock()
+	sort.Slice(names, func(i, j int) bool {
+		if (names[i] == DefaultDatabase) != (names[j] == DefaultDatabase) {
+			return names[i] == DefaultDatabase
+		}
+		return names[i] < names[j]
+	})
+	return names
 }
 
 // ListDatabases returns every database with object counts, default first
@@ -131,13 +163,23 @@ func (cl *Cluster) RegisterUser(username string, superuser bool) error {
 
 // HandleSystemQueryForDatabase answers a system-catalog query against the
 // named database (default when unknown), with the default "public" schema as
-// the session schema. It lets the wire server work on the cluster directly.
+// the session schema.
 func (cl *Cluster) HandleSystemQueryForDatabase(query, database string) (*SystemResult, bool) {
+	return cl.HandleSystemQueryForSession(query, database, "public")
+}
+
+// HandleSystemQueryForSession answers a system-catalog query inside database
+// with schema as the session search_path. It lets the wire server work on the
+// cluster directly.
+func (cl *Cluster) HandleSystemQueryForSession(query, database, schema string) (*SystemResult, bool) {
 	c, ok := cl.Database(database)
 	if !ok {
-		c = cl.Default()
+		// Not handled: the query falls through to the executor path, which
+		// reports "database does not exist" instead of answering from another
+		// database.
+		return nil, false
 	}
-	return c.HandleSystemQueryForDatabase(query, "public")
+	return c.HandleSystemQueryForSession(query, database, schema)
 }
 
 // Name returns the database this catalog belongs to.

@@ -9,7 +9,16 @@ import "dbf/internal/catalog"
 type CatalogProvider interface {
 	DatabaseExists(name string) bool
 	RegisterUser(username string, superuser bool) error
-	HandleSystemQueryForDatabase(query, database string) (*catalog.SystemResult, bool)
+	// HandleSystemQueryForSession answers a system-catalog query inside the
+	// session's database with the session's schema as search_path.
+	HandleSystemQueryForSession(query, database, schema string) (*catalog.SystemResult, bool)
+}
+
+// session is the per-connection context: the database chosen at startup and
+// the schema selected with SET search_path (public by default).
+type session struct {
+	database string
+	schema   string
 }
 
 // QueryHandler handles SQL queries and returns results for the wire layer.
@@ -21,6 +30,12 @@ type QueryHandler interface {
 // connection-level database context.
 type DatabaseQueryHandler interface {
 	HandleWithDatabase(query string, database string) (*QueryResult, error)
+}
+
+// SessionQueryHandler is an optional extension for handlers that also honour
+// the session schema (SET search_path).
+type SessionQueryHandler interface {
+	HandleWithSession(query string, database string, schema string) (*QueryResult, error)
 }
 
 // QueryResult is a minimal representation of query results used by pgwire.

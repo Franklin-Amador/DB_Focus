@@ -6,8 +6,27 @@ import (
 	"io"
 	"log"
 	"net"
+	"regexp"
 	"strings"
 )
+
+// searchPathRe matches "SET search_path TO x[, y]" / "SET search_path = x".
+var searchPathRe = regexp.MustCompile(`(?is)^\s*SET\s+search_path\s*(?:=|\bTO\b)\s*(.+?)\s*;?\s*$`)
+
+// searchPathTarget extracts the first schema of a SET search_path statement,
+// or "" when the statement is something else.
+func searchPathTarget(stmt string) string {
+	m := searchPathRe.FindStringSubmatch(stmt)
+	if m == nil {
+		return ""
+	}
+	first := strings.TrimSpace(strings.SplitN(m[1], ",", 2)[0])
+	first = strings.Trim(first, "\"'")
+	if first == "" || first == "$user" {
+		return "public"
+	}
+	return first
+}
 
 // Default max connections to prevent OOM on limited memory systems
 const defaultMaxConnections = 20
@@ -68,6 +87,7 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat CatalogProvi
 		return
 	}
 	log.Printf("[conn] authenticated from %s as user: %s (db=%s)", remoteAddr, user, currentDatabase)
+	sess := &session{database: currentDatabase, schema: "public"}
 
 	// Register user in catalog
 	if err := cat.RegisterUser(user, true); err != nil {
@@ -87,7 +107,7 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat CatalogProvi
 
 		switch msgType {
 		case 'Q':
-			if err := handleSimpleQuery(rw, handler, cat, payload, currentDatabase); err != nil {
+			if err := handleSimpleQuery(rw, handler, cat, payload, sess); err != nil {
 				log.Printf("[conn] query handler error: %v", err)
 				return
 			}
@@ -101,7 +121,7 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat CatalogProvi
 		case 'D':
 			handleDescribe(rw, lastPrepared)
 		case 'E':
-			handleExecute(rw, handler, lastPrepared, currentDatabase)
+			handleExecute(rw, handler, lastPrepared, sess)
 		case 'S':
 			if err := writeReady(rw); err != nil {
 				log.Printf("[msg S] writeReady error: %v", err)
@@ -126,7 +146,7 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat CatalogProvi
 	}
 }
 
-func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogProvider, payload []byte, currentDatabase string) error {
+func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogProvider, payload []byte, sess *session) error {
 	query := strings.TrimRight(string(payload), "\x00")
 
 	if strings.TrimSpace(query) == "" {
@@ -156,13 +176,22 @@ func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogPr
 			continue
 		}
 
-		if sysResult, ok := cat.HandleSystemQueryForDatabase(stmt, currentDatabase); ok {
+		// SET search_path changes the session schema (like PostgreSQL).
+		if target := searchPathTarget(stmt); target != "" {
+			sess.schema = target
+			log.Printf("[msg Q] search_path -> %s", target)
+			writeEmptyRowDescription(rw)
+			writeCommandComplete(rw, "SET")
+			continue
+		}
+
+		if sysResult, ok := cat.HandleSystemQueryForSession(stmt, sess.database, sess.schema); ok {
 			log.Printf("[msg Q] system query handled")
 			writeSystemResult(rw, sysResult)
 			continue
 		}
 
-		result, err := executeQuery(handler, stmt, currentDatabase)
+		result, err := executeQuery(handler, stmt, sess)
 		if err != nil {
 			log.Printf("[msg Q] handler error: %v", err)
 			writeError(rw, err.Error())
@@ -256,7 +285,7 @@ func handleDescribe(rw *bufio.ReadWriter, lastPrepared string) {
 	rw.Flush()
 }
 
-func handleExecuteWithDatabase(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared string, currentDatabase string) {
+func handleExecuteWithDatabase(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared string, sess *session) {
 	log.Printf("[msg E] executing: %q", lastPrepared) // agrega esto
 
 	if lastPrepared == "" {
@@ -283,8 +312,15 @@ func handleExecuteWithDatabase(rw *bufio.ReadWriter, handler QueryHandler, lastP
 		return
 	}
 
+	if target := searchPathTarget(lastPrepared); target != "" {
+		sess.schema = target
+		writeCommandComplete(rw, "SET")
+		rw.Flush()
+		return
+	}
+
 	log.Printf("[msg E] calling handler.Handle()...")
-	result, err := executeQuery(handler, lastPrepared, currentDatabase)
+	result, err := executeQuery(handler, lastPrepared, sess)
 	log.Printf("[msg E] handler.Handle() returned")
 	if err != nil {
 		log.Printf("[msg E] handler error: %v", err)
@@ -327,13 +363,16 @@ func handleExecuteWithDatabase(rw *bufio.ReadWriter, handler QueryHandler, lastP
 	log.Printf("[msg E] flushed buffer")
 }
 
-func handleExecute(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared string, currentDatabase string) {
-	handleExecuteWithDatabase(rw, handler, lastPrepared, currentDatabase)
+func handleExecute(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared string, sess *session) {
+	handleExecuteWithDatabase(rw, handler, lastPrepared, sess)
 }
 
-func executeQuery(handler QueryHandler, query string, currentDatabase string) (*QueryResult, error) {
+func executeQuery(handler QueryHandler, query string, sess *session) (*QueryResult, error) {
+	if sh, ok := handler.(SessionQueryHandler); ok {
+		return sh.HandleWithSession(query, sess.database, sess.schema)
+	}
 	if dbHandler, ok := handler.(DatabaseQueryHandler); ok {
-		return dbHandler.HandleWithDatabase(query, currentDatabase)
+		return dbHandler.HandleWithDatabase(query, sess.database)
 	}
 	return handler.Handle(query)
 }

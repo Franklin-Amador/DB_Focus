@@ -67,6 +67,11 @@ func (e *Executor) executeSet(ctx context.Context, stmt *ast.Set) (*Result, erro
 	return &Result{Tag: constants.ResultOK}, nil
 }
 
+// Catalog returns the catalog (database) this executor runs against.
+func (e *Executor) Catalog() *catalog.Catalog {
+	return e.catalog
+}
+
 // SetTriggersEnabled enables or disables trigger execution
 func (e *Executor) SetTriggersEnabled(enabled bool) {
 	e.triggersEnabled = enabled

@@ -6,6 +6,9 @@ import (
 )
 
 func (c *Catalog) CreateView(name string, columns []Column, query *ast.Select, schemaOpt ...string) error {
+	if err := checkIdentifier("view", name); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

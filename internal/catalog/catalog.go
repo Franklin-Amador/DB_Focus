@@ -25,25 +25,25 @@ func newCatalog(name string, cl *Cluster) *Catalog {
 	return c
 }
 
-// resolveDatabaseSchema maps the session context passed to the system-query
-// handlers to a schema name. Callers pass the session schema ("public" by
-// default); the historical database aliases "" and "postgres" also mean public.
-func resolveDatabaseSchema(currentDatabase string) string {
-	if currentDatabase == "" || currentDatabase == DefaultDatabase {
+// resolveDatabaseSchema maps the session schema passed to the system-query
+// handlers to a schema name: empty means public. (A schema may legitimately
+// be called "postgres", so no database alias is applied here.)
+func resolveDatabaseSchema(currentSchema string) string {
+	if currentSchema == "" {
 		return "public"
 	}
-	return currentDatabase
+	return currentSchema
 }
 
 // GetInformationSchemaTables returns information_schema.tables data based on actual catalog tables
 func (c *Catalog) GetInformationSchemaTables() [][]interface{} {
-	return c.GetInformationSchemaTablesForDatabase("postgres")
+	return c.GetInformationSchemaTablesForDatabase("public")
 }
 
 // GetInformationSchemaTablesForDatabase returns information_schema.tables for the active database.
 func (c *Catalog) GetInformationSchemaTablesForDatabase(currentDatabase string) [][]interface{} {
 	if currentDatabase == "" {
-		currentDatabase = "postgres"
+		currentDatabase = "public"
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -82,13 +82,13 @@ func (c *Catalog) GetInformationSchemaTablesForDatabase(currentDatabase string) 
 
 // GetInformationSchemaColumns returns information_schema.columns data based on actual catalog columns
 func (c *Catalog) GetInformationSchemaColumns() [][]interface{} {
-	return c.GetInformationSchemaColumnsForDatabase("postgres")
+	return c.GetInformationSchemaColumnsForDatabase("public")
 }
 
 // GetInformationSchemaColumnsForDatabase returns information_schema.columns for the active database.
 func (c *Catalog) GetInformationSchemaColumnsForDatabase(currentDatabase string) [][]interface{} {
 	if currentDatabase == "" {
-		currentDatabase = "postgres"
+		currentDatabase = "public"
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()

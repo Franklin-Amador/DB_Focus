@@ -6,6 +6,9 @@ import (
 )
 
 func (c *Catalog) CreateTable(name string, columns []Column, constraints []Constraint, schemaOpt ...string) error {
+	if err := checkIdentifier("table", name); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -108,6 +111,9 @@ func (c *Catalog) CreateSchema(name string) error {
 
 	if name == "" {
 		return fmt.Errorf("schema name cannot be empty")
+	}
+	if err := checkIdentifier("schema", name); err != nil {
+		return err
 	}
 	if _, ok := c.tables[name]; ok {
 		return fmt.Errorf("schema %s already exists", name)

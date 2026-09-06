@@ -30,26 +30,8 @@ func (c *Catalog) initSystemCatalog() {
 		_ = roles.InsertRowUnsafe([]interface{}{10, "postgres", true, true, true, true, true})
 	}
 
-	// pg_catalog.pg_database
-	_ = c.CreateTable(constants.CatalogDatabase, []Column{
-		{Name: "oid", Type: constants.DataTypeInteger},
-		{Name: "datname", Type: constants.DataTypeText},
-		{Name: "datdba", Type: constants.DataTypeInteger},
-		{Name: "encoding", Type: constants.DataTypeInteger},
-		{Name: "datcollate", Type: constants.DataTypeText},
-		{Name: "datctype", Type: constants.DataTypeText},
-		{Name: "datlocprovider", Type: constants.DataTypeText},
-		{Name: "daticulocale", Type: constants.DataTypeText},
-		{Name: "daticurules", Type: constants.DataTypeText},
-		{Name: "datacl", Type: constants.DataTypeText},
-		{Name: "datcollversion", Type: constants.DataTypeText},
-		{Name: "datallowconn", Type: constants.DataTypeBoolean},
-		{Name: "datistemplate", Type: constants.DataTypeBoolean},
-	}, nil)
-
-	if dbs, err := c.GetTable(constants.CatalogDatabase); err == nil {
-		_ = dbs.InsertRowUnsafe([]interface{}{1, "postgres", 10, 6, "C", "C", "c", "", "", "", "", true, false})
-	}
+	// pg_catalog.pg_database is answered from the cluster (system_handler.go
+	// getPgDatabase); no backing table is needed.
 
 	// pg_catalog.pg_extension
 	_ = c.CreateTable("pg_catalog.pg_extension", []Column{
