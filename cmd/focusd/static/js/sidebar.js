@@ -4,6 +4,7 @@ import { icon } from './icons.js';
 import { render, escHtml, escAttr } from './dom.js';
 import { apiSchema, apiObjects } from './api.js';
 import { runQuery } from './editor.js';
+import { loadSchemas, getSchemas } from './schemas.js';
 
 let schemaData  = [];
 let objectsData = { triggers: [], jobs: [], procedures: [] };
@@ -11,8 +12,10 @@ let tableNames = [], colNames = [];
 
 export async function loadSidebar() {
   try {
+    // Primero los esquemas (puede corregir state.schema si el activo ya no existe).
+    await loadSchemas();
     const [schemaRes, objRes] = await Promise.all([apiSchema(), apiObjects()]);
-    schemaData  = schemaRes || [];
+    schemaData  = Array.isArray(schemaRes) ? schemaRes : [];
     objectsData = objRes    || { triggers: [], jobs: [], procedures: [] };
 
     tableNames = schemaData.map(t => t.name);
@@ -41,7 +44,24 @@ export function renderSidebar(filter) {
 
   let html = '';
 
-  // ── Tables / Views section
+  // ── Schemas: el activo se resalta; click cambia el esquema activo.
+  const schemaItems = getSchemas().filter(s => !f || s.name.toLowerCase().includes(f));
+  html += sectionHTML(icon('schema'), 'Schemas', 'sec-schemas', schemaItems.map(s => {
+    const active = s.name === state.schema;
+    const summary = `${s.tables} tabla${s.tables !== 1 ? 's' : ''} · ${s.views} vista${s.views !== 1 ? 's' : ''}`;
+    return `
+      <div class="t-item ${active ? 'selected' : ''}" onclick="setActiveSchema('${escAttr(s.name)}')"
+           title="${escAttr(summary + (active ? ' · activo' : ' · click para activar'))}">
+        <span class="ico">${icon('schema', 13)}</span>
+        <span class="lbl">${escHtml(s.name)}</span>
+        <span class="cnt">${s.tables + s.views}</span>
+        ${s.isDefault ? '' : `<button class="t-act" title="Eliminar esquema"
+          onclick="event.stopPropagation();schemaDropOpen('${escAttr(s.name)}')">×</button>`}
+      </div>`;
+  }), schemaItems.length,
+    `<button class="sec-act" title="Nuevo esquema" onclick="event.stopPropagation();schemaCreateOpen()">+</button>`);
+
+  // ── Tables / Views section (del esquema activo)
   const tableItems = schemaData.filter(t =>
     t.kind === 'BASE TABLE' && (!f || t.name.toLowerCase().includes(f))
   );
@@ -113,12 +133,13 @@ export function renderSidebar(filter) {
   render(tree, html || '<div class="empty-state" style="height:80px"><p>Sin objetos</p></div>');
 }
 
-function sectionHTML(icon, label, id, itemsHTML, count) {
+function sectionHTML(icon, label, id, itemsHTML, count, actionHTML = '') {
   return `
     <div class="tree-section">
       <div class="sec-hdr" onclick="toggleSection('${id}')">
         <span class="arr">▾</span> <span class="sec-ico">${icon}</span> ${label}
         ${count > 0 ? `<span class="cnt" style="margin-left:auto">${count}</span>` : ''}
+        ${actionHTML}
       </div>
       <div class="sec-body" id="${id}">
         ${itemsHTML.length ? itemsHTML.join('') : '<div style="padding:4px 18px;font-size:11px;color:var(--dim)">vacío</div>'}

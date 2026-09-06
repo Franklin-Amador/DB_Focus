@@ -6,6 +6,12 @@ Motor de base de datos en Go con compatibilidad PostgreSQL Wire Protocol.
 
 Interfaz web incluida en el binario (`go:embed`), disponible en `http://localhost:9011` (flag `-gui`). **Funciona 100% offline**: CodeMirror 5.65.16 está vendoreado en `cmd/focusd/static/vendor/` (licencia MIT incluida).
 
+**Esquemas (bases de datos)**
+- Selector de **esquema activo** en el header. Todo lo que no lleva prefijo de esquema (tablas en el editor, explorador, diagrama, autocompletado) se resuelve dentro del esquema activo, como el `search_path` de una sesión. La elección persiste en el navegador.
+- Sección **Schemas** en el árbol lateral: click activa un esquema; `+` en el encabezado crea uno (modal, equivale a `CREATE SCHEMA`); `×` al pasar el mouse lo elimina (modal con opción `CASCADE` cuando no está vacío). `public` no se puede eliminar.
+- Para cruzar esquemas se califica el nombre: `SELECT p.nombre, v.monto FROM tienda.productos p JOIN public.ventas v ON p.id = v.id`.
+- En FocusDB una **base de datos es un alias de esquema**: `CREATE DATABASE x` crea el esquema `x` (y `DROP DATABASE x` lo elimina con todo su contenido); conectarse por wire con `database=x` equivale a activar ese esquema. No hay aislamiento adicional de almacenamiento, y procedimientos, triggers y jobs son globales.
+
 **Editor**
 - Pestañas múltiples de consulta (undo propio por pestaña; persisten en el navegador).
 - Ejecutar statement actual (`F5`/`Ctrl+Enter`), selección, o todo el script (`Ctrl+Shift+Enter`).
@@ -39,7 +45,7 @@ Interfaz web incluida en el binario (`go:embed`), disponible en `http://localhos
 - Self-FK como bucle, cardinalidad `1`/`N` en los extremos, contador de filas por tabla, badges de índice (`ix`) y `UNIQUE` (`u`).
 - Export SVG/PNG limpio (sin labels de hover). Modo compacto real (cajas más angostas, sin tipos).
 
-**API HTTP** (puerto GUI): `POST /api/query` (`{sql, maxRows?}`), `POST /api/script` (resultados por statement + `failedIndex`), `POST /api/validate`, `GET /api/schema` (columnas con `notNull/identity/isPK/isFK/isUnique`, `rowCount`, `indexes`, `viewDefinition`), `GET /api/objects` (con `bodyText`, `lastRun`), `GET /api/diagram`, `GET /api/table-data?table=&offset=&limit=`.
+**API HTTP** (puerto GUI): `POST /api/query` (`{sql, maxRows?, schema?}`), `POST /api/script` (resultados por statement + `failedIndex`; también acepta `schema`), `POST /api/validate`, `GET /api/schemas` (esquemas de usuario con conteo de tablas/vistas), `GET /api/schema?schema=` (columnas con `notNull/identity/isPK/isFK/isUnique`, `rowCount`, `indexes`, `viewDefinition`), `GET /api/objects` (con `bodyText`, `lastRun`), `GET /api/diagram?schema=`, `GET /api/table-data?table=&schema=&offset=&limit=`. `schema` vacío significa `public`; un esquema inexistente responde `404`.
 
 **Flags**: `-gui :9011` · `-query-timeout 60s` (tope por consulta de la GUI; `0` lo desactiva).
 
@@ -105,7 +111,9 @@ postgresql://postgres:4444@localhost:4444/postgres
 - `CREATE INDEX` indice ON tabla (columna)
 - `CREATE INDEX` indice ON tabla (columna1 [, columna2, ...])
 - `DROP INDEX` indice ON tabla
-- `CREATE DATABASE` nombre [WITH opciones]
+- `CREATE SCHEMA` [IF NOT EXISTS] esquema
+- `CREATE DATABASE` nombre [WITH opciones] — alias de `CREATE SCHEMA` (más una fila en `pg_database`)
+- `DROP DATABASE` nombre — elimina el esquema homónimo con todo su contenido
 - `CREATE PROCEDURE` nombre [(parámetros)] AS BEGIN sentencias... END
 - `CREATE TRIGGER` nombre [BEFORE|AFTER|INSTEAD OF] [INSERT|UPDATE|DELETE] ON tabla [FOR EACH ROW] BEGIN sentencias... END
 - `CREATE JOB` nombre SCHEDULE EVERY n [MINUTE|HOUR|DAY] BEGIN sentencias... END
@@ -153,6 +161,10 @@ postgresql://postgres:4444@localhost:4444/postgres
 - `DROP SCHEMA RESTRICT` (default): bloquea el borrado si el schema contiene tablas o vistas.
 - `DROP SCHEMA CASCADE`: elimina el schema junto con sus tablas y vistas.
 - `DROP SCHEMA IF EXISTS`: no retorna error si el schema no existe.
+- `public`, `pg_catalog`, `information_schema` y `pg_toast` no se pueden eliminar ni con `CASCADE`.
+- Referencias a tablas: `FROM esquema.tabla [AS] alias`, también con alias sin `AS` (`FROM ventas v`). Las columnas pueden calificarse con el alias, el nombre de la tabla o `esquema.tabla` (`WHERE v.monto > 1`, `SELECT tienda.productos.nombre ...`). Sin calificar, una tabla se busca en el esquema de la sesión (parámetro `database` del wire protocol, o esquema activo de la GUI) y por defecto en `public`.
+- Una vista resuelve sus tablas sin calificar dentro de **su propio esquema**, también tras reiniciar el servidor (`CREATE VIEW caros AS SELECT ... FROM productos` creada con el esquema `tienda` activo lee `tienda.productos`).
+- `pg_catalog.pg_namespace` y `\dn` listan los esquemas de usuario.
 - `ALTER JOB` permite habilitar/deshabilitar jobs sin eliminarlos. Los cambios persisten entre reinicios.
 - `ALTER TABLE` permite modificar la estructura de tablas existentes: agregar/eliminar columnas, cambiar tipos, renombrar columnas.
 - `CREATE INDEX` permite acelerar búsquedas por igualdad (`WHERE columna = valor`) en tablas con alto volumen de filas.
@@ -220,7 +232,11 @@ go run ./cmd/test-alter
 go run ./cmd/test-alter-constraints
 go run ./cmd/test-create-schema
 go run ./cmd/test-drop-schema
+go run ./cmd/test-schemas          # esquema activo, alias, vistas por esquema, DROP DATABASE, recarga
 go run ./cmd/test-parse-ddl
+
+# API HTTP de la GUI (httptest, sin puerto)
+go test ./cmd/focusd
 
 # Índices
 go run ./cmd/test-index

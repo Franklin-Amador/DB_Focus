@@ -71,6 +71,8 @@ const (
 	ResultDropIndex       = "DROP INDEX"
 	ResultDropView        = "DROP VIEW"
 	ResultDropTable       = "DROP TABLE"
+	ResultCreateSchema    = "CREATE SCHEMA"
+	ResultDropSchema      = "DROP SCHEMA"
 	ResultCreateDatabase  = "CREATE DATABASE"
 	ResultDropDatabase    = "DROP DATABASE"
 	ResultCreateProcedure = "CREATE PROCEDURE"

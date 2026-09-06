@@ -14,13 +14,16 @@ import {
   exportResultsCSV, exportResultsJSON, closeCellModal, copyCellModal,
 } from './results.js';
 import {
-  loadDiagram, reloadDiagram, fitDiagram, resetDiagramLayout, diagSearch,
+  loadDiagram, reloadDiagram, discardDiagram, fitDiagram, resetDiagramLayout, diagSearch,
   diagZoomBy, toggleCompact, exportSVG, exportPNG,
 } from './diagram.js';
 import {
   openExplorer, explorerPage, explorerRefresh, explorerEditCell,
   explorerDeleteRow, explorerDeleteConfirm, explorerInsertOpen, explorerInsertConfirm,
 } from './explorer.js';
+import {
+  setActiveSchema, schemaCreateOpen, schemaCreateConfirm, schemaDropOpen, schemaDropConfirm,
+} from './schemas.js';
 
 // ─── Tabs (Resultados / Historial) ───────────────────────────────────────────
 export function activateTab(name) {
@@ -39,6 +42,17 @@ export function refreshSidebar() {
     await loadSidebar();
     refreshPending = false;
   }, 400);
+}
+
+// ─── Cambio de esquema activo ─────────────────────────────────────────────────
+// El árbol, el diagrama y el explorador dependen del esquema: se recargan.
+export function onSchemaChanged() {
+  loadSidebar();
+  discardDiagram();
+  const diagramVisible  = document.getElementById('diagram-view').classList.contains('visible');
+  const explorerVisible = document.getElementById('explorer-view').classList.contains('visible');
+  if (diagramVisible) loadDiagram();
+  if (explorerVisible) showView('query');
 }
 
 // ─── View switching (query | diagram | explorer) ──────────────────────────────
@@ -73,6 +87,8 @@ Object.assign(window, {
   // explorador de datos
   openExplorer, explorerPage, explorerRefresh, explorerEditCell,
   explorerDeleteRow, explorerDeleteConfirm, explorerInsertOpen, explorerInsertConfirm,
+  // esquemas (header + sidebar + modales)
+  setActiveSchema, schemaCreateOpen, schemaCreateConfirm, schemaDropOpen, schemaDropConfirm,
 });
 
 // ─── Bootstrap ────────────────────────────────────────────────────────────────

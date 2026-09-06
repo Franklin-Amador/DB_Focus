@@ -117,13 +117,17 @@ func (c *Catalog) CreateSchema(name string) error {
 	return nil
 }
 
-// DropSchema removes a schema and all its tables from the catalog.
+// DropSchema removes a schema and all its tables from the catalog. System
+// schemas and "public" are protected and can never be dropped.
 func (c *Catalog) DropSchema(name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if name == "" {
 		return fmt.Errorf("schema name cannot be empty")
+	}
+	if IsProtectedSchema(name) {
+		return fmt.Errorf("cannot drop schema %s: it is a system schema", name)
 	}
 	if _, ok := c.tables[name]; !ok {
 		return fmt.Errorf("schema %s does not exist", name)

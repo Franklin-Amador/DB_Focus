@@ -58,7 +58,9 @@ function schemaSig(data) {
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
   return h.toString(36);
 }
-function persistKey() { return 'focusdb.diagram.v1.' + (diagData ? schemaSig(diagData) : '0'); }
+// v2: la clave incluye el esquema activo (tablas homónimas en distintos esquemas
+// no comparten posiciones).
+function persistKey() { return 'focusdb.diagram.v2.' + state.schema + '.' + (diagData ? schemaSig(diagData) : '0'); }
 
 let persistTimer = null;
 function persistDiagram() {
@@ -75,7 +77,7 @@ function persistDiagram() {
 
 function loadPersisted(data) {
   try {
-    const raw = localStorage.getItem('focusdb.diagram.v1.' + schemaSig(data));
+    const raw = localStorage.getItem('focusdb.diagram.v2.' + state.schema + '.' + schemaSig(data));
     if (!raw) return null;
     const st = JSON.parse(raw);
     if (!st || typeof st.positions !== 'object') return null;
@@ -936,6 +938,13 @@ export async function exportPNG() {
   } catch (e) {
     showToast('Error al exportar PNG: ' + e.message, 'err');
   }
+}
+
+// Descarta datos y posiciones en memoria (cambio de esquema activo): la
+// próxima entrada a la vista vuelve a pedir el diagrama del esquema nuevo.
+export function discardDiagram() {
+  diagData = null;
+  diagPos = {};
 }
 
 // Refresh explícito (botón ↺): refetch del schema conservando posiciones.

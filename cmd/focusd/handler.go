@@ -106,10 +106,13 @@ type scriptResult struct {
 // (Parser.Pos), so quoted semicolons and dollar-quoted bodies are attributed
 // correctly. Execution stops at the first error; prior statements remain
 // applied (there is no transaction support in the engine).
-func (h executeHandler) HandleScript(ctx context.Context, sql string, maxRows int) *scriptResult {
+func (h executeHandler) HandleScript(ctx context.Context, sql string, maxRows int, currentDatabase string) *scriptResult {
 	out := &scriptResult{FailedIndex: -1}
 
-	query := rewriteSystemFunctions(sql, "postgres")
+	if currentDatabase == "" {
+		currentDatabase = "postgres"
+	}
+	query := rewriteSystemFunctions(sql, currentDatabase)
 	p := parser.NewParser(query)
 	idx := 0
 
@@ -128,6 +131,7 @@ func (h executeHandler) HandleScript(ctx context.Context, sql string, maxRows in
 		if stmt == nil {
 			continue // bare semicolon
 		}
+		applyDatabaseContext(stmt, currentDatabase)
 
 		t0 := time.Now()
 		result, err := h.executor.Execute(ctx, stmt)
@@ -198,58 +202,14 @@ func rewriteSystemFunctions(query string, currentDatabase string) string {
 	return result
 }
 
+// applyDatabaseContext qualifies unqualified object references with the
+// session's database, which FocusDB maps to a schema namespace ("postgres"
+// and "" mean the default "public" schema, where nothing needs qualifying).
 func applyDatabaseContext(stmt ast.Statement, currentDatabase string) {
-	if currentDatabase == "" || currentDatabase == "postgres" {
+	if currentDatabase == "" || currentDatabase == "postgres" || currentDatabase == "public" {
 		return
 	}
-
-	setDefaultSchema := func(id *ast.Identifier) {
-		if id != nil && id.Name != "" && id.Alias == "" {
-			id.Alias = currentDatabase
-		}
-	}
-
-	var applyToSelect func(sel *ast.Select)
-	applyToSelect = func(sel *ast.Select) {
-		if sel == nil {
-			return
-		}
-		setDefaultSchema(&sel.Table)
-		if sel.Join != nil {
-			setDefaultSchema(&sel.Join.Table)
-		}
-		for i := range sel.With {
-			applyToSelect(sel.With[i].Select)
-		}
-	}
-
-	switch s := stmt.(type) {
-	case *ast.Select:
-		applyToSelect(s)
-	case *ast.Insert:
-		setDefaultSchema(&s.Table)
-	case *ast.Update:
-		setDefaultSchema(&s.Table)
-	case *ast.Delete:
-		setDefaultSchema(&s.Table)
-	case *ast.CreateTable:
-		setDefaultSchema(&s.Table)
-	case *ast.DropTable:
-		setDefaultSchema(&s.Table)
-	case *ast.AlterTable:
-		setDefaultSchema(&s.Table)
-	case *ast.CreateIndex:
-		setDefaultSchema(&s.Table)
-	case *ast.CreateView:
-		setDefaultSchema(&s.Name)
-		applyToSelect(s.Query)
-	case *ast.DropView:
-		setDefaultSchema(&s.Name)
-	case *ast.CreateTrigger:
-		setDefaultSchema(&s.Table)
-	case *ast.DropTrigger:
-		setDefaultSchema(&s.Table)
-	}
+	ast.ApplyDefaultSchema(stmt, currentDatabase)
 }
 
 func replaceAllCaseInsensitive(input, pattern, replacement string) string {
@@ -270,4 +230,3 @@ func replaceAllCaseInsensitive(input, pattern, replacement string) string {
 	}
 	return out.String()
 }
-

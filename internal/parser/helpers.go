@@ -54,16 +54,9 @@ func (p *Parser) parseFromAndJoin() (ast.Identifier, []*ast.JoinClause, error) {
 	if p.cur.Type != TokenIdent {
 		return ast.Identifier{}, nil, p.errorf("expected table name")
 	}
-	table := ast.Identifier{Name: p.cur.Literal}
-	p.next()
-	// Optional AS alias for table
-	if p.cur.Type == TokenAs {
-		p.next()
-		if p.cur.Type != TokenIdent {
-			return ast.Identifier{}, nil, p.errorf("expected alias after AS")
-		}
-		table.Alias = p.cur.Literal
-		p.next()
+	table, err := p.parseTableRef()
+	if err != nil {
+		return ast.Identifier{}, nil, err
 	}
 
 	// Optional chain of JOINs
@@ -135,15 +128,9 @@ func (p *Parser) parseSingleJoin() (*ast.JoinClause, error) {
 	if p.cur.Type != TokenIdent {
 		return nil, p.errorf("expected table name after JOIN")
 	}
-	joinTable := ast.Identifier{Name: p.cur.Literal}
-	p.next()
-	if p.cur.Type == TokenAs {
-		p.next()
-		if p.cur.Type != TokenIdent {
-			return nil, p.errorf("expected alias after AS")
-		}
-		joinTable.Alias = p.cur.Literal
-		p.next()
+	joinTable, err := p.parseTableRef()
+	if err != nil {
+		return nil, err
 	}
 
 	if natural && joinType == "CROSS" {
@@ -204,6 +191,31 @@ func (p *Parser) parseSingleJoin() (*ast.JoinClause, error) {
 	p.next()
 
 	return &ast.JoinClause{Type: joinType, Table: joinTable, Left: left, Right: right}, nil
+}
+
+// parseTableRef parses a FROM/JOIN table reference: "[schema.]table [[AS] alias]".
+// The current token must be the table identifier. A dotted name is split into
+// Identifier.Schema + Name so that Alias is purely the table alias.
+func (p *Parser) parseTableRef() (ast.Identifier, error) {
+	id := ast.Identifier{Name: p.cur.Literal}
+	if parts := strings.SplitN(id.Name, ".", 2); len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+		id.Schema, id.Name = parts[0], parts[1]
+	}
+	p.next()
+	switch {
+	case p.cur.Type == TokenAs:
+		p.next()
+		if p.cur.Type != TokenIdent {
+			return ast.Identifier{}, p.errorf("expected alias after AS")
+		}
+		id.Alias = p.cur.Literal
+		p.next()
+	case p.cur.Type == TokenIdent:
+		// Bare alias: FROM ventas v
+		id.Alias = p.cur.Literal
+		p.next()
+	}
+	return id, nil
 }
 
 func (p *Parser) parseWhereClause() (*ast.WhereClause, error) {

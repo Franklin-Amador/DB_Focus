@@ -5,10 +5,15 @@
 import { render, escHtml, escAttr, showToast } from './dom.js';
 import { apiTableData, apiQuery } from './api.js';
 import { refreshSidebar } from './app.js';
+import { state } from './state.js';
 
 const LIMIT = 100;
 
-let ex = null;  // {table, offset, total, columns, pk, rows}
+let ex = null;  // {schema, table, offset, total, columns, pk, rows}
+
+// Las escrituras se califican con el esquema del explorador (capturado al
+// abrirlo), aunque el usuario cambie el esquema activo mientras tanto.
+function runWrite(sql) { return apiQuery(sql, { schema: ex.schema }); }
 
 function quoteIdent(name) {
   return /^[a-z_][a-z0-9_]*$/.test(name) ? name : '"' + name.replace(/"/g, '""') + '"';
@@ -33,7 +38,7 @@ function pkWhere(row) {
 export async function openExplorer(table) {
   const { showView } = await import('./app.js');
   showView('explorer');
-  ex = { table, offset: 0, total: 0, columns: [], pk: [], rows: [] };
+  ex = { schema: state.schema, table, offset: 0, total: 0, columns: [], pk: [], rows: [] };
   await loadExplorerPage(0);
 }
 
@@ -42,7 +47,7 @@ export async function loadExplorerPage(offset) {
   const statusEl = document.getElementById('explorer-status');
   if (statusEl) statusEl.textContent = 'Cargando…';
   try {
-    const data = await apiTableData(ex.table, offset, LIMIT);
+    const data = await apiTableData(ex.table, offset, LIMIT, ex.schema);
     if (data.error) {
       showToast(data.error, 'err');
       if (statusEl) statusEl.textContent = data.error;
@@ -72,7 +77,7 @@ export function explorerPage(delta) {
 
 function renderExplorer() {
   const title = document.getElementById('explorer-title');
-  if (title) title.textContent = ex.table;
+  if (title) title.textContent = ex.schema === 'public' ? ex.table : `${ex.schema}.${ex.table}`;
 
   const editable = ex.pk.length > 0;
   const page = Math.floor(ex.offset / LIMIT) + 1;
@@ -139,7 +144,7 @@ export function explorerEditCell(ri, ci, td) {
       return;
     }
     const sql = `UPDATE ${quoteIdent(ex.table)} SET ${quoteIdent(col.name)} = ${sqlLiteral(newVal, col.type)} WHERE ${pkWhere(ex.rows[ri])}`;
-    const res = await apiQuery(sql);
+    const res = await runWrite(sql);
     if (res.error) {
       showToast(res.error, 'err');
       renderExplorer();
@@ -190,7 +195,7 @@ export async function explorerDeleteConfirm(ri) {
   closeCellModal();
   if (!ex) return;
   const sql = `DELETE FROM ${quoteIdent(ex.table)} WHERE ${pkWhere(ex.rows[ri])}`;
-  const res = await apiQuery(sql);
+  const res = await runWrite(sql);
   if (res.error) {
     showToast(res.error, 'err');
   } else {
@@ -248,7 +253,7 @@ export async function explorerInsertConfirm() {
   if (!cols.length) { showToast('Completá al menos un campo', 'err'); return; }
 
   const sql = `INSERT INTO ${quoteIdent(ex.table)} (${cols.join(', ')}) VALUES (${vals.join(', ')})`;
-  const res = await apiQuery(sql);
+  const res = await runWrite(sql);
   if (res.error) {
     showToast(res.error, 'err');
   } else {

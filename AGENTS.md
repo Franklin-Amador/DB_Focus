@@ -55,7 +55,8 @@ clásico y se usa vía el global `window.CodeMirror`.
 | `editor.js` | CodeMirror, ejecución, validación, historial persistente, autocompletado |
 | `tabs.js` | Pestañas de consulta (`CodeMirror.Doc` + `swapDoc`) |
 | `results.js` | Resultados: filtro/orden/paginación, export CSV-JSON, modal de celda, script runner |
-| `sidebar.js` | Árbol de objetos |
+| `sidebar.js` | Árbol de objetos (sección Schemas + objetos del esquema activo) |
+| `schemas.js` | Esquema activo (`state.schema`, selector del header) y modales crear/eliminar esquema |
 | `explorer.js` | Grilla CRUD (`/api/table-data` + escrituras por `/api/query`) |
 | `diagram.js` | Diagrama ER (layout, drag, minimapa, export) |
 
@@ -303,6 +304,18 @@ Desde el refactor (Fase 2) el dispatch es **por datos, con auto-registro**: no h
    `Load*` de la recarga (un `Get*` que olvide copiar `BodyText` lo pierde al persistir).
 4. **`gob` acopla el formato en disco.** Agregar campos a un struct persistido es
    backward-compatible (decodifican a cero); renombrarlos o cambiar su tipo, no.
+5. **`Identifier.Alias` significa dos cosas.** En DDL/DML (`CREATE TABLE`, `INSERT`,
+   `DROP VIEW`, …) el parser guarda el **schema** en `Alias` (`parseQualifiedIdent`) y el
+   executor lo lee con `schemaOrPublic(stmt.Table.Alias)`. En las tablas de `SELECT`
+   (FROM/JOIN) `Alias` es el **alias de tabla** y el schema va en `Identifier.Schema`
+   (`parseTableRef`). `ast.ApplyDefaultSchema` respeta ambas convenciones; no mezclarlas
+   (usar `Alias` como schema en un SELECT rompe `FROM t AS x`, que es justo el bug que
+   existía antes).
+6. **El esquema por defecto se aplica en tres sitios y debe ser el mismo walker**
+   (`ast.ApplyDefaultSchema`): wire protocol (`applyDatabaseContext`, param `database`), GUI
+   (`apiQueryRequest.Schema` → `guiDatabase`) y catálogo (`CreateView`/`LoadView`, para que
+   una vista siga resolviendo sus tablas en su esquema tras el re-parseo de `QueryText`).
+   Los nombres de CTE nunca se califican (viven en `public` como tablas temporales).
 
 ## Work Log - Feature Integration Backlog
 
@@ -1360,3 +1373,44 @@ justo después de `groupRows` y activa la agrupación aunque no haya GROUP BY. C
 
 **Fuera de alcance / follow-ups**: `LAG/LEAD/NTILE/FIRST_VALUE`, frames explícitos `ROWS/RANGE BETWEEN`, `SELECT *, ventana`
 (limitación previa del parser con `*`), cláusula `WINDOW w AS (...)`.
+
+### Session: September 6, 2026 - Esquemas en la GUI (esquema activo + gestión) y coherencia del motor
+
+**Objetivo**: acercar FocusDB Studio a un gestor real con bases de datos/esquemas. Hallazgo
+previo: en el motor una **base de datos es un alias de esquema** (`CREATE DATABASE x` ≡
+`CreateSchema(x)` + fila en `pg_database`; un solo `Catalog`/`PebbleStorage`; procedures,
+triggers y jobs globales). Decisión: la GUI expone **esquemas** con un esquema activo, y el
+motor se hace coherente con esa equivalencia.
+
+**Motor**:
+- `ast.Identifier.Schema` (nuevo) para las tablas de SELECT; `parseTableRef` parte
+  `esquema.tabla`, acepta alias con y sin `AS` (`FROM ventas v` **fallaba** antes: el alias se
+  tomaba como schema). `executeSelectMain`/`executeJoinSelect` usan `Schema`; `joinColumn.schema`
+  + `refMatches` resuelven `esquema.tabla.col`; `fetchRows` quita el calificador de la tabla en
+  WHERE (`WHERE v.monto > 1`, antes "column v.monto not found").
+- `ast.ApplyDefaultSchema` (nuevo, `internal/ast/schema.go`) reemplaza `applyDatabaseContext`
+  del handler: recorre CTEs y **todos** los `Joins` (antes solo `Join[0]`), no califica nombres de
+  CTE. Lo aplican wire, GUI (`HandleScript` ahora recibe `currentDatabase` y antes no calificaba
+  nada) y `catalog.CreateView/LoadView` (vistas ligadas a su esquema tras reinicio).
+- `CREATE SCHEMA [IF NOT EXISTS]`; tags `CREATE SCHEMA`/`DROP SCHEMA` (antes devolvía
+  `CREATE TABLE`/`DROP TABLE`); `catalog.DropSchema` protege `public` y los esquemas de sistema
+  (antes `DROP SCHEMA pg_catalog CASCADE` destruía el catálogo); `DROP DATABASE` elimina el
+  esquema y su contenido (antes solo la fila de `pg_database` y la base "reaparecía");
+  `pg_namespace`/`\dn` listan esquemas de usuario (antes 4 filas fijas).
+- `catalog.ListSchemas()` (excluye `pg_catalog`, `information_schema`, `pg_toast`, `focus`),
+  `SchemaExists`, `IsSystemSchema`, `IsProtectedSchema` (`internal/catalog/schemas.go`).
+
+**API GUI** (`gui_api.go`): `apiQueryRequest.Schema` en `/api/query` y `/api/script`
+(`guiDatabase` lo mapea a `currentDatabase`); `GET /api/schemas`; `?schema=` en `/api/schema`,
+`/api/diagram`, `/api/table-data` (404 si no existe). `newGUIMux` extraído de `startGUIServer`
+para testear con `httptest` (`cmd/focusd/gui_api_test.go`, primer test del API).
+
+**Frontend**: `state.schema` persistido (`focusdb.schema.v1`); `api.js` envía `schema` en todo;
+`schemas.js` (selector del header, sección Schemas con `+`/`×`, modales crear/eliminar con
+CASCADE); `app.onSchemaChanged` recarga árbol/diagrama y cierra el explorador; el explorador
+captura su esquema al abrirse (`ex.schema`) para que las escrituras no cambien de esquema a mitad;
+clave del diagrama versionada a `focusdb.diagram.v2.<schema>.<sig>`.
+
+**Tests**: `internal/ast/schema_test.go`, `internal/catalog/schemas_test.go`, parser
+(`TestParseCreateSchemaIfNotExists`, `TestParseTableRefSchemaAndAlias`), `cmd/focusd/gui_api_test.go`,
+`cmd/test-schemas` (incluye recarga desde Pebble). Regresión de integración completa ✅.

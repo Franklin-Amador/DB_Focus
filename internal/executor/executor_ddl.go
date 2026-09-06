@@ -401,9 +401,19 @@ func (e *Executor) executeDropDatabase(ctx context.Context, stmt *ast.DropDataba
 		return nil, fmt.Errorf("database %s does not exist", dbName)
 	}
 
+	// A database is a schema namespace in FocusDB: dropping it removes the
+	// namespace and every object inside (like DROP DATABASE would). The
+	// default database maps to "public", which can never be dropped.
+	if catalog.IsProtectedSchema(dbName) || dbName == "postgres" {
+		return nil, fmt.Errorf("cannot drop database %s: it is the default database", dbName)
+	}
+	if e.catalog.SchemaExists(dbName) {
+		if err := e.dropSchemaEverywhere(dbName); err != nil {
+			return nil, fmt.Errorf("failed to drop database %s: %w", dbName, err)
+		}
+	}
+
 	// Delete the database entry
-	// Note: This is a simplistic delete that only removes from pg_database catalog
-	// A real implementation would handle cascading deletes, active connections, etc.
 	if err := dbTable.DeleteWhere("datname", dbName); err != nil {
 		return nil, fmt.Errorf("failed to delete database: %w", err)
 	}
@@ -463,6 +473,9 @@ func (e *Executor) executeCreateSchema(ctx context.Context, stmt *ast.CreateSche
 		return nil, err
 	}
 
+	if stmt.IfNotExists && e.catalog.SchemaExists(schemaName) {
+		return &Result{Tag: constants.ResultCreateSchema}, nil
+	}
 	if err := e.catalog.CreateSchema(schemaName); err != nil {
 		return nil, fmt.Errorf("failed to create schema: %w", err)
 	}
@@ -479,7 +492,7 @@ func (e *Executor) executeCreateSchema(ctx context.Context, stmt *ast.CreateSche
 		}
 	}
 
-	return &Result{Tag: constants.ResultCreateTable}, nil
+	return &Result{Tag: constants.ResultCreateSchema}, nil
 }
 
 // executeDropTable handles DROP TABLE statements with FK dependency checks.
@@ -585,10 +598,14 @@ func (e *Executor) executeDropSchema(ctx context.Context, stmt *ast.DropSchema) 
 		behavior = "RESTRICT"
 	}
 
+	if catalog.IsProtectedSchema(schemaName) {
+		return nil, fmt.Errorf("cannot drop schema %s: it is a system schema", schemaName)
+	}
+
 	isEmpty, err := e.catalog.SchemaIsEmpty(schemaName)
 	if err != nil {
 		if stmt.IfExists {
-			return &Result{Tag: constants.ResultDropTable}, nil
+			return &Result{Tag: constants.ResultDropSchema}, nil
 		}
 		return nil, fmt.Errorf("failed to drop schema: %w", err)
 	}
@@ -597,21 +614,28 @@ func (e *Executor) executeDropSchema(ctx context.Context, stmt *ast.DropSchema) 
 		return nil, fmt.Errorf("cannot drop schema %s: schema is not empty (use CASCADE)", schemaName)
 	}
 
-	if err := e.catalog.DropSchema(schemaName); err != nil {
+	if err := e.dropSchemaEverywhere(schemaName); err != nil {
 		if stmt.IfExists && strings.Contains(err.Error(), "does not exist") {
-			return &Result{Tag: constants.ResultDropTable}, nil
+			return &Result{Tag: constants.ResultDropSchema}, nil
 		}
 		return nil, fmt.Errorf("failed to drop schema: %w", err)
 	}
 
-	// Clean up persistent storage
+	return &Result{Tag: constants.ResultDropSchema}, nil
+}
+
+// dropSchemaEverywhere removes a schema (and everything in it) from the catalog
+// and from persistent storage.
+func (e *Executor) dropSchemaEverywhere(schemaName string) error {
+	if err := e.catalog.DropSchema(schemaName); err != nil {
+		return err
+	}
 	if e.storage != nil {
 		if err := e.storage.DeleteSchema(schemaName); err != nil {
 			fmt.Printf("warning: failed to delete persisted schema %s: %v\n", schemaName, err)
 		}
 	}
-
-	return &Result{Tag: constants.ResultDropTable}, nil
+	return nil
 }
 
 // executeAlterTable handles ALTER TABLE statements

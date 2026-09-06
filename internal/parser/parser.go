@@ -733,12 +733,25 @@ func (p *Parser) parseCreateIndex() (ast.Statement, error) {
 // CREATE SCHEMA schema
 func (p *Parser) parseCreateSchema() (ast.Statement, error) {
 	p.next()
+	ifNotExists := false
+	if p.cur.Type == TokenIf {
+		p.next()
+		if p.cur.Type != TokenNot {
+			return nil, p.errorf("expected NOT after IF")
+		}
+		p.next()
+		if p.cur.Type != TokenExists {
+			return nil, p.errorf("expected EXISTS after IF NOT")
+		}
+		p.next()
+		ifNotExists = true
+	}
 	if p.cur.Type != TokenIdent {
 		return nil, p.errorf("expected schema name")
 	}
 	schema := p.cur.Literal
 	p.next()
-	return &ast.CreateSchema{Name: schema}, nil
+	return &ast.CreateSchema{Name: schema, IfNotExists: ifNotExists}, nil
 }
 
 func (p *Parser) parseCreateTable() (ast.Statement, error) {

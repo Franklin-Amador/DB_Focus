@@ -77,7 +77,7 @@ func (e *Executor) executeSelectMain(ctx context.Context, stmt *ast.Select) (*Re
 		return e.executeJoinSelect(ctx, stmt)
 	}
 
-	schema := stmt.Table.Alias
+	schema := stmt.Table.Schema
 	table, err := e.catalog.GetTable(stmt.Table.Name, schema)
 	if err != nil {
 		view, vErr := e.catalog.GetView(stmt.Table.Name, schema)
@@ -106,14 +106,14 @@ func (e *Executor) executeSelectFromTable(ctx context.Context, stmt *ast.Select,
 	}
 
 	// FROM + WHERE (index fast-path for single equality predicates).
-	rows, err := e.fetchRows(table, stmt.Where)
+	rows, err := e.fetchRows(table, stmt)
 	if err != nil {
 		return nil, err
 	}
 
 	// Every later stage (grouping, windows, QUALIFY, ORDER BY, projection)
 	// runs on the shared pipeline.
-	rs := &rowset{cols: joinColsFor(stmt.Table.Name, table.Columns), rows: rows}
+	rs := &rowset{cols: joinColsFor(refName(stmt.Table), stmt.Table.Schema, table.Columns), rows: rows}
 	return e.finishSelect(ctx, stmt, rs)
 }
 
@@ -143,6 +143,7 @@ func (e *Executor) executeSelectNoTable(stmt *ast.Select) (*Result, error) {
 // from one (e.g. "SUM(monto)"), and whether SELECT * should hide it.
 type joinColumn struct {
 	ref    string
+	schema string // schema of the owning table when explicitly qualified
 	name   string
 	typ    string
 	expr   string
@@ -165,21 +166,21 @@ func (e *Executor) executeJoinSelect(ctx context.Context, stmt *ast.Select) (*Re
 	}
 
 	// Base (left-most) table.
-	baseTable, err := e.catalog.GetTable(stmt.Table.Name)
+	baseTable, err := e.catalog.GetTable(stmt.Table.Name, stmt.Table.Schema)
 	if err != nil {
 		return nil, fmt.Errorf("table %s not found: %w", stmt.Table.Name, err)
 	}
 	accRows := baseTable.SelectAll()
-	accCols := joinColsFor(refName(stmt.Table), baseTable.Columns)
+	accCols := joinColsFor(refName(stmt.Table), stmt.Table.Schema, baseTable.Columns)
 
 	// Fold each JOIN into the accumulated result.
 	for _, j := range joins {
-		rightTable, err := e.catalog.GetTable(j.Table.Name)
+		rightTable, err := e.catalog.GetTable(j.Table.Name, j.Table.Schema)
 		if err != nil {
 			return nil, fmt.Errorf("joined table %s not found: %w", j.Table.Name, err)
 		}
 		accRows, accCols, err = e.foldJoin(j, accRows, accCols,
-			rightTable.SelectAll(), joinColsFor(refName(j.Table), rightTable.Columns))
+			rightTable.SelectAll(), joinColsFor(refName(j.Table), j.Table.Schema, rightTable.Columns))
 		if err != nil {
 			return nil, err
 		}
@@ -210,6 +211,23 @@ func (e *Executor) executeJoinSelect(ctx context.Context, stmt *ast.Select) (*Re
 	return e.finishSelect(ctx, stmt, &rowset{cols: accCols, rows: accRows, qualified: true})
 }
 
+// stripTableQualifier removes a "qualifier." prefix from a column reference
+// when the qualifier designates the given table (its alias, its name or
+// "schema.name"). Any other qualifier is preserved.
+func stripTableQualifier(ref string, table ast.Identifier) string {
+	qualifier, col := queryutil.SplitQualified(ref)
+	if qualifier == "" {
+		return ref
+	}
+	switch {
+	case strings.EqualFold(qualifier, refName(table)),
+		strings.EqualFold(qualifier, table.Name),
+		table.Schema != "" && strings.EqualFold(qualifier, table.Schema+"."+table.Name):
+		return col
+	}
+	return ref
+}
+
 // refName returns the reference used to qualify a table's columns (alias if set).
 func refName(id ast.Identifier) string {
 	if id.Alias != "" {
@@ -218,12 +236,21 @@ func refName(id ast.Identifier) string {
 	return id.Name
 }
 
-func joinColsFor(ref string, cols []catalog.Column) []joinColumn {
+func joinColsFor(ref, schema string, cols []catalog.Column) []joinColumn {
 	out := make([]joinColumn, len(cols))
 	for i, c := range cols {
-		out[i] = joinColumn{ref: ref, name: c.Name, typ: c.Type}
+		out[i] = joinColumn{ref: ref, schema: schema, name: c.Name, typ: c.Type}
 	}
 	return out
+}
+
+// refMatches reports whether a column's table reference matches qualifier:
+// the alias/name itself, or "schema.name" for an explicitly qualified table.
+func refMatches(c joinColumn, qualifier string) bool {
+	if strings.EqualFold(c.ref, qualifier) {
+		return true
+	}
+	return c.schema != "" && strings.EqualFold(c.schema+"."+c.ref, qualifier)
 }
 
 // resolveJoinColumn resolves a (possibly qualified) column reference to its index
@@ -234,7 +261,7 @@ func resolveJoinColumn(cols []joinColumn, ref string) (int, error) {
 	if qualifier != "" {
 		refSeen := false
 		for i, c := range cols {
-			if strings.EqualFold(c.ref, qualifier) {
+			if refMatches(c, qualifier) {
 				refSeen = true
 				if strings.EqualFold(c.name, colName) {
 					return i, nil
@@ -267,7 +294,7 @@ func resolveJoinColumn(cols []joinColumn, ref string) (int, error) {
 func firstJoinColumnMatch(cols []joinColumn, ref string) int {
 	qualifier, colName := queryutil.SplitQualified(ref)
 	for i, c := range cols {
-		if qualifier != "" && !strings.EqualFold(c.ref, qualifier) {
+		if qualifier != "" && !refMatches(c, qualifier) {
 			continue
 		}
 		if strings.EqualFold(c.name, colName) {
@@ -475,17 +502,22 @@ func (e *Executor) createCTETable(name string, result *Result) error {
 	return e.catalog.CreateTable(name, columns, nil)
 }
 
-func (e *Executor) fetchRows(table *catalog.Table, where *ast.WhereClause) ([][]interface{}, error) {
+// fetchRows returns the rows of a single-table SELECT that satisfy its WHERE
+// clause. Column references may be qualified with the table's alias, name or
+// "schema.name" (WHERE v.monto > 1); other qualifiers are left as-is so they
+// fail with "column x.y not found".
+func (e *Executor) fetchRows(table *catalog.Table, stmt *ast.Select) ([][]interface{}, error) {
+	where := stmt.Where
 	if where == nil {
 		return table.SelectAll(), nil
 	}
 	// Fast path: a single equality predicate can use an index when present.
 	if where.IsLeaf() && (where.Operator == "" || where.Operator == "=") {
-		return table.SelectWhere(where.Column.Name, where.Value.Value)
+		return table.SelectWhere(stripTableQualifier(where.Column.Name, stmt.Table), where.Value.Value)
 	}
 	// Otherwise scan the table and evaluate the predicate tree per row.
 	resolve := func(name string) (int, bool) {
-		i := findColumnIndex(table.Columns, name)
+		i := findColumnIndex(table.Columns, stripTableQualifier(name, stmt.Table))
 		return i, i != -1
 	}
 	all := table.SelectAll()

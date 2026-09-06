@@ -31,6 +31,9 @@ func (c *Catalog) CreateView(name string, columns []Column, query *ast.Select, s
 		return fmt.Errorf("view %s.%s already exists", schema, viewName)
 	}
 
+	// Tables referenced without a schema resolve inside the view's own schema
+	// (the view's search_path), also after re-parsing the stored SQL text.
+	ast.ApplyDefaultSchemaToSelect(query, schema)
 	c.views[schema][viewName] = &View{Name: viewName, Columns: columns, Query: query}
 	return nil
 }
@@ -105,6 +108,7 @@ func (c *Catalog) LoadView(name string, columns []Column, query *ast.Select, sch
 	if _, exists := c.views[schema][viewName]; exists {
 		return nil
 	}
+	ast.ApplyDefaultSchemaToSelect(query, schema)
 	c.views[schema][viewName] = &View{Name: viewName, Columns: append([]Column(nil), columns...), Query: query}
 	return nil
 }

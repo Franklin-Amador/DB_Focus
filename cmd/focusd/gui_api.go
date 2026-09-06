@@ -23,6 +23,17 @@ import (
 type apiQueryRequest struct {
 	SQL     string `json:"sql"`
 	MaxRows int    `json:"maxRows,omitempty"`
+	// Schema is the GUI's active schema: unqualified object names in the SQL
+	// resolve inside it (like a session search_path). Empty means "public".
+	Schema string `json:"schema,omitempty"`
+}
+
+// apiSchemaInfo describes one user-visible schema for the sidebar/selector.
+type apiSchemaInfo struct {
+	Name      string `json:"name"`
+	Tables    int    `json:"tables"`
+	Views     int    `json:"views"`
+	IsDefault bool   `json:"isDefault"`
 }
 
 type apiQueryResponse struct {
@@ -244,7 +255,7 @@ func handleAPIQuery(h executeHandler, timeout time.Duration) http.HandlerFunc {
 		defer cancel()
 
 		start := time.Now()
-		result, err := h.HandleWithDatabaseCtx(ctx, req.SQL, "postgres")
+		result, err := h.HandleWithDatabaseCtx(ctx, req.SQL, guiDatabase(req.Schema))
 		elapsed := time.Since(start).Milliseconds()
 
 		if err != nil {
@@ -283,7 +294,7 @@ func handleAPIScript(h executeHandler, timeout time.Duration) http.HandlerFunc {
 		ctx, cancel := queryContext(r, timeout)
 		defer cancel()
 
-		res := h.HandleScript(ctx, req.SQL, req.MaxRows)
+		res := h.HandleScript(ctx, req.SQL, req.MaxRows, guiDatabase(req.Schema))
 
 		resp := apiScriptResponse{
 			Results:     make([]apiScriptStatement, 0, len(res.Results)),
@@ -308,9 +319,25 @@ func handleAPIScript(h executeHandler, timeout time.Duration) http.HandlerFunc {
 	}
 }
 
+// handleAPISchemas lists the user-visible schemas with object counts.
+func handleAPISchemas(cat *catalog.Catalog) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		infos := cat.ListSchemas()
+		out := make([]apiSchemaInfo, 0, len(infos))
+		for _, s := range infos {
+			out = append(out, apiSchemaInfo{Name: s.Name, Tables: s.Tables, Views: s.Views, IsDefault: s.Name == "public"})
+		}
+		writeJSON(w, out)
+	}
+}
+
 func handleAPISchema(cat *catalog.Catalog) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		metas := collectTableMeta(cat, "public")
+		schema, ok := requestSchema(w, r, cat)
+		if !ok {
+			return
+		}
+		metas := collectTableMeta(cat, schema)
 
 		tables := make([]apiTableInfo, 0, len(metas)+4)
 		for i := range metas {
@@ -326,7 +353,7 @@ func handleAPISchema(cat *catalog.Catalog) http.HandlerFunc {
 		}
 
 		// Vistas: columnas propias + definición SQL original.
-		views := cat.GetAllViewsInSchema("public")
+		views := cat.GetAllViewsInSchema(schema)
 		viewNames := make([]string, 0, len(views))
 		for name := range views {
 			viewNames = append(viewNames, name)
@@ -339,7 +366,7 @@ func handleAPISchema(cat *catalog.Catalog) http.HandlerFunc {
 				cols = append(cols, apiColumnInfo{Name: c.Name, Type: c.Type, Ordinal: i + 1})
 			}
 			tables = append(tables, apiTableInfo{
-				Schema:         "public",
+				Schema:         schema,
 				Name:           name,
 				Kind:           "VIEW",
 				Columns:        cols,
@@ -433,7 +460,11 @@ func jobIntervalSeconds(interval int, unit string) int {
 
 func handleAPIDiagram(cat *catalog.Catalog) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		metas := collectTableMeta(cat, "public")
+		schema, ok := requestSchema(w, r, cat)
+		if !ok {
+			return
+		}
+		metas := collectTableMeta(cat, schema)
 
 		dto := diagramDTO{
 			Tables: make([]diagramTableDTO, 0, len(metas)),
@@ -524,15 +555,24 @@ func handleAPITableData(cat *catalog.Catalog) http.HandlerFunc {
 			writeJSON(w, apiTableDataResponse{Error: "missing table parameter"})
 			return
 		}
+		schema := r.URL.Query().Get("schema")
+		if schema == "" {
+			schema = "public"
+		}
+		if !cat.SchemaExists(schema) {
+			w.WriteHeader(http.StatusNotFound)
+			writeJSON(w, apiTableDataResponse{Error: "schema not found: " + schema})
+			return
+		}
 
 		// Las vistas no tienen filas propias: el frontend usa /api/query.
-		if views := cat.GetAllViewsInSchema("public"); views[name] != nil {
+		if views := cat.GetAllViewsInSchema(schema); views[name] != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			writeJSON(w, apiTableDataResponse{Error: "views are read-only; query them via /api/query"})
 			return
 		}
 
-		t, err := cat.GetTable(name, "public")
+		t, err := cat.GetTable(name, schema)
 		if err != nil {
 			w.WriteHeader(http.StatusNotFound)
 			writeJSON(w, apiTableDataResponse{Error: "table not found: " + name})
@@ -563,7 +603,7 @@ func handleAPITableData(cat *catalog.Catalog) http.HandlerFunc {
 		page := sanitizeRows(rows[offset:end])
 
 		// Metadata de columnas + PK para edición.
-		metas := collectTableMeta(cat, "public")
+		metas := collectTableMeta(cat, schema)
 		var cols []apiColumnInfo
 		pk := []string{}
 		for i := range metas {
@@ -587,6 +627,31 @@ func handleAPITableData(cat *catalog.Catalog) http.HandlerFunc {
 }
 
 // ─── Utilidades ───────────────────────────────────────────────────────────────
+
+// guiDatabase maps the GUI's active schema to the "current database" the
+// execution path expects (empty/public → the default "postgres" namespace).
+func guiDatabase(schema string) string {
+	if schema == "" || schema == "public" {
+		return "postgres"
+	}
+	return schema
+}
+
+// requestSchema reads the optional ?schema= parameter (default "public") and
+// answers 404 when the schema does not exist. ok=false means the response was
+// already written.
+func requestSchema(w http.ResponseWriter, r *http.Request, cat *catalog.Catalog) (string, bool) {
+	schema := r.URL.Query().Get("schema")
+	if schema == "" {
+		schema = "public"
+	}
+	if !cat.SchemaExists(schema) {
+		w.WriteHeader(http.StatusNotFound)
+		writeJSON(w, map[string]string{"error": "schema not found: " + schema})
+		return "", false
+	}
+	return schema, true
+}
 
 // queryContext deriva el contexto de la request con timeout opcional.
 func queryContext(r *http.Request, timeout time.Duration) (context.Context, context.CancelFunc) {

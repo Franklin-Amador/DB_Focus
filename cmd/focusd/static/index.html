@@ -22,6 +22,10 @@
   <span class="logo"><span class="leaf">🌿</span> focus<span class="logo-db">db</span></span>
   <span class="logo-port">studio · :9011</span>
   <span class="conn-badge" id="conn-badge">● conectado</span>
+  <label class="schema-pick" title="Esquema activo: las tablas sin calificar se resuelven aquí (como el search_path)">
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="8" cy="4" rx="5.5" ry="2.2"/><path d="M2.5 4v8c0 1.2 2.5 2.2 5.5 2.2s5.5-1 5.5-2.2V4"/><path d="M2.5 8c0 1.2 2.5 2.2 5.5 2.2s5.5-1 5.5-2.2"/></svg>
+    <select id="schema-select" onchange="setActiveSchema(this.value)"><option value="public">public</option></select>
+  </label>
   <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
     <button class="nav-btn active" id="nav-query"   onclick="showView('query')"><span class="ti"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4l3.5 4L3 12"/><line x1="8.5" y1="12" x2="13" y2="12"/></svg></span> <span class="btn-label">Consulta</span></button>
     <button class="nav-btn"        id="nav-diagram" onclick="showView('diagram')"><span class="ti"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="5" height="4" rx="1"/><rect x="9" y="9.5" width="5" height="4" rx="1"/><path d="M4.5 6.5v3.5a1 1 0 0 0 1 1H9"/></svg></span> <span class="btn-label">Diagrama</span></button>

@@ -7,6 +7,11 @@ type Statement interface {
 type Identifier struct {
 	Name  string
 	Alias string
+	// Schema qualifies a SELECT table reference (FROM/JOIN): set by the parser
+	// for "schema.table" and by ApplyDefaultSchema for the session's default
+	// schema. Alias is then purely the table alias. DDL/DML object references
+	// keep the older convention of carrying the schema in Alias.
+	Schema string
 	// Window is set when the identifier denotes a window-function call
 	// (e.g. ROW_NUMBER() OVER (...)). Name is then empty and Alias carries the
 	// output column name.
@@ -118,7 +123,8 @@ type CreateDatabase struct {
 func (CreateDatabase) stmtNode() {}
 
 type CreateSchema struct {
-	Name string
+	Name        string
+	IfNotExists bool
 }
 
 func (CreateSchema) stmtNode() {}

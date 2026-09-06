@@ -673,3 +673,41 @@ func TestParseWindowErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestParseCreateSchemaIfNotExists(t *testing.T) {
+	p := NewParser("CREATE SCHEMA IF NOT EXISTS tienda")
+	stmt, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	cs, ok := stmt.(*ast.CreateSchema)
+	if !ok || cs.Name != "tienda" || !cs.IfNotExists {
+		t.Fatalf("unexpected statement %+v", stmt)
+	}
+	p = NewParser("CREATE SCHEMA tienda")
+	stmt, _ = p.ParseStatement()
+	if cs := stmt.(*ast.CreateSchema); cs.IfNotExists {
+		t.Errorf("IfNotExists must default to false")
+	}
+}
+
+func TestParseTableRefSchemaAndAlias(t *testing.T) {
+	sel := parseSelectT(t, "SELECT p.nombre, v.monto FROM tienda.productos AS p INNER JOIN public.ventas v ON p.id = v.id LEFT JOIN cats ON cats.id = v.id")
+	if sel.Table.Schema != "tienda" || sel.Table.Name != "productos" || sel.Table.Alias != "p" {
+		t.Errorf("unexpected FROM table %+v", sel.Table)
+	}
+	if len(sel.Joins) != 2 {
+		t.Fatalf("expected 2 joins, got %d", len(sel.Joins))
+	}
+	if j := sel.Joins[0].Table; j.Schema != "public" || j.Name != "ventas" || j.Alias != "v" {
+		t.Errorf("unexpected first join table %+v", j)
+	}
+	if j := sel.Joins[1].Table; j.Schema != "" || j.Name != "cats" || j.Alias != "" {
+		t.Errorf("unexpected second join table %+v", j)
+	}
+	// Bare alias on a simple FROM.
+	sel = parseSelectT(t, "SELECT v.monto FROM ventas v WHERE v.monto > 1")
+	if sel.Table.Name != "ventas" || sel.Table.Alias != "v" || sel.Table.Schema != "" {
+		t.Errorf("unexpected bare alias parse %+v", sel.Table)
+	}
+}

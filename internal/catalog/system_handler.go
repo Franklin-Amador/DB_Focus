@@ -185,16 +185,28 @@ func (c *Catalog) getDtRelations(currentDatabase string, includeTables bool, inc
 	}
 }
 
+// getPgNamespace lists the system schemas plus every user schema, so \dn and
+// pg_namespace reflect CREATE SCHEMA.
 func (c *Catalog) getPgNamespace() *SystemResult {
+	rows := [][]interface{}{
+		{"14704", "14704", "information_schema", "10", "{postgres=UC/postgres,=U/postgres}", nil},
+		{"11", "11", "pg_catalog", "10", "{postgres=UC/postgres,=U/postgres}", "system catalog schema"},
+		{"99", "99", "pg_toast", "10", nil, "reserved schema for TOAST tables"},
+		{"2200", "2200", "public", "6171", "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}", "standard public schema"},
+	}
+	oid := 16384
+	for _, s := range c.ListSchemas() {
+		if s.Name == "public" {
+			continue
+		}
+		id := fmt.Sprintf("%d", oid)
+		rows = append(rows, []interface{}{id, id, s.Name, "10", nil, nil})
+		oid++
+	}
 	return &SystemResult{
 		Columns: []string{"oid", "oid_1", "nspname", "nspowner", "nspacl", "description"},
-		Rows: [][]interface{}{
-			{"14704", "14704", "information_schema", "10", "{postgres=UC/postgres,=U/postgres}", nil},
-			{"11", "11", "pg_catalog", "10", "{postgres=UC/postgres,=U/postgres}", "system catalog schema"},
-			{"99", "99", "pg_toast", "10", nil, "reserved schema for TOAST tables"},
-			{"2200", "2200", "public", "6171", "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}", "standard public schema"},
-		},
-		Tag: "SELECT 4",
+		Rows:    rows,
+		Tag:     fmt.Sprintf("SELECT %d", len(rows)),
 	}
 }
 
