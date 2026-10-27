@@ -39,95 +39,120 @@ func (e *Executor) executeInsert(ctx context.Context, stmt *ast.Insert) (*Result
 		return nil, err
 	}
 
-	// Execute BEFORE INSERT triggers
-	if e.triggersEnabled {
-		qual := qualifiedName(schema, stmt.Table.Name)
-		if err := e.executeTriggers(ctx, qual, constants.TriggerBefore, constants.TriggerInsert, nil, nil); err != nil {
-			return nil, fmt.Errorf("BEFORE INSERT trigger failed: %w", err)
+	// Collect the VALUES tuples. Rows is the multi-row form; fall back to the
+	// single Values row for gob-decoded statements created before Rows existed.
+	rows := stmt.Rows
+	if len(rows) == 0 {
+		rows = [][]ast.Literal{stmt.Values}
+	}
+
+	qual := qualifiedName(schema, stmt.Table.Name)
+	count := 0
+	var insertErr error
+
+	for _, rowLits := range rows {
+		// BEFORE INSERT triggers (per row, like PostgreSQL FOR EACH ROW).
+		if e.triggersEnabled {
+			if err := e.executeTriggers(ctx, qual, constants.TriggerBefore, constants.TriggerInsert, nil, nil); err != nil {
+				insertErr = fmt.Errorf("BEFORE INSERT trigger failed: %w", err)
+				break
+			}
+		}
+
+		values, err := e.buildInsertValues(table, stmt.Columns, rowLits)
+		if err != nil {
+			insertErr = err
+			break
+		}
+
+		if err := table.InsertRow(values, e.catalog); err != nil {
+			insertErr = fmt.Errorf("failed to insert row: %w", err)
+			break
+		}
+		count++
+
+		// AFTER INSERT triggers (per row).
+		if e.triggersEnabled {
+			if err := e.executeTriggers(ctx, qual, constants.TriggerAfter, constants.TriggerInsert, nil, values); err != nil {
+				insertErr = fmt.Errorf("AFTER INSERT trigger failed: %w", err)
+				break
+			}
 		}
 	}
 
-	// Build final values array
+	// Persist whatever was inserted (keeps memory and disk consistent even if a
+	// later row in the batch failed; there are no transactions).
+	if count > 0 {
+		e.persistTableWarn(table, schema)
+	}
+	if insertErr != nil {
+		return nil, insertErr
+	}
+
+	if count == 1 {
+		return &Result{Tag: constants.ResultInsert}, nil
+	}
+	return &Result{Tag: fmt.Sprintf("INSERT 0 %d", count)}, nil
+}
+
+// buildInsertValues maps one VALUES tuple to a full row aligned with the
+// table's columns, auto-generating IDENTITY columns. It supports an explicit
+// column list, a full positional tuple, or a positional tuple covering only
+// the non-IDENTITY columns.
+func (e *Executor) buildInsertValues(table *catalog.Table, columns []ast.Identifier, rowLits []ast.Literal) ([]interface{}, error) {
 	values := make([]interface{}, len(table.Columns))
 
-	if len(stmt.Columns) > 0 {
-		// Columns specified - map values to columns
-		// Initialize all values to nil
-		for i := range values {
-			values[i] = nil
+	if len(columns) > 0 {
+		if len(rowLits) != len(columns) {
+			return nil, fmt.Errorf("number of values (%d) does not match number of columns (%d)", len(rowLits), len(columns))
 		}
-
-		// Map specified values to their columns
-		for i, col := range stmt.Columns {
-			colIdx := -1
-			for j, tableCol := range table.Columns {
-				if tableCol.Name == col.Name {
-					colIdx = j
-					break
-				}
-			}
+		// Map specified values to their columns (others stay nil).
+		for i, col := range columns {
+			colIdx := findColumnIndex(table.Columns, col.Name)
 			if colIdx == -1 {
-				return nil, fmt.Errorf("column %s not found in table %s", col.Name, stmt.Table.Name)
+				return nil, fmt.Errorf("column %s not found in table %s", col.Name, table.Name)
 			}
-			values[colIdx] = stmt.Values[i].Value
+			values[colIdx] = rowLits[i].Value
 		}
-
-		// Fill in IDENTITY columns
+		// Fill in IDENTITY columns that were not provided.
 		for i, col := range table.Columns {
 			if col.Identity && values[i] == nil {
 				table.Columns[i].IdentityValue++
 				values[i] = table.Columns[i].IdentityValue
 			}
 		}
-	} else {
-		// No columns specified.
-		// Supported modes:
-		// 1) Full positional VALUES matching all columns.
-		// 2) VALUES matching only non-IDENTITY columns (IDENTITY auto-generated).
-		nonIdentityCount := 0
-		for _, col := range table.Columns {
-			if !col.Identity {
-				nonIdentityCount++
-			}
-		}
+		return values, nil
+	}
 
-		if len(stmt.Values) == len(table.Columns) {
-			for i, lit := range stmt.Values {
-				values[i] = lit.Value
-			}
-		} else if len(stmt.Values) == nonIdentityCount {
-			valueIdx := 0
-			for i, col := range table.Columns {
-				if col.Identity {
-					table.Columns[i].IdentityValue++
-					values[i] = table.Columns[i].IdentityValue
-					continue
-				}
-				values[i] = stmt.Values[valueIdx].Value
-				valueIdx++
-			}
-		} else {
-			return nil, fmt.Errorf("number of values does not match table schema")
+	// No column list. Either a full positional tuple, or one covering only the
+	// non-IDENTITY columns (IDENTITY auto-generated).
+	nonIdentityCount := 0
+	for _, col := range table.Columns {
+		if !col.Identity {
+			nonIdentityCount++
 		}
 	}
 
-	// Insert row
-	if err := table.InsertRow(values, e.catalog); err != nil {
-		return nil, fmt.Errorf("failed to insert row: %w", err)
-	}
-
-	// Persist to storage
-	e.persistTableWarn(table, schema)
-
-	// Execute AFTER INSERT triggers
-	if e.triggersEnabled {
-		qual := qualifiedName(schema, stmt.Table.Name)
-		if err := e.executeTriggers(ctx, qual, constants.TriggerAfter, constants.TriggerInsert, nil, values); err != nil {
-			return nil, fmt.Errorf("AFTER INSERT trigger failed: %w", err)
+	switch len(rowLits) {
+	case len(table.Columns):
+		for i, lit := range rowLits {
+			values[i] = lit.Value
 		}
+	case nonIdentityCount:
+		valueIdx := 0
+		for i, col := range table.Columns {
+			if col.Identity {
+				table.Columns[i].IdentityValue++
+				values[i] = table.Columns[i].IdentityValue
+				continue
+			}
+			values[i] = rowLits[valueIdx].Value
+			valueIdx++
+		}
+	default:
+		return nil, fmt.Errorf("number of values does not match table schema")
 	}
-
-	return &Result{Tag: constants.ResultInsert}, nil
+	return values, nil
 }
 
 // executeUpdate handles UPDATE statements

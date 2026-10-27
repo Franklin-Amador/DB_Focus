@@ -154,7 +154,13 @@ func (DropDatabase) stmtNode() {}
 type Insert struct {
 	Table   Identifier
 	Columns []Identifier
-	Values  []Literal
+	// Values holds the first row's literals. Kept for backward compatibility
+	// (procedure parameter substitution, validation, gob-decoded old data).
+	Values []Literal
+	// Rows holds every VALUES tuple for multi-row inserts
+	// (INSERT ... VALUES (...), (...), ...). The parser always fills it and
+	// sets Values = Rows[0]; executor iterates Rows (falling back to [Values]).
+	Rows [][]Literal
 }
 
 func (Insert) stmtNode() {}

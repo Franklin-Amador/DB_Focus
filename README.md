@@ -103,7 +103,8 @@ postgresql://postgres:4444@localhost:4444/postgres
   - `QUALIFY`: filtra **después** de calcular las ventanas. El predicado tiene la misma forma que `WHERE` y el lado izquierdo puede ser una columna, un alias del `SELECT`, un agregado o una ventana inline: `QUALIFY ROW_NUMBER() OVER (PARTITION BY categoria ORDER BY monto DESC) = 1`.
   - Funciona sobre tablas, JOINs (columnas calificadas), CTEs, vistas y consultas con `GROUP BY` — en ese caso la ventana opera sobre las filas ya agrupadas y puede referenciar agregados: `RANK() OVER (ORDER BY SUM(monto) DESC)`.
 - `WITH` cte_name AS (SELECT ...) [, cte_name2 AS (SELECT ...)] SELECT ...
-- `CREATE TABLE` tabla (columna tipo [IDENTITY] [PRIMARY KEY], ...)
+- `CREATE TABLE` tabla (columna tipo [IDENTITY] [PRIMARY KEY] [UNIQUE] [NOT NULL] [REFERENCES tabla(columna)], ..., [FOREIGN KEY (columna) REFERENCES tabla(columna)])
+  - La clave foránea se puede declarar **inline en la columna** (`padre_id INT REFERENCES padre(id)`) o a nivel de tabla (`FOREIGN KEY (padre_id) REFERENCES padre(id)`), ambas en una sola línea.
 - `CREATE VIEW` vista AS SELECT ...
 - `CREATE VIEW IF NOT EXISTS` vista AS SELECT ...
 - `CREATE VIEW` vista (columna1, columna2, ...) AS SELECT ...
@@ -130,7 +131,7 @@ postgresql://postgres:4444@localhost:4444/postgres
 - `ALTER TABLE` tabla DROP COLUMN columna
 - `ALTER TABLE` tabla ALTER COLUMN columna TYPE nuevo_tipo
 - `ALTER TABLE` tabla RENAME COLUMN nombre_viejo TO nombre_nuevo
-- `INSERT INTO` tabla [(columna, ...)] VALUES (literal, ...)
+- `INSERT INTO` tabla [(columna, ...)] VALUES (literal, ...) [, (literal, ...), ...] — admite **múltiples filas** en un solo statement (estilo PostgreSQL)
 - `UPDATE` tabla SET columna = valor [WHERE columna = literal]
 - `DELETE FROM` tabla [WHERE columna = literal]
 
@@ -173,7 +174,10 @@ postgresql://postgres:4444@localhost:4444/postgres
 - `CREATE INDEX` permite acelerar búsquedas por igualdad (`WHERE columna = valor`) en tablas con alto volumen de filas.
 - `DROP INDEX` elimina un índice definido en una tabla y persiste el cambio en disco.
 - Soporta claves foráneas autorreferenciadas (self FK), por ejemplo `FOREIGN KEY (parent_id) REFERENCES categorias(id)`.
-- Las claves foráneas funcionan correctamente cuando referencian una columna `IDENTITY`: la comparación de valores es tolerante al tipo, así que un valor literal (`1`) coincide con una clave IDENTITY autogenerada.
+- Las claves foráneas se pueden declarar **inline a nivel de columna** (`padre_id INT REFERENCES padre(id)`) además de a nivel de tabla.
+- Las claves foráneas funcionan correctamente cuando referencian una columna `IDENTITY`: la comparación de valores es tolerante al tipo (tanto al **insertar** como al **borrar/actualizar**), así que un valor literal (`1`) coincide con una clave IDENTITY autogenerada.
+- `DELETE` (y `DROP`) sobre una fila referenciada por una FK se **bloquea** (no deja huérfanos), incluso cuando el PK referenciado es `IDENTITY`. Hay que borrar primero las filas hijas.
+- `INSERT ... VALUES (...), (...), ...` inserta **varias filas** en un statement; cada fila autogenera su `IDENTITY` y dispara los triggers `FOR EACH ROW`. El tag de resultado es `INSERT 0 N`.
 - Los JOIN encadenan N tablas (3+). La condición `ON` compara por forma canónica, por lo que un JOIN entre una FK literal y una PK `IDENTITY` empareja correctamente.
 - `NATURAL JOIN` y `USING` coalescen las columnas comunes (aparecen una vez). En outer joins el valor coalescido toma el lado no nulo. La columna común sobrevive con la referencia de la tabla izquierda (ej. tras `a NATURAL JOIN b`, se usa `a.col` o `col` sin calificar; `b.col` deja de estar disponible).
 - **Validación de constraints en ALTER TABLE**:
@@ -250,6 +254,7 @@ go run ./cmd/test-drop-table-fk
 go run ./cmd/test-self-fk
 go run ./cmd/test-fk-identity
 go run ./cmd/test-identity-insert
+go run ./cmd/test-insert-fk      # INSERT multi-fila, FK inline, DELETE bloqueado por FK, SELECT por PK IDENTITY
 
 # Consultas: WHERE, agregados, JOINs, ventanas + QUALIFY
 go run ./cmd/test-where-operators
@@ -310,6 +315,11 @@ CREATE DATABASE testing;
 -- Crear tablas
 CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT);
 CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, product TEXT);
+
+-- Clave foránea inline (en una sola línea) + INSERT de varias filas
+CREATE TABLE items (id INT IDENTITY PRIMARY KEY, order_id INT REFERENCES orders(id), sku TEXT);
+INSERT INTO items (order_id, sku) VALUES (1, 'A-1'), (1, 'A-2'), (2, 'B-1');  -- INSERT 0 3
+DELETE FROM orders WHERE id = 1;  -- ERROR: foreign key reference exists in table public.items
 
 -- Crear vista
 CREATE VIEW v_users AS SELECT id, name FROM users;

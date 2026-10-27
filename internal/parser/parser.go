@@ -906,16 +906,32 @@ func (p *Parser) parseInsert() (ast.Statement, error) {
 	if !p.expect(TokenValues) {
 		return nil, p.errorf("expected VALUES")
 	}
-	if !p.expect(TokenLParen) {
-		return nil, p.errorf("expected (")
-	}
 
+	// Parse one or more parenthesized value tuples: (...), (...), ...
 	for {
-		lit, err := p.parseLiteral()
-		if err != nil {
-			return nil, err
+		if !p.expect(TokenLParen) {
+			return nil, p.errorf("expected (")
 		}
-		stmt.Values = append(stmt.Values, lit)
+
+		var row []ast.Literal
+		for {
+			lit, err := p.parseLiteral()
+			if err != nil {
+				return nil, err
+			}
+			row = append(row, lit)
+			if p.cur.Type == TokenComma {
+				p.next()
+				continue
+			}
+			break
+		}
+
+		if !p.expect(TokenRParen) {
+			return nil, p.errorf("expected ) after values")
+		}
+		stmt.Rows = append(stmt.Rows, row)
+
 		if p.cur.Type == TokenComma {
 			p.next()
 			continue
@@ -923,9 +939,8 @@ func (p *Parser) parseInsert() (ast.Statement, error) {
 		break
 	}
 
-	if !p.expect(TokenRParen) {
-		return nil, p.errorf("expected ) after values")
-	}
+	// Values mirrors the first row for backward compatibility.
+	stmt.Values = stmt.Rows[0]
 
 	return stmt, nil
 }

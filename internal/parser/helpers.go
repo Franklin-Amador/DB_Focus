@@ -830,6 +830,28 @@ func (p *Parser) parseColumnDef() (ast.ColumnDef, error) {
 		case TokenUnique:
 			p.next()
 			colDef.Constraints = append(colDef.Constraints, &ast.UniqueConstraint{ColumnName: colName.Name})
+		case TokenReferences:
+			// Inline column-level foreign key: col TYPE REFERENCES table(col)
+			p.next()
+			refTable, err := p.parseIdentRequired("expected referenced table name")
+			if err != nil {
+				return ast.ColumnDef{}, err
+			}
+			if !p.expect(TokenLParen) {
+				return ast.ColumnDef{}, p.errorf("expected ( after referenced table")
+			}
+			refCol, err := p.parseIdentRequired("expected referenced column name")
+			if err != nil {
+				return ast.ColumnDef{}, err
+			}
+			if !p.expect(TokenRParen) {
+				return ast.ColumnDef{}, p.errorf("expected ) after referenced column")
+			}
+			colDef.Constraints = append(colDef.Constraints, &ast.ForeignKeyConstraint{
+				ColumnName:      colName.Name,
+				ReferencedTable: refTable.Name,
+				ReferencedCol:   refCol.Name,
+			})
 		case TokenIdent:
 			// DEFAULT keyword (not yet a dedicated token)
 			if strings.EqualFold(p.cur.Literal, "DEFAULT") {

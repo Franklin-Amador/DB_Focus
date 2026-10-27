@@ -1496,3 +1496,63 @@ sobre una copia del directorio `data/` real (migración verificada).
 - Se eliminó la tabla `pg_catalog.pg_database` de `initSystemCatalog` (el clúster es la fuente).
 - No abordado (documentado): `DROP DATABASE` no espera a otras sesiones conectadas a esa base; su
   trabajo en curso sigue en memoria pero ya no puede persistir (`tablesForWrite`).
+
+### Session: October 26, 2026 - Fixes: DELETE ignora FK, INSERT multi-fila, FK inline (+ SELECT por PK IDENTITY)
+
+**Objetivo**: tres defectos reportados por el usuario + un hallazgo propio durante el análisis.
+Todos confirmados con un repro antes de tocar nada.
+
+**Status**: ✅ COMPLETED
+
+**Bug 1 — DELETE borra filas referenciadas por FK (correctitud, grave)**:
+- Síntoma: `DELETE FROM padre WHERE id = N` tenía éxito aunque una tabla hija referenciara esa fila,
+  dejando huérfanos. Pasaba con PK `IDENTITY` (el caso común).
+- Causa: `catalog.CheckForeignKeyReferences` (catalog_tables.go) comparaba `row[fkColIdx] == pkValue`
+  con **`==` crudo** sobre `interface{}`. El PK IDENTITY del padre es `int`, el FK del hijo es
+  `string` literal → `int(1) == "1"` es `false` → nunca encontraba las filas hijas → permitía el
+  borrado. Es el gotcha #1 (mismo que FK-vs-IDENTITY en INSERT), pero el lado DELETE se había
+  omitido cuando se corrigió INSERT/`validateForeignKey`.
+- Fix: `ValuesEqual(row[fkColIdx], pkValue)` (+ guard de longitud). Afecta `DELETE` con y sin WHERE.
+
+**Bug 2 — INSERT de múltiples filas (estilo PostgreSQL)**:
+- `INSERT INTO t VALUES (...), (...), ...` fallaba al parsear (`parseInsert` leía una sola tupla).
+- Fix: `ast.Insert.Rows [][]Literal` (se conserva `Values` = primera fila para compat: gob viejo,
+  sustitución de parámetros, validador). `parseInsert` hace loop de tuplas; `executeInsert` itera
+  `Rows` (fallback a `[Values]`), con armado de fila extraído a `buildInsertValues`, IDENTITY y
+  triggers `FOR EACH ROW` **por fila**, persistencia una vez, tag `INSERT 0 N`.
+- Regresión evitada: `substituteInsertParameters` (procedures) hacía `*stmt` (copiaba `Rows`) y solo
+  reemplazaba `Values`; como el executor ahora prefiere `Rows`, un INSERT con parámetros en un
+  procedure habría insertado los **nombres** de parámetro. Reescrito para sustituir sobre todas las
+  filas y mantener `Rows`/`Values` coherentes.
+
+**Bug 3 — FK inline en una sola línea**:
+- `CREATE TABLE hijo (..., padre_id INT REFERENCES padre(id))` fallaba (`parseColumnDef` no
+  manejaba `REFERENCES`). El FK a nivel de tabla ya funcionaba.
+- Fix: caso `TokenReferences` en `parseColumnDef` que produce `*ast.ForeignKeyConstraint` a nivel de
+  columna. `executeCreateTable` **ya** propagaba ese constraint al catálogo (no hizo falta tocarlo).
+
+**Bug 4 — hallazgo propio: SELECT por PK IDENTITY sin índice devolvía 0 filas**:
+- `SELECT * FROM t WHERE id = N` sobre una columna `IDENTITY` **sin índice** devolvía 0 filas
+  (misma causa de tipos: `Table.SelectWhere` caía al scan `row[colIdx] == value`, `int` vs `string`).
+  `UPDATE`/`DELATE` ya estaban a salvo porque pasan por `whereMatches`/`compareCells`; el `SELECT`
+  con fast-path de igualdad llamaba a `SelectWhere`, que solo funcionaba si había índice.
+- Fix: `SelectWhere` usa `ValuesEqual` en el scan. De paso, el dup-check de PK/UNIQUE en
+  `insertRowWithValidation` también usaba `==` crudo → migrado a `ValuesEqual` (consistencia).
+
+**Notificado al usuario (no corregido, requiere decisión de semántica)**:
+- `UPDATE` de una columna PK referenciada por una FK no se bloquea (no hay `ON UPDATE RESTRICT`):
+  cambiar el valor de un PK referenciado puede dejar hijos huérfanos. Misma familia que el Bug 1
+  pero en UPDATE; pendiente de decidir si se adopta RESTRICT.
+- Sin transacciones: un `INSERT` multi-fila que falla a mitad deja las filas previas aplicadas
+  (se persisten para que memoria y disco coincidan), no hace rollback.
+
+**Código**: `internal/catalog/catalog_tables.go` (FK DELETE), `internal/catalog/table.go`
+(`SelectWhere`, dup-check PK/UNIQUE), `internal/parser/helpers.go` (`parseColumnDef` REFERENCES),
+`internal/parser/parser.go` (`parseInsert` multi-fila), `internal/ast/ast.go` (`Insert.Rows`),
+`internal/executor/executor_dml.go` (`executeInsert` + `buildInsertValues`),
+`internal/executor/executor_procedure.go` (`substituteInsertParameters`).
+
+**Verificación**: `go test ./internal/... ./cmd/focusd` ✅; **30/30** integración ✅. Test nuevo
+`cmd/test-insert-fk` (multi-fila con lista/posicional, IDENTITY por fila, FK inline aceptada/
+rechazada, DELETE bloqueado y luego permitido, SELECT por PK IDENTITY, procedure con parámetros).
+README actualizado.

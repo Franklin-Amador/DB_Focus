@@ -68,7 +68,7 @@ func (t *Table) insertRowWithValidation(values []interface{}, catalog *Catalog, 
 				continue
 			}
 			for _, row := range t.Rows {
-				if row[colIdx] == values[colIdx] {
+				if colIdx < len(row) && ValuesEqual(row[colIdx], values[colIdx]) {
 					return fmt.Errorf("duplicate primary key value %v for column %s", values[colIdx], constraint.ColumnName)
 				}
 			}
@@ -82,7 +82,7 @@ func (t *Table) insertRowWithValidation(values []interface{}, catalog *Catalog, 
 				continue
 			}
 			for _, row := range t.Rows {
-				if row[colIdx] == values[colIdx] {
+				if colIdx < len(row) && ValuesEqual(row[colIdx], values[colIdx]) {
 					return fmt.Errorf("duplicate value %v for unique column %s", values[colIdx], constraint.ColumnName)
 				}
 			}
@@ -307,7 +307,7 @@ func (t *Table) SelectWhere(colName string, value interface{}) ([][]interface{},
 
 	var result [][]interface{}
 	for _, row := range t.Rows {
-		if row[colIdx] == value {
+		if colIdx < len(row) && ValuesEqual(row[colIdx], value) {
 			rowCopy := make([]interface{}, len(row))
 			copy(rowCopy, row)
 			result = append(result, rowCopy)

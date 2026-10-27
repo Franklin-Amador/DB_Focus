@@ -118,27 +118,40 @@ func (e *Executor) substituteParameters(stmt ast.Statement, paramValues map[stri
 	return stmt
 }
 
-// substituteInsertParameters substitutes parameters in an INSERT statement.
+// substituteInsertParameters substitutes parameters in an INSERT statement,
+// across every VALUES row (keeping Rows and Values consistent).
 func (e *Executor) substituteInsertParameters(stmt *ast.Insert, paramValues map[string]string) *ast.Insert {
 	newStmt := *stmt
-	newValues := make([]ast.Literal, len(stmt.Values))
 
-	for i, val := range stmt.Values {
-		// Check if it's an identifier (parameter reference)
+	subst := func(val ast.Literal) ast.Literal {
+		// Identifier literals are parameter references.
 		if val.Kind == "identifier" {
 			if paramVal, exists := paramValues[val.Value]; exists {
-				newValues[i] = inferLiteralType(paramVal)
-			} else {
-				newValues[i] = val
+				return inferLiteralType(paramVal)
 			}
-		} else if paramVal, exists := paramValues[val.Value]; exists {
-			newValues[i] = ast.Literal{Kind: val.Kind, Value: paramVal}
-		} else {
-			newValues[i] = val
+			return val
 		}
+		if paramVal, exists := paramValues[val.Value]; exists {
+			return ast.Literal{Kind: val.Kind, Value: paramVal}
+		}
+		return val
 	}
 
-	newStmt.Values = newValues
+	rows := stmt.Rows
+	if len(rows) == 0 {
+		rows = [][]ast.Literal{stmt.Values}
+	}
+	newRows := make([][]ast.Literal, len(rows))
+	for r, row := range rows {
+		nr := make([]ast.Literal, len(row))
+		for i, val := range row {
+			nr[i] = subst(val)
+		}
+		newRows[r] = nr
+	}
+
+	newStmt.Rows = newRows
+	newStmt.Values = newRows[0]
 	return &newStmt
 }
 

@@ -214,7 +214,7 @@ func (c *Catalog) CheckForeignKeyReferences(tableName, pkColName string, pkValue
 
 				table.Mu().RLock()
 				for _, row := range table.Rows {
-					if row[fkColIdx] == pkValue {
+					if fkColIdx < len(row) && ValuesEqual(row[fkColIdx], pkValue) {
 						table.Mu().RUnlock()
 						return fmt.Errorf("cannot delete record: foreign key reference exists in table %s column %s", tName, constraint.ColumnName)
 					}
