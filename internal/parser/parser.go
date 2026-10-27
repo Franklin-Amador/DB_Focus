@@ -482,6 +482,17 @@ func (p *Parser) parseDropIndex() (ast.Statement, error) {
 	return &ast.DropIndex{Name: indexName, Table: tableIdent}, nil
 }
 
+// DESCRIBE table | DESC table — lists the columns of a table. The table name
+// may be schema-qualified; the schema lands in Table.Alias (DDL convention).
+func (p *Parser) parseDescribe() (ast.Statement, error) {
+	p.next() // consume DESCRIBE / DESC
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected table name after DESCRIBE")
+	}
+	table := p.parseQualifiedIdent()
+	return &ast.Describe{Table: table}, nil
+}
+
 // DROP PROCEDURE procedure_name[()]
 func (p *Parser) parseDropProcedure() (ast.Statement, error) {
 	p.next()

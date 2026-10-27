@@ -134,6 +134,7 @@ postgresql://postgres:4444@localhost:4444/postgres
 - `INSERT INTO` tabla [(columna, ...)] VALUES (literal, ...) [, (literal, ...), ...] — admite **múltiples filas** en un solo statement (estilo PostgreSQL)
 - `UPDATE` tabla SET columna = valor [WHERE columna = literal]
 - `DELETE FROM` tabla [WHERE columna = literal]
+- `DESCRIBE` tabla (o `DESC` tabla) — lista las columnas de una tabla (nombre, tipo, nullabilidad, rol de clave y si es IDENTITY)
 
 **Notas:**
 - `WHERE` soporta operadores de comparación: `=`, `<>`/`!=`, `<`, `>`, `<=`, `>=` (en SELECT, UPDATE y DELETE). La igualdad (`=`) usa índice cuando existe. **Todos** los operadores comparan por forma canónica: numéricamente si ambos lados son números, lexicográficamente en caso contrario. Esto hace que `WHERE id = 1` funcione igual sobre una columna `IDENTITY` (valor `int`) que sobre una columna con valores literales (`string`) — importante en `UPDATE`/`DELETE`, que recorren la tabla en vez de usar el índice.
@@ -173,6 +174,7 @@ postgresql://postgres:4444@localhost:4444/postgres
 - `ALTER TABLE` permite modificar la estructura de tablas existentes: agregar/eliminar columnas, cambiar tipos, renombrar columnas.
 - `CREATE INDEX` permite acelerar búsquedas por igualdad (`WHERE columna = valor`) en tablas con alto volumen de filas.
 - `DROP INDEX` elimina un índice definido en una tabla y persiste el cambio en disco.
+- `DESCRIBE tabla` (alias `DESC tabla`) devuelve un conjunto de filas con las columnas de la tabla: `Column`, `Type`, `Null` (`YES`/`NO`), `Key` (`PRI`/`UNI`/`MUL` para primaria/única/foránea) e `Identity` (`YES`/`NO`). Acepta nombre calificado (`DESCRIBE esquema.tabla`) y error si la tabla no existe.
 - Soporta claves foráneas autorreferenciadas (self FK), por ejemplo `FOREIGN KEY (parent_id) REFERENCES categorias(id)`.
 - Las claves foráneas se pueden declarar **inline a nivel de columna** (`padre_id INT REFERENCES padre(id)`) además de a nivel de tabla.
 - Las claves foráneas funcionan correctamente cuando referencian una columna `IDENTITY`: la comparación de valores es tolerante al tipo (tanto al **insertar** como al **borrar/actualizar**), así que un valor literal (`1`) coincide con una clave IDENTITY autogenerada.

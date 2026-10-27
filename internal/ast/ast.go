@@ -116,6 +116,16 @@ type DropIndex struct {
 
 func (DropIndex) stmtNode() {}
 
+// Describe is `DESCRIBE table` (or its `DESC table` alias): it lists the
+// columns of a table with their type, nullability, key role, and identity
+// flag. Following the DDL convention (see AGENTS.md gotcha #5), the schema
+// is carried in Table.Alias.
+type Describe struct {
+	Table Identifier
+}
+
+func (Describe) stmtNode() {}
+
 type CreateDatabase struct {
 	Name Identifier
 }

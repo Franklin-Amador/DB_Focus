@@ -1556,3 +1556,36 @@ Todos confirmados con un repro antes de tocar nada.
 `cmd/test-insert-fk` (multi-fila con lista/posicional, IDENTITY por fila, FK inline aceptada/
 rechazada, DELETE bloqueado y luego permitido, SELECT por PK IDENTITY, procedure con parámetros).
 README actualizado.
+
+### Session: October 26, 2026 - DESCRIBE / DESC (introspección de columnas)
+
+**Objetivo**: el motor no tenía forma de listar las columnas de una tabla como data. Agregar
+`DESCRIBE tabla` (y su alias `DESC tabla`), que devuelve un result set estilo MySQL.
+
+**Status**: ✅ COMPLETED
+
+**Qué devuelve**: una fila por columna con `Column`, `Type`, `Null` (`YES`/`NO`), `Key`
+(`PRI`/`UNI`/`MUL` para primaria/única/foránea; prioridad PRI > UNI > MUL) e `Identity`
+(`YES`/`NO`). Acepta nombre calificado (`DESCRIBE esquema.tabla`) y retorna error si la tabla
+no existe. Como es row-returning, fluye por el mismo path de `writers.go` que SELECT
+(`len(result.Columns) > 0` → RowDescription); tag de resultado `DESCRIBE`.
+
+**Cambios** (siguiendo el patrón de "Adding a New SQL Statement Type"):
+- **token.go**: `TokenDescribe` (`"DESCRIBE"`) + entrada en `keywords`. El alias `DESC` reusa el
+  `TokenDesc` existente (solo aparece como dirección de ORDER BY dentro de una query, así que no
+  hay conflicto al top level).
+- **ast.go**: `Describe{Table Identifier}` (schema en `Table.Alias`, convención DDL — gotcha #5).
+- **parser.go**: `parseDescribe()` (usa `parseQualifiedIdent`); registrado en el `init()` de
+  `parser_registry.go` para `TokenDescribe` **y** `TokenDesc` en `topLevelParsers`.
+- **executor_describe.go** (nuevo): `executeDescribe` + `columnKeyRoles` (deriva PRI/UNI/MUL de
+  `table.Constraints`), auto-registrado con `registerExec` en su `init()`. Sin storage (lectura).
+- **constants.go**: `ResultDescribe = "DESCRIBE"`.
+- Sin validador (la inexistencia de tabla la reporta `catalog.GetTable`).
+
+**Tests**: `parser_test.go` (`TestDescribe` con ambas formas, `TestDescribeQualified`);
+`cmd/test-describe` (tipo/null/key/identity sobre PK IDENTITY, UNIQUE, FK inline → MUL, columna
+sin clave, NOT NULL, alias `DESC`, error de tabla inexistente).
+
+**Verificación** (CGO_ENABLED=0): `go build ./internal/...` ✅, `go vet ./internal/{executor,parser}`
+✅, `go test ./internal/...` ✅, `go run ./cmd/test-describe` ✅, `go build ./cmd/focusd` ✅.
+README actualizado (sintaxis + nota de comportamiento).

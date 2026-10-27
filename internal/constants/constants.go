@@ -82,6 +82,7 @@ const (
 	ResultCreateJob       = "CREATE JOB"
 	ResultDropJob         = "DROP JOB"
 	ResultCall            = "CALL"
+	ResultDescribe        = "DESCRIBE"
 )
 
 // ResultSelectTag returns a SELECT result tag with the row count.

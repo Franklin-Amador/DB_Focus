@@ -189,6 +189,38 @@ func TestDropIndex(t *testing.T) {
 	}
 }
 
+func TestDescribe(t *testing.T) {
+	for _, input := range []string{"DESCRIBE users;", "DESC users;"} {
+		p := NewParser(input)
+		stmt, err := p.ParseStatement()
+		if err != nil {
+			t.Fatalf("Failed to parse %q: %v", input, err)
+		}
+		d, ok := stmt.(*ast.Describe)
+		if !ok {
+			t.Fatalf("%q: expected *ast.Describe, got %T", input, stmt)
+		}
+		if d.Table.Name != "users" {
+			t.Fatalf("%q: expected table users, got %s", input, d.Table.Name)
+		}
+	}
+}
+
+func TestDescribeQualified(t *testing.T) {
+	p := NewParser("DESCRIBE sales.orders;")
+	stmt, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("Failed to parse DESCRIBE sales.orders: %v", err)
+	}
+	d, ok := stmt.(*ast.Describe)
+	if !ok {
+		t.Fatalf("Expected *ast.Describe, got %T", stmt)
+	}
+	if d.Table.Name != "orders" || d.Table.Alias != "sales" {
+		t.Fatalf("Expected schema sales / table orders, got %s / %s", d.Table.Alias, d.Table.Name)
+	}
+}
+
 func TestDropIndexQualifiedTable(t *testing.T) {
 	input := "DROP INDEX idx_users_age ON public.users;"
 	p := NewParser(input)

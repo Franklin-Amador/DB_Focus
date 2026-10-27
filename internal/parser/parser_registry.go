@@ -48,6 +48,8 @@ func init() {
 		TokenCall:         (*Parser).parseCall,
 		TokenDrop:         (*Parser).parseDrop,
 		TokenAlter:        (*Parser).parseAlter,
+		TokenDescribe:     (*Parser).parseDescribe,
+		TokenDesc:         (*Parser).parseDescribe, // DESC table alias
 		TokenSemicolon:    (*Parser).parseNoop,
 		TokenEnd:          (*Parser).parseNoop,
 		TokenDollarString: (*Parser).parseNoop,
