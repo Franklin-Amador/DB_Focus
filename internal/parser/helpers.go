@@ -554,15 +554,129 @@ func whereOperator(t TokenType) (string, bool) {
 	return "", false
 }
 
-func (p *Parser) parseGroupByClause() ([]ast.Identifier, error) {
+func (p *Parser) parseGroupByClause() ([]ast.Identifier, bool, error) {
 	if p.cur.Type != TokenGroup {
-		return nil, nil
+		return nil, false, nil
 	}
 	p.next()
 	if !p.expect(TokenBy) {
-		return nil, p.errorf("expected BY after GROUP")
+		return nil, false, p.errorf("expected BY after GROUP")
 	}
-	return p.parseColumnRefList("GROUP BY")
+	// GROUP BY ALL: group by every non-aggregate select item (Snowflake). ALL is
+	// not a reserved keyword, so it lexes as an identifier.
+	if p.cur.Type == TokenIdent && strings.EqualFold(p.cur.Literal, "ALL") {
+		p.next()
+		return nil, true, nil
+	}
+	cols, err := p.parseColumnRefList("GROUP BY")
+	return cols, false, err
+}
+
+// parseStarModifiers parses the optional Snowflake SELECT * modifiers that may
+// follow the star, in any order: ILIKE 'pattern', EXCLUDE (cols) and
+// RENAME (col AS new). None of these are reserved keywords (they lex as
+// identifiers), so a column literally named "exclude" is unaffected elsewhere.
+func (p *Parser) parseStarModifiers(stmt *ast.Select) error {
+	// Match on the literal, not the token type: RENAME lexes as a reserved
+	// keyword token (from ALTER TABLE ... RENAME), while EXCLUDE/ILIKE lex as
+	// identifiers. A non-matching literal (FROM, EOF, ...) ends the loop.
+	for {
+		switch {
+		case strings.EqualFold(p.cur.Literal, "ILIKE"):
+			p.next()
+			if p.cur.Type != TokenString {
+				return p.errorf("expected string pattern after ILIKE")
+			}
+			stmt.StarILike = p.cur.Literal
+			p.next()
+		case strings.EqualFold(p.cur.Literal, "EXCLUDE"):
+			p.next()
+			cols, err := p.parseStarColumnList()
+			if err != nil {
+				return err
+			}
+			stmt.StarExclude = cols
+		case strings.EqualFold(p.cur.Literal, "RENAME"):
+			p.next()
+			renames, err := p.parseStarRenameList()
+			if err != nil {
+				return err
+			}
+			stmt.StarRename = renames
+		default:
+			return nil
+		}
+	}
+}
+
+// parseStarColumnList parses `(a, b, ...)` or a single `a` column list.
+func (p *Parser) parseStarColumnList() ([]string, error) {
+	var cols []string
+	if p.cur.Type == TokenLParen {
+		p.next()
+		for {
+			id, err := p.parseIdentRequired("expected column name")
+			if err != nil {
+				return nil, err
+			}
+			cols = append(cols, id.Name)
+			if p.cur.Type == TokenComma {
+				p.next()
+				continue
+			}
+			break
+		}
+		if !p.expect(TokenRParen) {
+			return nil, p.errorf("expected ) after column list")
+		}
+		return cols, nil
+	}
+	id, err := p.parseIdentRequired("expected column name")
+	if err != nil {
+		return nil, err
+	}
+	return []string{id.Name}, nil
+}
+
+// parseStarRenameList parses `(a AS x, b AS y)` or a single `a AS x`.
+func (p *Parser) parseStarRenameList() ([]ast.StarRename, error) {
+	var out []ast.StarRename
+	parseOne := func() error {
+		from, err := p.parseIdentRequired("expected column name in RENAME")
+		if err != nil {
+			return err
+		}
+		if !p.expect(TokenAs) {
+			return p.errorf("expected AS in RENAME")
+		}
+		to, err := p.parseIdentRequired("expected new name in RENAME")
+		if err != nil {
+			return err
+		}
+		out = append(out, ast.StarRename{From: from.Name, To: to.Name})
+		return nil
+	}
+	if p.cur.Type == TokenLParen {
+		p.next()
+		for {
+			if err := parseOne(); err != nil {
+				return nil, err
+			}
+			if p.cur.Type == TokenComma {
+				p.next()
+				continue
+			}
+			break
+		}
+		if !p.expect(TokenRParen) {
+			return nil, p.errorf("expected ) after RENAME list")
+		}
+		return out, nil
+	}
+	if err := parseOne(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (p *Parser) parseOrderByClause() ([]ast.OrderByClause, error) {

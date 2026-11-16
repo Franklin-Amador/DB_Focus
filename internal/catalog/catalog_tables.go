@@ -347,14 +347,16 @@ func (c *Catalog) ForeignKeyReferencers(parentSchema, parentTable string) []FKRe
 				continue
 			}
 			ref := constraint.ReferencedTable
-			// A qualified reference must match exactly; a bare reference resolves
-			// within the child table's own schema (SQL default), so it only
-			// matches a parent in that same schema. This prevents a FK that names
-			// "autor" in one schema from being enforced against a different
-			// schema's "autor" during a cascade.
+			// Match a bare reference exactly the way the INSERT/UPDATE FK check
+			// resolves it (catalog.GetTable(ref) defaults to "public"): a bare
+			// ref means public.<name>, and also matches a same-schema parent as a
+			// safe superset. This keeps DELETE/UPDATE enforcement consistent with
+			// what INSERT validates (no orphan via a resolver differential). A
+			// qualified reference must match exactly.
 			matched := ref == parentQualified
 			if !matched {
-				if parts := splitQualifiedName(ref); len(parts) != 2 && ref == parentTable && childSchema == parentSchema {
+				if parts := splitQualifiedName(ref); len(parts) != 2 && ref == parentTable &&
+					(parentSchema == "public" || childSchema == parentSchema) {
 					matched = true
 				}
 			}

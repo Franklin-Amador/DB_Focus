@@ -205,6 +205,18 @@ type Select struct {
 	Star         bool
 	Distinct     bool
 	AllowMissing bool
+	// Snowflake-style SELECT * modifiers (only meaningful when Star is true).
+	StarExclude []string      // SELECT * EXCLUDE (a, b): columns to drop
+	StarRename  []StarRename  // SELECT * RENAME (a AS x): columns to rename in the output
+	StarILike   string        // SELECT * ILIKE 'pattern': keep only columns matching the pattern
+	// GroupByAll is set by GROUP BY ALL: group by every non-aggregate select item.
+	GroupByAll bool
+}
+
+// StarRename is one `old AS new` pair of a SELECT * RENAME clause.
+type StarRename struct {
+	From string
+	To   string
 }
 
 func (Select) stmtNode() {}

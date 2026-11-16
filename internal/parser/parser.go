@@ -137,6 +137,9 @@ func (p *Parser) parseSelect() (ast.Statement, error) {
 	if p.cur.Type == TokenStar {
 		stmt.Star = true
 		p.next()
+		if err := p.parseStarModifiers(stmt); err != nil {
+			return nil, err
+		}
 	} else {
 		cols, allowMissing, err := p.parseSelectList()
 		if err != nil {
@@ -168,11 +171,12 @@ func (p *Parser) parseSelect() (ast.Statement, error) {
 		stmt.Where = where
 	}
 
-	grp, err := p.parseGroupByClause()
+	grp, groupAll, err := p.parseGroupByClause()
 	if err != nil {
 		return nil, err
 	}
 	stmt.GroupBy = grp
+	stmt.GroupByAll = groupAll
 
 	having, err := p.parseHavingClause()
 	if err != nil {

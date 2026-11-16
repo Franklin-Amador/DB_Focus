@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"dbf/internal/ast"
@@ -286,9 +287,20 @@ func projectRows(stmt *ast.Select, rs *rowset, itemIdx []int) ([]string, [][]int
 			if c.hidden {
 				continue
 			}
+			// Snowflake SELECT * modifiers: keep by ILIKE pattern, drop by
+			// EXCLUDE, rename the output name by RENAME.
+			if stmt.StarILike != "" && !ilikeMatch(stmt.StarILike, c.name) {
+				continue
+			}
+			if containsFold(stmt.StarExclude, c.name) {
+				continue
+			}
 			name := c.name
 			if rs.qualified {
 				name = c.ref + "." + c.name
+			}
+			if newName, ok := starRename(stmt.StarRename, c.name); ok {
+				name = newName
 			}
 			columns = append(columns, name)
 			idxs = append(idxs, i)
@@ -330,6 +342,49 @@ func projectRows(stmt *ast.Select, rs *rowset, itemIdx []int) ([]string, [][]int
 	return columns, projected
 }
 
+// containsFold reports whether list contains s, case-insensitively.
+func containsFold(list []string, s string) bool {
+	for _, x := range list {
+		if strings.EqualFold(x, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// starRename returns the RENAME target for a column, if any (case-insensitive).
+func starRename(renames []ast.StarRename, col string) (string, bool) {
+	for _, r := range renames {
+		if strings.EqualFold(r.From, col) {
+			return r.To, true
+		}
+	}
+	return "", false
+}
+
+// ilikeMatch reports whether name matches a SQL ILIKE pattern: case-insensitive,
+// with % matching any sequence and _ matching any single character.
+func ilikeMatch(pattern, name string) bool {
+	var b strings.Builder
+	b.WriteString("(?i)^")
+	for _, r := range pattern {
+		switch r {
+		case '%':
+			b.WriteString(".*")
+		case '_':
+			b.WriteString(".")
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	b.WriteString("$")
+	re, err := regexp.Compile(b.String())
+	if err != nil {
+		return false
+	}
+	return re.MatchString(name)
+}
+
 // ─── Grouping ────────────────────────────────────────────────────────────────
 
 // isAggregateExpr reports whether a reference is aggregate call text.
@@ -342,7 +397,7 @@ func isAggregateExpr(ref string) bool {
 // aggregate stage: an explicit GROUP BY or HAVING, or an aggregate in the
 // select list.
 func needsGrouping(stmt *ast.Select) bool {
-	if len(stmt.GroupBy) > 0 || stmt.Having != nil {
+	if len(stmt.GroupBy) > 0 || stmt.GroupByAll || stmt.Having != nil {
 		return true
 	}
 	for _, c := range stmt.Columns {
@@ -401,14 +456,28 @@ type groupCol struct {
 // engine's historical leniency (first value of the group); a hidden column
 // may only be an aggregate or a GROUP BY key.
 func groupRows(stmt *ast.Select, rs *rowset) (*rowset, error) {
-	// Group keys.
-	groupIdxs := make([]int, len(stmt.GroupBy))
-	for i, g := range stmt.GroupBy {
-		idx, err := rs.resolveWithAliases(stmt, g.Name)
-		if err != nil {
-			return nil, fmt.Errorf("GROUP BY: %w", err)
+	// Group keys. GROUP BY ALL uses every non-aggregate select item as a key.
+	var groupIdxs []int
+	if stmt.GroupByAll {
+		for _, id := range stmt.Columns {
+			if id.Window != nil || isAggregateExpr(id.Name) {
+				continue
+			}
+			idx, err := rs.resolveWithAliases(stmt, id.Name)
+			if err != nil {
+				return nil, fmt.Errorf("GROUP BY ALL: %w", err)
+			}
+			groupIdxs = append(groupIdxs, idx)
 		}
-		groupIdxs[i] = idx
+	} else {
+		groupIdxs = make([]int, len(stmt.GroupBy))
+		for i, g := range stmt.GroupBy {
+			idx, err := rs.resolveWithAliases(stmt, g.Name)
+			if err != nil {
+				return nil, fmt.Errorf("GROUP BY: %w", err)
+			}
+			groupIdxs[i] = idx
+		}
 	}
 	isGroupKey := func(idx int) bool {
 		for _, g := range groupIdxs {
