@@ -88,9 +88,20 @@ func (e *Executor) executeDropFunction(ctx context.Context, stmt *ast.DropFuncti
 	return &Result{Tag: constants.ResultDropFunction}, nil
 }
 
+// maxFunctionCallDepth bounds nested set-returning function calls so a function
+// whose body references itself (directly or through a cycle) cannot recurse into
+// a stack overflow and crash the server.
+const maxFunctionCallDepth = 32
+
 // resolveFunctionTable runs a set-returning function referenced in a FROM clause
 // and returns its result as a virtual table (same shape the view path uses).
 func (e *Executor) resolveFunctionTable(ctx context.Context, call ast.Identifier) (*catalog.Table, error) {
+	if e.funcDepth >= maxFunctionCallDepth {
+		return nil, fmt.Errorf("function call depth exceeded (%d) resolving %s; recursive function?", maxFunctionCallDepth, call.Name)
+	}
+	e.funcDepth++
+	defer func() { e.funcDepth-- }()
+
 	fn, err := e.catalog.GetFunction(call.Name, call.Schema)
 	if err != nil {
 		return nil, err

@@ -25,6 +25,7 @@ type Executor struct {
 	validator       *validator.Validator
 	triggersEnabled bool
 	triggerDepth    int
+	funcDepth       int
 }
 
 // New creates a new Executor instance

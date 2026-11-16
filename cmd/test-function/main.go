@@ -136,6 +136,20 @@ $$`)
 	run(ctx, exe2, "DROP FUNCTION IF EXISTS fn_no_existe")
 	fmt.Println("  ok: DROP FUNCTION + DROP FUNCTION IF EXISTS")
 
+	// 6) Recursion guard: a self-referencing function must error, not overflow
+	// the stack. Seed a valid body, then OR REPLACE it to call itself.
+	run(ctx, exe2, "CREATE FUNCTION fn_rec() RETURNS TABLE (id INTEGER) AS $$ BEGIN RETURN QUERY SELECT c.id FROM cursos c; END; $$")
+	run(ctx, exe2, "CREATE OR REPLACE FUNCTION fn_rec() RETURNS TABLE (id INTEGER) AS $$ BEGIN RETURN QUERY SELECT r.id FROM fn_rec() r; END; $$")
+	stmt, perr := parser.NewParser("SELECT * FROM fn_rec()").ParseStatement()
+	if perr != nil {
+		log.Fatalf("parse fn_rec call: %v", perr)
+	}
+	if _, rerr := exe2.Execute(ctx, stmt); rerr == nil {
+		log.Fatalf("expected recursive function to error, got success")
+	} else {
+		fmt.Printf("  ok: recursive function bounded -> %v\n", rerr)
+	}
+
 	st2.Close()
 	fmt.Println("=== All function tests passed! ===")
 }
