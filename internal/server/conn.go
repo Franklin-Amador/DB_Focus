@@ -130,6 +130,15 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat CatalogProvi
 				return
 			}
 			rw.Flush()
+		case 'C':
+			// Close a prepared statement or portal. pgjdbc (DBeaver) sends this
+			// after Execute; replying CloseComplete instead of an error keeps the
+			// extended-protocol response stream intact (an ErrorResponse here made
+			// the driver discard the result set, so grids and the metadata tree
+			// came back empty).
+			sess.descValid = false
+			writeCloseComplete(rw)
+			rw.Flush()
 		case 'H':
 			rw.Flush()
 		case 'X':

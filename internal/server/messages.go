@@ -105,6 +105,12 @@ func writeBindComplete(rw *bufio.ReadWriter) error {
 	return writeMessage(rw, '2', nil)
 }
 
+// writeCloseComplete acknowledges a Close ('C') message for a prepared
+// statement or portal.
+func writeCloseComplete(rw *bufio.ReadWriter) error {
+	return writeMessage(rw, '3', nil)
+}
+
 func writeNoData(rw *bufio.ReadWriter) error {
 	return writeMessage(rw, 'n', nil)
 }
