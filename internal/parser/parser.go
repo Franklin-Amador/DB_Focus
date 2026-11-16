@@ -865,10 +865,16 @@ func (p *Parser) parseTableLevelConstraint() (ast.Constraint, error) {
 		if err := p.expectOrError(TokenRParen, "expected ) after referenced column"); err != nil {
 			return nil, err
 		}
+		onDelete, onUpdate, err := p.parseReferentialActions()
+		if err != nil {
+			return nil, err
+		}
 		return &ast.ForeignKeyConstraint{
 			ColumnName:      id.Name,
 			ReferencedTable: refTable.Name,
 			ReferencedCol:   refCol.Name,
+			OnDelete:        onDelete,
+			OnUpdate:        onUpdate,
 		}, nil
 
 	case TokenUnique:

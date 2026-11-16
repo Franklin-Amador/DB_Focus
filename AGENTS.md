@@ -1589,3 +1589,103 @@ sin clave, NOT NULL, alias `DESC`, error de tabla inexistente).
 **Verificación** (CGO_ENABLED=0): `go build ./internal/...` ✅, `go vet ./internal/{executor,parser}`
 ✅, `go test ./internal/...` ✅, `go run ./cmd/test-describe` ✅, `go build ./cmd/focusd` ✅.
 README actualizado (sintaxis + nota de comportamiento).
+
+---
+
+### Session: November 16, 2026 - Integridad referencial: ON DELETE / ON UPDATE + fixes de correctitud
+
+**Objetivo**: rumbo "correctitud y endurecimiento". Acciones referenciales completas y cierre de un
+bug 🔴 real detectado en la auditoría.
+
+**Status**: ✅ COMPLETED
+
+**Bugs encontrados en la auditoría** (antes de tocar nada):
+1. 🔴 **`UPDATE padre SET pk = x` no se bloqueaba** aunque hubiera hijos referenciando el valor viejo
+   → huérfanos silenciosos. `validateUpdateConstraints` solo validaba el lado *hijo* (actualizar una
+   FK), nunca el lado *padre* (actualizar una PK referenciada). `DELETE` sí bloqueaba; `UPDATE` no.
+2. 🔴 **Deadlock latente en `DELETE` de tablas self-FK**: `performDelete` sostenía el write-lock del
+   padre y llamaba `CheckForeignKeyReferences`, que para una tabla autorreferenciada hacía `RLock`
+   sobre el **mismo** mutex (el skip `tName == tableName` comparaba qualified vs bare y nunca
+   coincidía con la propia tabla). El test `test-self-fk` solo cubría INSERT, así que no se detectaba.
+3. No existían acciones `ON DELETE`/`ON UPDATE` (todo era RESTRICT implícito y solo en DELETE).
+
+**Features / fixes implementados**:
+1. ✅ **`ON DELETE` / `ON UPDATE`**: `RESTRICT` (default) · `NO ACTION` (= RESTRICT; sin transacciones
+   no hay diferido) · `CASCADE` · `SET NULL`. Combinables y en cualquier orden.
+2. ✅ **Fix bug #1**: `UPDATE` de una columna referenciada respeta `ON UPDATE` (RESTRICT por defecto
+   bloquea; CASCADE propaga el nuevo valor; SET NULL anula la FK de las hijas).
+3. ✅ **Fix bug #2**: el enforcement FK ahora corre como **pre-pass sin sostener locks anidados**
+   (snapshot del padre bajo RLock, luego mutar/persistir hijas con sus propios locks). Self-FG DELETE
+   ya no deadlockea; `performDelete` quedó como pura remoción de filas.
+4. ✅ **Cascada multinivel** con guarda de ciclos (`maxCascadeDepth = 64` + set `visited`), cubre
+   self-FK (`cat → hijos → nietos`).
+
+**Código**:
+- `ast.ForeignKeyConstraint`, `catalog.Constraint`, `storage.ConstraintData`: campos `OnDelete`/
+  `OnUpdate` (gob/JSON retro-compatible: vacío = RESTRICT). Conversión en ambas direcciones de
+  `pebble_storage.go` + `executor_ddl.go` (FK inline y a nivel de tabla).
+- Parser (`helpers.go`): `parseReferentialActions` / `parseReferentialAction` (CASCADE/RESTRICT via
+  token; `SET NULL` via `TokenSet`+`TokenNull`; `NO ACTION` via idents, para no reservar keywords).
+  Llamado en `parseColumnDef` (TokenReferences) y en el FK a nivel de tabla (`parser.go`).
+- `catalog.ForeignKeyReferencers(parentSchema, parentTable)` (+ tipo `FKReferencer`): enumera toda FK
+  que referencia la tabla (bare o qualified, self-refs incluidas), con `ReferencedCol`/`OnDelete`/
+  `OnUpdate` e índice de la columna hija.
+- `executor/executor_fk.go` (nuevo): `enforceDeleteReferences`/`cascadeDeleteRow`,
+  `enforceUpdateReferences`/`cascadeUpdateValue`, helpers de fila (`snapshotMatchedRows`,
+  `snapshotMatchingRows`, `hasMatchingRow`, `deleteRowsWhere`, `setNullRowsWhere`,
+  `setColumnRowsWhere`, `distinctMatchedValues`, `rowKey`). Cableado en `executeDelete`/`executeUpdate`
+  **antes** de la mutación. `performDelete` simplificado (sin FK); `findPrimaryKeyColumn` eliminado
+  (quedó sin uso). `CheckForeignKeyReferences` del catálogo ya no se usa (se deja como estaba).
+
+**Comparaciones de tipos**: barrido confirmó que el único `==`/`!=` crudo vivo restante era un
+`== nil` legítimo en `storage.go`; `DeleteWhere` (catalog/table.go) usa `!=` crudo pero es **código
+muerto** (sin llamadores) — se deja para el commit de endurecimiento de UPDATE.
+
+**Tests**: `cmd/test-fk-actions` (A RESTRICT default DELETE+UPDATE, B ON DELETE CASCADE, C SET NULL,
+D ON UPDATE CASCADE, E acciones mixtas, F self-FK CASCADE multinivel + RESTRICT sin deadlock, G
+persistencia round-trip del action). `parser_test.go`: `TestForeignKeyReferentialActions` (5 casos,
+inline+tabla, orden invertido, default) + `TestForeignKeyInvalidAction`.
+
+**Verificación** (CGO_ENABLED=0): `go build ./internal/... ./cmd/focusd` ✅, `go vet` ✅,
+`go test ./internal/... ./cmd/focusd` ✅, **16/16** integración del motor ✅ (incluye FK/self-FK/
+persistencia/schemas). README actualizado (sintaxis FK + notas + lista de regresión).
+
+**Entrega 2 · endurecimiento de UPDATE** (misma sesión) ✅:
+- ✅ **UPDATE re-valida PK/UNIQUE**: nueva `validateUpdateUniqueness` (`executor_dml.go`) proyecta los
+  valores de la columna tras el update (filas del WHERE toman el valor nuevo, el resto conservan el
+  suyo) y falla en la primera colisión — misma validación que ya hacía INSERT y que UPDATE se saltaba
+  (`UPDATE t SET id = 2 WHERE id = 1` con `id=2` creaba un PK duplicado; poner el mismo PK en varias
+  filas también). Permite valor libre y no-op (mismo valor). Solo RLock, antes de `performUpdate`.
+  Cableada en `executeUpdate` tras `validateUpdateConstraints`.
+- ✅ **`DeleteWhere` eliminado** (`catalog/table.go`): era código muerto (sin llamadores) y usaba `!=`
+  crudo sobre `interface{}` (gotcha #1). Confirmado por grep que nadie lo usaba.
+- Test `cmd/test-update-unique` (PK colisión con otra fila, 2 filas al mismo PK, valor libre, no-op,
+  UNIQUE colisión y valor libre, columna normal sin cambios). Verificación: build/vet/test ✅,
+  **16/16** integración ✅. README actualizado.
+
+**Entrega 3 · índices por rango + BETWEEN** (misma sesión) ✅:
+- **Índice ordenado**: `catalog.Index` ahora lleva `sortedKeys []string` (claves distintas de `Values`
+  en orden canónico), derivado y no persistido. Sincronizado en `indexRowLocked` (inserción binaria
+  de clave nueva vía `insertSortedKey`) y reconstruido con un solo `sort.Slice` en
+  `rebuildIndexesLocked` (evita O(k²)). Comparador `compareIndexKeys` (numérico si ambos parsean,
+  lexicográfico si no) **idéntico** a `compareCells` del executor → resultado por índice == scan.
+  Refactor: key extraction unificada en `Index.keyForRow`.
+- **`Table.SelectRange(col, op, low, high)`**: usa un índice de **una sola columna** vía
+  `sort.Search` (lower/upper bound) para `<`, `<=`, `>`, `>=` y `BETWEEN` (rango acotado inclusivo);
+  devuelve `(rows, handled, err)` — `handled=false` si no hay índice adecuado y el caller hace scan.
+- **Executor** (`fetchRows`): el fast-path de leaf ahora enruta `=` por `SelectWhere` y los rangos/
+  `BETWEEN` por `SelectRange` (con fallback a scan vía `evalWhere` si no hay índice). Sin cambios en
+  el path compuesto (AND/OR) ni en UPDATE/DELETE (que siguen por scan, correctos).
+- **BETWEEN**: token `TokenBetween`; `ast.WhereClause.Value2` (gob-retro-compatible); parseo en
+  `parseWherePredicate` (`col BETWEEN low AND high` → leaf `Operator:"BETWEEN"`); `evalWhere` lo
+  evalúa con `compareCells` (inclusivo). Funciona en SELECT/UPDATE/DELETE.
+- Tests: `cmd/test-range-index` (compara tabla indexada vs no indexada con los mismos datos para
+  probar index==scan; orden numérico `n > 9 → 10..20`; mantenimiento tras INSERT/UPDATE/DELETE;
+  duplicados; rango vacío; persistencia tras reload). `parser_test.go`: `TestParseBetween`,
+  `TestParseBetweenMissingAnd`. Verificación: build/vet/test ✅, **20/20** integración ✅.
+  README + INDEXING.md actualizados.
+
+**Follow-ups restantes (otra sesión)**:
+- Optimización de rangos sobre índices **compuestos** (hoy solo igualdad por prefijo).
+- `NULL` como literal en `INSERT` no está soportado (`parseLiteral` no maneja `TokenNull`); los NULL
+  se insertan omitiendo la columna.

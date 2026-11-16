@@ -18,12 +18,23 @@ type Constraint struct {
 	ColumnName      string
 	ReferencedTable string
 	ReferencedCol   string
+	// OnDelete and OnUpdate hold the FK referential action ("CASCADE",
+	// "SET NULL", "RESTRICT", "NO ACTION"). Empty means the default, RESTRICT.
+	// Adding these fields is gob/JSON backward-compatible (old data decodes to
+	// the empty string, i.e. RESTRICT — the prior behavior).
+	OnDelete string
+	OnUpdate string
 }
 
 type Index struct {
 	Name        string
 	ColumnNames []string
 	Values      map[string][]int
+	// sortedKeys holds the distinct keys of Values in ascending canonical order
+	// (compareIndexKeys), enabling range lookups by binary search. It is derived
+	// state, kept in sync with Values on insert and rebuild; it is never
+	// persisted (rebuilt from rows on load).
+	sortedKeys []string
 }
 
 type Table struct {

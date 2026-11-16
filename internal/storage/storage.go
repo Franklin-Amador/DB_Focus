@@ -129,6 +129,8 @@ type ConstraintData struct {
 	ColumnName      string `json:"column_name"`
 	ReferencedTable string `json:"referenced_table,omitempty"`
 	ReferencedCol   string `json:"referenced_col,omitempty"`
+	OnDelete        string `json:"on_delete,omitempty"`
+	OnUpdate        string `json:"on_update,omitempty"`
 }
 
 // syncIdentityValues normalizes a table's IDENTITY columns after a bulk load:

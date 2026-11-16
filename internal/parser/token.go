@@ -68,6 +68,7 @@ const (
 	TokenUnique     TokenType = "UNIQUE"
 	TokenNot        TokenType = "NOT"
 	TokenNull       TokenType = "NULL"
+	TokenBetween    TokenType = "BETWEEN"
 	TokenWith       TokenType = "WITH"
 	TokenOwner      TokenType = "OWNER"
 	TokenEncoding   TokenType = "ENCODING"
@@ -179,6 +180,7 @@ var keywords = map[string]TokenType{
 	"UNIQUE":     TokenUnique,
 	"NOT":        TokenNot,
 	"NULL":       TokenNull,
+	"BETWEEN":    TokenBetween,
 	"WITH":       TokenWith,
 	"OWNER":      TokenOwner,
 	"ENCODING":   TokenEncoding,

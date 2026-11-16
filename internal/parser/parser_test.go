@@ -123,6 +123,126 @@ func TestCreateTable(t *testing.T) {
 	}
 }
 
+// findFK returns the first ForeignKeyConstraint declared anywhere in a
+// CREATE TABLE (column-level or table-level).
+func findFK(ct *ast.CreateTable) *ast.ForeignKeyConstraint {
+	for _, col := range ct.Columns {
+		for _, c := range col.Constraints {
+			if fk, ok := c.(*ast.ForeignKeyConstraint); ok {
+				return fk
+			}
+		}
+	}
+	for _, c := range ct.Constraints {
+		if fk, ok := c.(*ast.ForeignKeyConstraint); ok {
+			return fk
+		}
+	}
+	return nil
+}
+
+func TestForeignKeyReferentialActions(t *testing.T) {
+	cases := []struct {
+		name       string
+		input      string
+		wantDelete string
+		wantUpdate string
+	}{
+		{
+			name:       "inline cascade both",
+			input:      "CREATE TABLE c (id INT PRIMARY KEY, p INT REFERENCES par(id) ON DELETE CASCADE ON UPDATE CASCADE)",
+			wantDelete: "CASCADE",
+			wantUpdate: "CASCADE",
+		},
+		{
+			name:       "inline set null on delete only",
+			input:      "CREATE TABLE c (id INT PRIMARY KEY, p INT REFERENCES par(id) ON DELETE SET NULL)",
+			wantDelete: "SET NULL",
+			wantUpdate: "",
+		},
+		{
+			name:       "inline update restrict only",
+			input:      "CREATE TABLE c (id INT PRIMARY KEY, p INT REFERENCES par(id) ON UPDATE RESTRICT)",
+			wantDelete: "",
+			wantUpdate: "RESTRICT",
+		},
+		{
+			name:       "table-level no action + cascade (reversed order)",
+			input:      "CREATE TABLE c (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES par(id) ON UPDATE CASCADE ON DELETE NO ACTION)",
+			wantDelete: "NO ACTION",
+			wantUpdate: "CASCADE",
+		},
+		{
+			name:       "no actions defaults to empty",
+			input:      "CREATE TABLE c (id INT PRIMARY KEY, p INT REFERENCES par(id))",
+			wantDelete: "",
+			wantUpdate: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt, err := NewParser(tc.input).ParseStatement()
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			ct, ok := stmt.(*ast.CreateTable)
+			if !ok {
+				t.Fatalf("expected *ast.CreateTable, got %T", stmt)
+			}
+			fk := findFK(ct)
+			if fk == nil {
+				t.Fatal("no foreign key constraint found")
+			}
+			if fk.ReferencedTable != "par" || fk.ReferencedCol != "id" {
+				t.Errorf("expected REFERENCES par(id), got %s(%s)", fk.ReferencedTable, fk.ReferencedCol)
+			}
+			if fk.OnDelete != tc.wantDelete {
+				t.Errorf("OnDelete: expected %q, got %q", tc.wantDelete, fk.OnDelete)
+			}
+			if fk.OnUpdate != tc.wantUpdate {
+				t.Errorf("OnUpdate: expected %q, got %q", tc.wantUpdate, fk.OnUpdate)
+			}
+		})
+	}
+}
+
+func TestParseBetween(t *testing.T) {
+	stmt, err := NewParser("SELECT * FROM t WHERE n BETWEEN 5 AND 10").ParseStatement()
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	sel, ok := stmt.(*ast.Select)
+	if !ok {
+		t.Fatalf("expected *ast.Select, got %T", stmt)
+	}
+	w := sel.Where
+	if w == nil || !w.IsLeaf() {
+		t.Fatalf("expected a leaf WHERE, got %+v", w)
+	}
+	if w.Operator != "BETWEEN" {
+		t.Errorf("expected operator BETWEEN, got %q", w.Operator)
+	}
+	if w.Column.Name != "n" {
+		t.Errorf("expected column n, got %q", w.Column.Name)
+	}
+	if w.Value.Value != "5" || w.Value2.Value != "10" {
+		t.Errorf("expected bounds 5..10, got %q..%q", w.Value.Value, w.Value2.Value)
+	}
+}
+
+func TestParseBetweenMissingAnd(t *testing.T) {
+	if _, err := NewParser("SELECT * FROM t WHERE n BETWEEN 5 10").ParseStatement(); err == nil {
+		t.Fatal("expected parse error for BETWEEN without AND")
+	}
+}
+
+func TestForeignKeyInvalidAction(t *testing.T) {
+	if _, err := NewParser("CREATE TABLE c (id INT, p INT REFERENCES par(id) ON DELETE BOGUS)").ParseStatement(); err == nil {
+		t.Fatal("expected parse error for unknown referential action")
+	}
+}
+
 func TestCreateIndex(t *testing.T) {
 	input := "CREATE INDEX idx_users_name ON users (name);"
 	p := NewParser(input)

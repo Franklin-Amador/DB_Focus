@@ -3,11 +3,67 @@ package catalog
 import (
 	"dbf/internal/constants"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
 
 const compositeIndexSeparator = "\x1f"
+
+// compareIndexKeys orders two canonical index keys, returning -1, 0 or 1. It is
+// numeric when both keys parse as numbers, lexicographic otherwise. This MUST
+// match the executor's compareCells semantics so that an index-backed range
+// lookup returns exactly the same rows a full scan would.
+func compareIndexKeys(a, b string) int {
+	af, aerr := strconv.ParseFloat(a, 64)
+	bf, berr := strconv.ParseFloat(b, 64)
+	if aerr == nil && berr == nil {
+		switch {
+		case af < bf:
+			return -1
+		case af > bf:
+			return 1
+		default:
+			return 0
+		}
+	}
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// keyForRow builds this index's composite key for a row, reporting ok=false
+// when a referenced column is missing from the row.
+func (idx *Index) keyForRow(columns []Column, row []interface{}) (string, bool) {
+	if len(idx.ColumnNames) == 0 {
+		return "", false
+	}
+	vals := make([]interface{}, 0, len(idx.ColumnNames))
+	for _, colName := range idx.ColumnNames {
+		ci := columnIndex(columns, colName)
+		if ci == -1 || ci >= len(row) {
+			return "", false
+		}
+		vals = append(vals, row[ci])
+	}
+	return makeCompositeIndexKey(vals), true
+}
+
+// insertSortedKey inserts a new distinct key into sortedKeys, preserving order.
+func (idx *Index) insertSortedKey(key string) {
+	pos := sort.Search(len(idx.sortedKeys), func(i int) bool {
+		return compareIndexKeys(idx.sortedKeys[i], key) >= 0
+	})
+	idx.sortedKeys = append(idx.sortedKeys, "")
+	copy(idx.sortedKeys[pos+1:], idx.sortedKeys[pos:])
+	idx.sortedKeys[pos] = key
+}
 
 // ValuesEqual reports whether two cell values are equal, tolerant of the mixed
 // Go types the engine stores (literals as strings, IDENTITY keys as ints). It
@@ -139,26 +195,16 @@ func (t *Table) indexRowLocked(rowIdx int) {
 	}
 	row := t.Rows[rowIdx]
 	for _, idx := range t.Indexes {
-		if len(idx.ColumnNames) == 0 {
+		key, ok := idx.keyForRow(t.Columns, row)
+		if !ok {
 			continue
 		}
-
-		vals := make([]interface{}, 0, len(idx.ColumnNames))
-		valid := true
-		for _, colName := range idx.ColumnNames {
-			colIdx := columnIndex(t.Columns, colName)
-			if colIdx == -1 || colIdx >= len(row) {
-				valid = false
-				break
-			}
-			vals = append(vals, row[colIdx])
+		existing := idx.Values[key]
+		idx.Values[key] = append(existing, rowIdx)
+		if len(existing) == 0 {
+			// New distinct key: keep the ordered key list in sync.
+			idx.insertSortedKey(key)
 		}
-		if !valid {
-			continue
-		}
-
-		key := makeCompositeIndexKey(vals)
-		idx.Values[key] = append(idx.Values[key], rowIdx)
 	}
 }
 
@@ -169,10 +215,28 @@ func (t *Table) rebuildIndexesLocked() {
 
 	for _, idx := range t.Indexes {
 		idx.Values = make(map[string][]int)
+		idx.sortedKeys = nil
 	}
 
-	for rowIdx := range t.Rows {
-		t.indexRowLocked(rowIdx)
+	for rowIdx, row := range t.Rows {
+		for _, idx := range t.Indexes {
+			key, ok := idx.keyForRow(t.Columns, row)
+			if !ok {
+				continue
+			}
+			idx.Values[key] = append(idx.Values[key], rowIdx)
+		}
+	}
+
+	// Sort each index's distinct keys once (cheaper than incremental inserts).
+	for _, idx := range t.Indexes {
+		idx.sortedKeys = make([]string, 0, len(idx.Values))
+		for k := range idx.Values {
+			idx.sortedKeys = append(idx.sortedKeys, k)
+		}
+		sort.Slice(idx.sortedKeys, func(i, j int) bool {
+			return compareIndexKeys(idx.sortedKeys[i], idx.sortedKeys[j]) < 0
+		})
 	}
 }
 
@@ -316,23 +380,72 @@ func (t *Table) SelectWhere(colName string, value interface{}) ([][]interface{},
 	return result, nil
 }
 
-// DeleteWhere deletes rows matching a column value
-func (t *Table) DeleteWhere(colName string, value interface{}) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+// SelectRange returns the rows satisfying a range predicate on a single column,
+// using a single-column index on that column via binary search over its sorted
+// keys. op is one of "<", "<=", ">", ">=" (low is the bound) or "BETWEEN" (low
+// and high are the inclusive bounds). The second result reports whether an index
+// handled the query; when false, the caller must fall back to a scan. Results
+// are identical to a scan because the index orders keys with compareIndexKeys,
+// the same comparator the executor applies.
+func (t *Table) SelectRange(colName, op string, low, high interface{}) ([][]interface{}, bool, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 
 	colIdx := columnIndex(t.Columns, colName)
 	if colIdx == -1 {
-		return fmt.Errorf("column %s not found", colName)
+		return nil, false, fmt.Errorf("column %s not found", colName)
 	}
 
-	var newRows [][]interface{}
-	for _, row := range t.Rows {
-		if row[colIdx] != value {
-			newRows = append(newRows, row)
+	var idx *Index
+	for _, candidate := range t.Indexes {
+		if len(candidate.ColumnNames) == 1 && candidate.ColumnNames[0] == colName {
+			idx = candidate
+			break
 		}
 	}
-	t.Rows = newRows
-	t.rebuildIndexesLocked()
-	return nil
+	if idx == nil {
+		return nil, false, nil // no suitable index; caller scans
+	}
+
+	keys := idx.sortedKeys
+	lowKey := normalizeIndexValue(low)
+
+	var start, end int
+	switch op {
+	case ">":
+		start = sort.Search(len(keys), func(i int) bool { return compareIndexKeys(keys[i], lowKey) > 0 })
+		end = len(keys)
+	case ">=":
+		start = sort.Search(len(keys), func(i int) bool { return compareIndexKeys(keys[i], lowKey) >= 0 })
+		end = len(keys)
+	case "<":
+		start = 0
+		end = sort.Search(len(keys), func(i int) bool { return compareIndexKeys(keys[i], lowKey) >= 0 })
+	case "<=":
+		start = 0
+		end = sort.Search(len(keys), func(i int) bool { return compareIndexKeys(keys[i], lowKey) > 0 })
+	case "BETWEEN":
+		highKey := normalizeIndexValue(high)
+		start = sort.Search(len(keys), func(i int) bool { return compareIndexKeys(keys[i], lowKey) >= 0 })
+		end = sort.Search(len(keys), func(i int) bool { return compareIndexKeys(keys[i], highKey) > 0 })
+	default:
+		return nil, false, nil
+	}
+	if start > end {
+		start = end // empty range (e.g. BETWEEN 10 AND 5)
+	}
+
+	result := make([][]interface{}, 0)
+	for _, key := range keys[start:end] {
+		for _, pos := range idx.Values[key] {
+			if pos < 0 || pos >= len(t.Rows) {
+				continue
+			}
+			rowCopy := make([]interface{}, len(t.Rows[pos]))
+			copy(rowCopy, t.Rows[pos])
+			result = append(result, rowCopy)
+		}
+	}
+	return result, true, nil
 }
+

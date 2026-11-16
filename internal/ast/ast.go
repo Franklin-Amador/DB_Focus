@@ -49,6 +49,10 @@ type ForeignKeyConstraint struct {
 	ColumnName      string
 	ReferencedTable string
 	ReferencedCol   string
+	// OnDelete and OnUpdate hold the referential action ("CASCADE", "SET NULL",
+	// "RESTRICT", "NO ACTION"). An empty string means the default, RESTRICT.
+	OnDelete string
+	OnUpdate string
 }
 
 func (ForeignKeyConstraint) constraintNode() {}
@@ -226,8 +230,12 @@ func (SelectFunction) stmtNode() {}
 type WhereClause struct {
 	// Leaf fields (used when Conj == "").
 	Column   Identifier
-	Operator string // "=", "<>", "<", ">", "<=", ">=" (default "=")
+	Operator string // "=", "<>", "<", ">", "<=", ">=", "BETWEEN" (default "=")
 	Value    Literal
+	// Value2 is the upper bound of a BETWEEN predicate (Operator == "BETWEEN");
+	// Value is then the lower bound, both inclusive. Adding this field is
+	// gob-backward-compatible (old blobs decode it to the zero Literal).
+	Value2 Literal
 
 	// Compound fields (used when Conj != "").
 	Left  *WhereClause

@@ -886,6 +886,8 @@ func (ps *PebbleStorage) loadTableLocked(cat *catalog.Catalog, name string, sche
 			ColumnName:      c.ColumnName,
 			ReferencedTable: c.ReferencedTable,
 			ReferencedCol:   c.ReferencedCol,
+			OnDelete:        c.OnDelete,
+			OnUpdate:        c.OnUpdate,
 		}
 	}
 
@@ -1159,6 +1161,8 @@ func convertConstraints(constraints []catalog.Constraint) []ConstraintData {
 			ColumnName:      c.ColumnName,
 			ReferencedTable: c.ReferencedTable,
 			ReferencedCol:   c.ReferencedCol,
+			OnDelete:        c.OnDelete,
+			OnUpdate:        c.OnUpdate,
 		}
 	}
 	return result

@@ -313,6 +313,62 @@ func (c *Catalog) RemoveForeignKeyReferencesToTable(schema, tableName string) ([
 	return updated, nil
 }
 
+// FKReferencer describes a foreign key in some (child) table that points at a
+// column of a parent table. It carries everything the executor needs to apply a
+// referential action without re-walking the catalog.
+type FKReferencer struct {
+	Schema        string // child table's schema
+	TableName     string // child table's bare name
+	Table         *Table // child table
+	FKColumn      string // child column holding the foreign key
+	FKColIndex    int    // index of FKColumn in the child table
+	ReferencedCol string // parent column this FK references
+	OnDelete      string // referential action ("" means RESTRICT)
+	OnUpdate      string // referential action ("" means RESTRICT)
+}
+
+// ForeignKeyReferencers returns every foreign key across all schemas that
+// references parentTable (by its bare or schema-qualified name). Self-references
+// are included. The result drives ON DELETE / ON UPDATE enforcement in the
+// executor; it intentionally takes no lock beyond GetAllTables so callers can
+// mutate the returned child tables afterwards.
+func (c *Catalog) ForeignKeyReferencers(parentSchema, parentTable string) []FKReferencer {
+	allTables := c.GetAllTables()
+	parentQualified := parentSchema + "." + parentTable
+
+	var refs []FKReferencer
+	for srcQualified, table := range allTables {
+		for _, constraint := range table.Constraints {
+			if constraint.Type != constants.ConstraintForeignKey {
+				continue
+			}
+			ref := constraint.ReferencedTable
+			if ref != parentTable && ref != parentQualified {
+				continue
+			}
+			fkIdx := columnIndex(table.Columns, constraint.ColumnName)
+			if fkIdx == -1 {
+				continue
+			}
+			schema, name := parentTable, srcQualified
+			if parts := splitQualifiedName(srcQualified); len(parts) == 2 {
+				schema, name = parts[0], parts[1]
+			}
+			refs = append(refs, FKReferencer{
+				Schema:        schema,
+				TableName:     name,
+				Table:         table,
+				FKColumn:      constraint.ColumnName,
+				FKColIndex:    fkIdx,
+				ReferencedCol: constraint.ReferencedCol,
+				OnDelete:      constraint.OnDelete,
+				OnUpdate:      constraint.OnUpdate,
+			})
+		}
+	}
+	return refs
+}
+
 // checkColumnForeignKeyReferences verifies if a column is referenced by any foreign key
 func (c *Catalog) checkColumnForeignKeyReferences(tableName, columnName, schema string) error {
 	allTables := c.GetAllTables()

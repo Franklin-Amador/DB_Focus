@@ -71,6 +71,8 @@ func (e *Executor) executeCreateTable(ctx context.Context, stmt *ast.CreateTable
 					ColumnName:      col.Name.Name,
 					ReferencedTable: c.ReferencedTable,
 					ReferencedCol:   c.ReferencedCol,
+					OnDelete:        c.OnDelete,
+					OnUpdate:        c.OnUpdate,
 				})
 			}
 		}
@@ -95,6 +97,8 @@ func (e *Executor) executeCreateTable(ctx context.Context, stmt *ast.CreateTable
 				ColumnName:      c.ColumnName,
 				ReferencedTable: c.ReferencedTable,
 				ReferencedCol:   c.ReferencedCol,
+				OnDelete:        c.OnDelete,
+				OnUpdate:        c.OnUpdate,
 			})
 		}
 	}

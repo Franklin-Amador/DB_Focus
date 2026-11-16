@@ -299,9 +299,27 @@ func (p *Parser) parseWherePredicate() (*ast.WhereClause, error) {
 	default:
 		return nil, p.errorf("expected column in %s", clause)
 	}
+	// BETWEEN low AND high (inclusive on both ends).
+	if p.cur.Type == TokenBetween {
+		p.next()
+		low, err := p.parseLiteral()
+		if err != nil {
+			return nil, err
+		}
+		if p.cur.Type != TokenAnd {
+			return nil, p.errorf("expected AND after BETWEEN bound in %s", clause)
+		}
+		p.next()
+		high, err := p.parseLiteral()
+		if err != nil {
+			return nil, err
+		}
+		return &ast.WhereClause{Column: col, Operator: "BETWEEN", Value: low, Value2: high}, nil
+	}
+
 	op, ok := whereOperator(p.cur.Type)
 	if !ok {
-		return nil, p.errorf("expected comparison operator (=, <>, <, >, <=, >=) in %s", clause)
+		return nil, p.errorf("expected comparison operator (=, <>, <, >, <=, >=, BETWEEN) in %s", clause)
 	}
 	p.next()
 	lit, err := p.parseLiteral()
@@ -771,6 +789,69 @@ func (p *Parser) parseSelectItem(depth *int, exprIdx int) (ast.Identifier, bool,
 	}
 }
 
+// parseReferentialActions parses optional `ON DELETE <action>` and
+// `ON UPDATE <action>` clauses that follow a REFERENCES target, in either
+// order (as SQL allows). It returns the referential action for each; an empty
+// string means none was given (the default, RESTRICT). The parser is left just
+// after the last clause consumed.
+func (p *Parser) parseReferentialActions() (onDelete, onUpdate string, err error) {
+	for p.cur.Type == TokenOn {
+		p.next()
+		switch p.cur.Type {
+		case TokenDelete:
+			p.next()
+			action, aerr := p.parseReferentialAction()
+			if aerr != nil {
+				return "", "", aerr
+			}
+			onDelete = action
+		case TokenUpdate:
+			p.next()
+			action, aerr := p.parseReferentialAction()
+			if aerr != nil {
+				return "", "", aerr
+			}
+			onUpdate = action
+		default:
+			return "", "", p.errorf("expected DELETE or UPDATE after ON")
+		}
+	}
+	return onDelete, onUpdate, nil
+}
+
+// parseReferentialAction parses a single referential action:
+// CASCADE | RESTRICT | SET NULL | NO ACTION. NO and ACTION are not reserved
+// keywords (they lex as identifiers), so they are matched case-insensitively.
+func (p *Parser) parseReferentialAction() (string, error) {
+	switch p.cur.Type {
+	case TokenCascade:
+		p.next()
+		return "CASCADE", nil
+	case TokenRestrict:
+		p.next()
+		return "RESTRICT", nil
+	case TokenSet:
+		p.next()
+		if p.cur.Type != TokenNull {
+			return "", p.errorf("expected NULL after SET in referential action")
+		}
+		p.next()
+		return "SET NULL", nil
+	case TokenIdent:
+		if strings.EqualFold(p.cur.Literal, "NO") {
+			p.next()
+			if p.cur.Type != TokenIdent || !strings.EqualFold(p.cur.Literal, "ACTION") {
+				return "", p.errorf("expected ACTION after NO")
+			}
+			p.next()
+			return "NO ACTION", nil
+		}
+		return "", p.errorf("unknown referential action %q", p.cur.Literal)
+	default:
+		return "", p.errorf("expected referential action (CASCADE, RESTRICT, SET NULL, NO ACTION)")
+	}
+}
+
 // parseColumnDef parses a column definition inside CREATE TABLE and advances
 // the parser to the next token after the column definition and its
 // constraints.
@@ -847,10 +928,16 @@ func (p *Parser) parseColumnDef() (ast.ColumnDef, error) {
 			if !p.expect(TokenRParen) {
 				return ast.ColumnDef{}, p.errorf("expected ) after referenced column")
 			}
+			onDelete, onUpdate, err := p.parseReferentialActions()
+			if err != nil {
+				return ast.ColumnDef{}, err
+			}
 			colDef.Constraints = append(colDef.Constraints, &ast.ForeignKeyConstraint{
 				ColumnName:      colName.Name,
 				ReferencedTable: refTable.Name,
 				ReferencedCol:   refCol.Name,
+				OnDelete:        onDelete,
+				OnUpdate:        onUpdate,
 			})
 		case TokenIdent:
 			// DEFAULT keyword (not yet a dedicated token)

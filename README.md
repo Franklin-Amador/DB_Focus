@@ -89,7 +89,7 @@ postgresql://postgres:4444@localhost:4444/postgres
 ## SQL soportado
 
 - `SELECT` [DISTINCT] columnas FROM tabla [WHERE predicado] [GROUP BY columna] [HAVING predicado] [QUALIFY predicado] [ORDER BY columna [ASC|DESC]] [LIMIT n] [OFFSET n]
-  - `predicado`: `columna OP literal` combinable con `AND`/`OR` y paréntesis. `OP` puede ser `=`, `<>` (o `!=`), `<`, `>`, `<=`, `>=`.
+  - `predicado`: `columna OP literal` combinable con `AND`/`OR` y paréntesis. `OP` puede ser `=`, `<>` (o `!=`), `<`, `>`, `<=`, `>=`. También `columna BETWEEN min AND max` (rango inclusivo en ambos extremos).
   - Orden lógico de evaluación: `FROM/JOIN → WHERE → GROUP BY + agregados → HAVING → funciones de ventana → QUALIFY → ORDER BY → proyección → DISTINCT → LIMIT/OFFSET`.
 - `SELECT` [DISTINCT] ... FROM tabla [NATURAL] [INNER|LEFT|RIGHT|FULL [OUTER]|CROSS] JOIN tabla2 [ON tabla.col = tabla2.col | USING (col, ...)] [JOIN tabla3 ...] ... [WHERE ...] [ORDER BY columna [ASC|DESC]] [LIMIT n]
   - Soporta **cadenas de N joins** (3+ tablas): `FROM a JOIN b ON ... JOIN c ON ...`. Las columnas se referencian calificadas (`tabla.col`) o sin calificar si son inequívocas.
@@ -103,8 +103,9 @@ postgresql://postgres:4444@localhost:4444/postgres
   - `QUALIFY`: filtra **después** de calcular las ventanas. El predicado tiene la misma forma que `WHERE` y el lado izquierdo puede ser una columna, un alias del `SELECT`, un agregado o una ventana inline: `QUALIFY ROW_NUMBER() OVER (PARTITION BY categoria ORDER BY monto DESC) = 1`.
   - Funciona sobre tablas, JOINs (columnas calificadas), CTEs, vistas y consultas con `GROUP BY` — en ese caso la ventana opera sobre las filas ya agrupadas y puede referenciar agregados: `RANK() OVER (ORDER BY SUM(monto) DESC)`.
 - `WITH` cte_name AS (SELECT ...) [, cte_name2 AS (SELECT ...)] SELECT ...
-- `CREATE TABLE` tabla (columna tipo [IDENTITY] [PRIMARY KEY] [UNIQUE] [NOT NULL] [REFERENCES tabla(columna)], ..., [FOREIGN KEY (columna) REFERENCES tabla(columna)])
+- `CREATE TABLE` tabla (columna tipo [IDENTITY] [PRIMARY KEY] [UNIQUE] [NOT NULL] [REFERENCES tabla(columna) [ON DELETE acción] [ON UPDATE acción]], ..., [FOREIGN KEY (columna) REFERENCES tabla(columna) [ON DELETE acción] [ON UPDATE acción]])
   - La clave foránea se puede declarar **inline en la columna** (`padre_id INT REFERENCES padre(id)`) o a nivel de tabla (`FOREIGN KEY (padre_id) REFERENCES padre(id)`), ambas en una sola línea.
+  - **Acciones referenciales** `ON DELETE` / `ON UPDATE`: `RESTRICT` (default) · `NO ACTION` (= RESTRICT, no hay diferido sin transacciones) · `CASCADE` · `SET NULL`. Se pueden combinar y van en cualquier orden: `REFERENCES padre(id) ON DELETE CASCADE ON UPDATE RESTRICT`.
 - `CREATE VIEW` vista AS SELECT ...
 - `CREATE VIEW IF NOT EXISTS` vista AS SELECT ...
 - `CREATE VIEW` vista (columna1, columna2, ...) AS SELECT ...
@@ -137,7 +138,7 @@ postgresql://postgres:4444@localhost:4444/postgres
 - `DESCRIBE` tabla (o `DESC` tabla) — lista las columnas de una tabla (nombre, tipo, nullabilidad, rol de clave y si es IDENTITY)
 
 **Notas:**
-- `WHERE` soporta operadores de comparación: `=`, `<>`/`!=`, `<`, `>`, `<=`, `>=` (en SELECT, UPDATE y DELETE). La igualdad (`=`) usa índice cuando existe. **Todos** los operadores comparan por forma canónica: numéricamente si ambos lados son números, lexicográficamente en caso contrario. Esto hace que `WHERE id = 1` funcione igual sobre una columna `IDENTITY` (valor `int`) que sobre una columna con valores literales (`string`) — importante en `UPDATE`/`DELETE`, que recorren la tabla en vez de usar el índice.
+- `WHERE` soporta operadores de comparación: `=`, `<>`/`!=`, `<`, `>`, `<=`, `>=` y `BETWEEN min AND max` (en SELECT, UPDATE y DELETE). La igualdad (`=`) y los rangos (`<`, `>`, `<=`, `>=`, `BETWEEN`) usan índice cuando existe uno de una sola columna sobre la columna filtrada (ver sección Indices); `BETWEEN` es un rango acotado (una sola búsqueda por índice, inclusivo en ambos extremos). **Todos** los operadores comparan por forma canónica: numéricamente si ambos lados son números, lexicográficamente en caso contrario. Esto hace que `WHERE id = 1` funcione igual sobre una columna `IDENTITY` (valor `int`) que sobre una columna con valores literales (`string`) — importante en `UPDATE`/`DELETE`, que recorren la tabla en vez de usar el índice.
 - `WHERE` soporta predicados compuestos con `AND` y `OR`, precedencia estándar (`AND` liga más fuerte que `OR`) y paréntesis para agrupar: `WHERE a > 10 AND (b = 'x' OR c <= 5)`. Funciona también sobre JOINs (columnas calificadas, ej. `pedidos.total > 80`).
 - **Funciones de ventana**: dentro de cada partición (`PARTITION BY`, o toda la tabla si se omite) las filas se ordenan por el `ORDER BY` de la ventana; las filas iguales en todas las claves son *pares*. `ROW_NUMBER` numera 1..n; `RANK` deja huecos tras un empate (1,1,3); `DENSE_RANK` no (1,1,2). Los agregados `OVER` sin `ORDER BY` cubren toda la partición; con `ORDER BY` usan el frame por defecto del estándar (`RANGE UNBOUNDED PRECEDING → CURRENT ROW`): acumulado hasta la fila actual incluyendo sus pares. No hay frames explícitos (`ROWS BETWEEN ...`) ni `LAG/LEAD`.
 - `QUALIFY` se evalúa después de las ventanas y antes de `ORDER BY`/`LIMIT`, así que `QUALIFY rn <= 3 ORDER BY monto DESC LIMIT 5` filtra primero y recorta después. Si la consulta no tiene ventanas, `QUALIFY` actúa como un filtro sobre alias/columnas de salida (extensión permisiva). Una ventana usada solo en `QUALIFY` no aparece en el resultado (tampoco con `SELECT *`).
@@ -178,7 +179,11 @@ postgresql://postgres:4444@localhost:4444/postgres
 - Soporta claves foráneas autorreferenciadas (self FK), por ejemplo `FOREIGN KEY (parent_id) REFERENCES categorias(id)`.
 - Las claves foráneas se pueden declarar **inline a nivel de columna** (`padre_id INT REFERENCES padre(id)`) además de a nivel de tabla.
 - Las claves foráneas funcionan correctamente cuando referencian una columna `IDENTITY`: la comparación de valores es tolerante al tipo (tanto al **insertar** como al **borrar/actualizar**), así que un valor literal (`1`) coincide con una clave IDENTITY autogenerada.
-- `DELETE` (y `DROP`) sobre una fila referenciada por una FK se **bloquea** (no deja huérfanos), incluso cuando el PK referenciado es `IDENTITY`. Hay que borrar primero las filas hijas.
+- `DELETE` (y `DROP`) sobre una fila referenciada por una FK se **bloquea** por defecto (`RESTRICT`), incluso cuando el PK referenciado es `IDENTITY`. Con `ON DELETE CASCADE` se borran las filas hijas; con `ON DELETE SET NULL` la columna FK de las hijas pasa a `NULL`.
+- **Integridad referencial en `UPDATE`**: cambiar el valor de una columna referenciada por una FK (ej. `UPDATE padre SET id = ...`) respeta la acción `ON UPDATE`: por defecto se **bloquea** (`RESTRICT`, ya no deja huérfanos silenciosos); con `ON UPDATE CASCADE` el nuevo valor se propaga a las hijas; con `ON UPDATE SET NULL` la FK de las hijas pasa a `NULL`.
+- Las acciones referenciales funcionan sobre **FK autorreferenciadas** (self-FK): `ON DELETE CASCADE` borra el subárbol completo (recursivo, con guarda de ciclos) y `RESTRICT` bloquea correctamente (antes un `DELETE` sobre una tabla self-FK podía quedar en deadlock).
+- Las acciones (`OnDelete`/`OnUpdate`) **persisten** en disco y se rehidratan al reiniciar (retro-compatible: FKs sin acción guardadas antes decodifican como `RESTRICT`, el comportamiento previo).
+- `UPDATE` sobre una columna `PRIMARY KEY` o `UNIQUE` **rechaza** los cambios que dejarían un valor duplicado (ej. `UPDATE t SET id = 2 WHERE id = 1` cuando ya existe `id = 2`, o poner el mismo PK en varias filas). Un `UPDATE` a un valor libre, o un no-op (mismo valor), se permiten. Es la misma validación que ya hacía `INSERT`.
 - `INSERT ... VALUES (...), (...), ...` inserta **varias filas** en un statement; cada fila autogenera su `IDENTITY` y dispara los triggers `FOR EACH ROW`. El tag de resultado es `INSERT 0 N`.
 - Los JOIN encadenan N tablas (3+). La condición `ON` compara por forma canónica, por lo que un JOIN entre una FK literal y una PK `IDENTITY` empareja correctamente.
 - `NATURAL JOIN` y `USING` coalescen las columnas comunes (aparecen una vez). En outer joins el valor coalescido toma el lado no nulo. La columna común sobrevive con la referencia de la tabla izquierda (ej. tras `a NATURAL JOIN b`, se usa `a.col` o `col` sin calificar; `b.col` deja de estar disponible).
@@ -205,7 +210,7 @@ CREATE INDEX nombre_indice_compuesto ON tabla (columna1, columna2);
 
 Comportamiento actual:
 
-- Optimizados para filtros de igualdad: `WHERE columna = valor`.
+- Optimizados para filtros de igualdad (`WHERE columna = valor`) **y de rango** (`<`, `>`, `<=`, `>=`, `BETWEEN`) sobre índices de una sola columna.
 - Soporta indices simples y compuestos (multi-columna).
 - Se mantienen consistentes en `INSERT`, `UPDATE` y `DELETE`.
 - Persisten en disco y se rehidratan al reiniciar el motor.
@@ -217,15 +222,19 @@ Resumen rapido de optimizacion:
 | --- | --- |
 | `WHERE columna = valor` | Si optimiza |
 | `WHERE col1 = valor` con indice compuesto `(col1, col2)` | Si optimiza (prefijo de la primera columna) |
-| `WHERE columna > valor` | No optimiza (scan) |
-| `WHERE columna < valor` | No optimiza (scan) |
-| `WHERE columna BETWEEN a AND b` | No optimiza (scan) |
-| Indice compuesto `(col1, col2)` | Soportado |
+| `WHERE columna > valor` (o `<`, `>=`, `<=`) con índice de 1 columna | Si optimiza (búsqueda binaria sobre claves ordenadas) |
+| `WHERE columna BETWEEN a AND b` con índice de 1 columna | Si optimiza (rango acotado) |
+| `WHERE columna > valor` sobre índice **compuesto** | No optimiza (scan) |
+| Indice compuesto `(col1, col2)` | Soportado (igualdad por prefijo) |
+
+Detalle del rango por índice:
+
+- El índice mantiene, además del hash de posiciones, una **lista de claves ordenada** (`sortedKeys`) en forma canónica, sincronizada en cada `INSERT` (inserción binaria) y reconstruida en cada rebuild. Los rangos se resuelven por **búsqueda binaria** sobre esa lista → `O(log k + coincidencias)` en vez de un scan completo.
+- El orden es **numérico** cuando ambos lados parsean como número, lexicográfico en caso contrario — el mismo comparador que usa el executor, por lo que el resultado por índice es **idéntico** al del scan (ej. `n > 9` devuelve `10..20`, no se cae al orden de strings).
 
 Limitaciones actuales:
 
-- La optimizacion de indices compuestos actualmente aplica a busquedas por igualdad sobre la primera columna del indice.
-- Sin optimizacion de rangos (`>`, `<`, `BETWEEN`).
+- La optimizacion de rangos aplica a índices de **una sola columna**; sobre índices compuestos solo se optimiza la igualdad por prefijo de la primera columna.
 - `DROP INDEX` ya está soportado para eliminación explícita de índices por tabla.
 
 ## Pruebas de regresión recomendadas
@@ -250,6 +259,7 @@ go test ./cmd/focusd
 # Índices
 go run ./cmd/test-index
 go run ./cmd/test-drop-index
+go run ./cmd/test-range-index   # rangos <,>,<=,>=,BETWEEN por índice (index == scan, orden numérico)
 
 # Claves foráneas e IDENTITY
 go run ./cmd/test-drop-table-fk
@@ -257,6 +267,8 @@ go run ./cmd/test-self-fk
 go run ./cmd/test-fk-identity
 go run ./cmd/test-identity-insert
 go run ./cmd/test-insert-fk      # INSERT multi-fila, FK inline, DELETE bloqueado por FK, SELECT por PK IDENTITY
+go run ./cmd/test-fk-actions     # ON DELETE/ON UPDATE RESTRICT|CASCADE|SET NULL, self-FK, persistencia
+go run ./cmd/test-update-unique  # UPDATE rechaza PK/UNIQUE duplicados; permite valor libre y no-op
 
 # Consultas: WHERE, agregados, JOINs, ventanas + QUALIFY
 go run ./cmd/test-where-operators

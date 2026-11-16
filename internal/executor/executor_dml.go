@@ -198,6 +198,18 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 		return nil, err
 	}
 
+	// Reject updates that would create a duplicate PRIMARY KEY / UNIQUE value.
+	if err := e.validateUpdateUniqueness(table, stmt, colIdx); err != nil {
+		return nil, err
+	}
+
+	// Enforce ON UPDATE referential actions when the updated column is referenced
+	// by child foreign keys and its value changes. With the default (RESTRICT)
+	// this blocks the update instead of silently orphaning child rows.
+	if err := e.enforceUpdateReferences(schema, stmt.Table.Name, table, stmt.Where, stmt.Column.Name, stmt.Value.Value); err != nil {
+		return nil, err
+	}
+
 	// Perform update
 	updateCount, err := e.performUpdate(table, stmt, colIdx)
 	if err != nil {
@@ -251,11 +263,15 @@ func (e *Executor) executeDelete(ctx context.Context, stmt *ast.Delete) (*Result
 		}
 	}
 
-	// Find primary key column for FK checks
-	pkColName := findPrimaryKeyColumn(table)
+	// Enforce ON DELETE referential actions (RESTRICT by default) before removing
+	// any parent rows. This runs without holding the table lock, so it works for
+	// self-referencing tables and can cascade / set null across children.
+	if err := e.enforceDeleteReferences(schema, stmt.Table.Name, table, stmt.Where); err != nil {
+		return nil, err
+	}
 
 	// Perform deletion
-	deleteCount, err := e.performDelete(table, stmt, pkColName)
+	deleteCount, err := e.performDelete(table, stmt)
 	if err != nil {
 		return nil, err
 	}
@@ -286,15 +302,6 @@ func findColumnIndex(columns []catalog.Column, name string) int {
 	return -1
 }
 
-func findPrimaryKeyColumn(table *catalog.Table) string {
-	for _, constraint := range table.Constraints {
-		if constraint.Type == constants.ConstraintPrimaryKey {
-			return constraint.ColumnName
-		}
-	}
-	return ""
-}
-
 func (e *Executor) validateUpdateConstraints(table *catalog.Table, stmt *ast.Update, colIdx int) error {
 	updatingCol := table.Columns[colIdx]
 
@@ -314,6 +321,63 @@ func (e *Executor) validateUpdateConstraints(table *catalog.Table, stmt *ast.Upd
 		}
 	}
 
+	return nil
+}
+
+// validateUpdateUniqueness rejects an UPDATE that would leave a duplicate value
+// in a PRIMARY KEY or UNIQUE column. It projects the post-update values of that
+// column (rows matched by WHERE take the new value, the rest keep theirs) and
+// fails on the first collision. This mirrors the duplicate check INSERT already
+// performs, which UPDATE previously skipped (so `UPDATE t SET id = 2 WHERE id = 1`
+// could create two rows with id = 2). It must run before performUpdate and takes
+// only a read lock, so it does not nest with the write lock there.
+func (e *Executor) validateUpdateUniqueness(table *catalog.Table, stmt *ast.Update, colIdx int) error {
+	colName := stmt.Column.Name
+	kind := ""
+	for _, c := range table.Constraints {
+		if c.ColumnName != colName {
+			continue
+		}
+		if c.Type == constants.ConstraintPrimaryKey {
+			kind = "primary key"
+			break
+		}
+		if c.Type == constants.ConstraintUnique {
+			kind = "unique"
+		}
+	}
+	if kind == "" {
+		return nil
+	}
+
+	resolve := columnResolver(table)
+	newVal := stmt.Value.Value
+
+	table.Mu().RLock()
+	defer table.Mu().RUnlock()
+
+	seen := make(map[string]bool, len(table.Rows))
+	for _, row := range table.Rows {
+		if colIdx >= len(row) {
+			continue
+		}
+		val := row[colIdx]
+		matched, err := evalWhere(stmt.Where, row, resolve)
+		if err != nil {
+			return err
+		}
+		if matched {
+			val = newVal
+		}
+		key := fmt.Sprintf("%v", val)
+		if seen[key] {
+			if kind == "primary key" {
+				return fmt.Errorf("duplicate primary key value %v for column %s", val, colName)
+			}
+			return fmt.Errorf("duplicate value %v for unique column %s", val, colName)
+		}
+		seen[key] = true
+	}
 	return nil
 }
 
@@ -378,63 +442,34 @@ func columnResolver(table *catalog.Table) func(string) (int, bool) {
 	}
 }
 
-func (e *Executor) performDelete(table *catalog.Table, stmt *ast.Delete, pkColName string) (int, error) {
+// performDelete removes the rows selected by the statement's WHERE clause (or
+// all rows when there is none). Referential integrity is enforced beforehand by
+// enforceDeleteReferences, so this does pure row removal under the table lock.
+func (e *Executor) performDelete(table *catalog.Table, stmt *ast.Delete) (int, error) {
 	table.Mu().Lock()
 	defer table.Mu().Unlock()
 
-	deleteCount := 0
-
-	if stmt.Where != nil {
-		resolve := columnResolver(table)
-
-		// Check FK references if necessary
-		if pkColName != "" {
-			pkColIdx := findColumnIndex(table.Columns, pkColName)
-			if pkColIdx != -1 {
-				for _, row := range table.Rows {
-					matched, err := evalWhere(stmt.Where, row, resolve)
-					if err != nil {
-						return 0, err
-					}
-					if matched {
-						if err := e.catalog.CheckForeignKeyReferences(stmt.Table.Name, pkColName, row[pkColIdx]); err != nil {
-							return 0, err
-						}
-					}
-				}
-			}
-		}
-
-		// Perform deletion
-		newRows := [][]interface{}{}
-		for _, row := range table.Rows {
-			matched, err := evalWhere(stmt.Where, row, resolve)
-			if err != nil {
-				return 0, err
-			}
-			if matched {
-				deleteCount++
-			} else {
-				newRows = append(newRows, row)
-			}
-		}
-		table.Rows = newRows
-	} else {
-		// Delete all rows
-		if pkColName != "" {
-			pkColIdx := findColumnIndex(table.Columns, pkColName)
-			if pkColIdx != -1 {
-				for _, row := range table.Rows {
-					if err := e.catalog.CheckForeignKeyReferences(stmt.Table.Name, pkColName, row[pkColIdx]); err != nil {
-						return 0, err
-					}
-				}
-			}
-		}
-
-		deleteCount = len(table.Rows)
+	if stmt.Where == nil {
+		deleteCount := len(table.Rows)
 		table.Rows = [][]interface{}{}
+		return deleteCount, nil
 	}
+
+	resolve := columnResolver(table)
+	deleteCount := 0
+	newRows := [][]interface{}{}
+	for _, row := range table.Rows {
+		matched, err := evalWhere(stmt.Where, row, resolve)
+		if err != nil {
+			return 0, err
+		}
+		if matched {
+			deleteCount++
+		} else {
+			newRows = append(newRows, row)
+		}
+	}
+	table.Rows = newRows
 
 	return deleteCount, nil
 }

@@ -36,6 +36,10 @@ func evalWhere(where *ast.WhereClause, row []interface{}, resolve func(string) (
 	if idx < 0 || idx >= len(row) {
 		return false, nil
 	}
+	if where.Operator == "BETWEEN" {
+		cell := row[idx]
+		return compareCells(cell, where.Value.Value) >= 0 && compareCells(cell, where.Value2.Value) <= 0, nil
+	}
 	return whereMatches(row[idx], where.Operator, where.Value.Value), nil
 }
 

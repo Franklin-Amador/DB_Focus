@@ -511,9 +511,28 @@ func (e *Executor) fetchRows(table *catalog.Table, stmt *ast.Select) ([][]interf
 	if where == nil {
 		return table.SelectAll(), nil
 	}
-	// Fast path: a single equality predicate can use an index when present.
-	if where.IsLeaf() && (where.Operator == "" || where.Operator == "=") {
-		return table.SelectWhere(stripTableQualifier(where.Column.Name, stmt.Table), where.Value.Value)
+	// Fast path: a single leaf predicate can use an index when present. Equality
+	// goes through SelectWhere (which scans when there is no index); range and
+	// BETWEEN go through SelectRange, which reports whether an index handled it
+	// and otherwise leaves the scan below to do the work.
+	if where.IsLeaf() {
+		col := stripTableQualifier(where.Column.Name, stmt.Table)
+		switch where.Operator {
+		case "", "=":
+			return table.SelectWhere(col, where.Value.Value)
+		case "<", "<=", ">", ">=":
+			if rows, handled, err := table.SelectRange(col, where.Operator, where.Value.Value, nil); err != nil {
+				return nil, err
+			} else if handled {
+				return rows, nil
+			}
+		case "BETWEEN":
+			if rows, handled, err := table.SelectRange(col, "BETWEEN", where.Value.Value, where.Value2.Value); err != nil {
+				return nil, err
+			} else if handled {
+				return rows, nil
+			}
+		}
 	}
 	// Otherwise scan the table and evaluate the predicate tree per row.
 	resolve := func(name string) (int, bool) {
