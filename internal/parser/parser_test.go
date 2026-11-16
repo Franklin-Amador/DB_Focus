@@ -207,6 +207,90 @@ func TestForeignKeyReferentialActions(t *testing.T) {
 	}
 }
 
+func TestParseStarModifiers(t *testing.T) {
+	stmt, err := NewParser("SELECT * EXCLUDE (ssn, loaded_at) RENAME (nombre AS name) FROM t").ParseStatement()
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	s := stmt.(*ast.Select)
+	if !s.Star {
+		t.Fatal("expected Star")
+	}
+	if len(s.StarExclude) != 2 || s.StarExclude[0] != "ssn" || s.StarExclude[1] != "loaded_at" {
+		t.Errorf("StarExclude = %v", s.StarExclude)
+	}
+	if len(s.StarRename) != 1 || s.StarRename[0].From != "nombre" || s.StarRename[0].To != "name" {
+		t.Errorf("StarRename = %v", s.StarRename)
+	}
+	if s.Table.Name != "t" {
+		t.Errorf("expected FROM t, got %q", s.Table.Name)
+	}
+
+	s2 := mustParseSelect(t, "SELECT * ILIKE '%_amount' FROM payments")
+	if s2.StarILike != "%_amount" {
+		t.Errorf("StarILike = %q", s2.StarILike)
+	}
+}
+
+func TestParseGroupByAll(t *testing.T) {
+	s := mustParseSelect(t, "SELECT a, COUNT(*) FROM t GROUP BY ALL")
+	if !s.GroupByAll {
+		t.Fatal("expected GroupByAll")
+	}
+	if len(s.GroupBy) != 0 {
+		t.Errorf("GroupBy should be empty, got %v", s.GroupBy)
+	}
+}
+
+func TestParseMaxBy(t *testing.T) {
+	s := mustParseSelect(t, "SELECT MAX_BY(status, updated_at) FROM t")
+	if len(s.Columns) != 1 || s.Columns[0].Name != "MAX_BY(status, updated_at)" {
+		t.Fatalf("expected MAX_BY text column, got %+v", s.Columns)
+	}
+	if _, err := NewParser("SELECT MAX_BY(status) FROM t").ParseStatement(); err == nil {
+		t.Error("expected error for MAX_BY with one argument")
+	}
+}
+
+func TestParseAsofJoin(t *testing.T) {
+	s := mustParseSelect(t, "SELECT * FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym")
+	if len(s.Joins) != 1 {
+		t.Fatalf("expected 1 join, got %d", len(s.Joins))
+	}
+	j := s.Joins[0]
+	if !j.Asof || j.Type != "ASOF" {
+		t.Errorf("expected ASOF join, got Asof=%v Type=%q", j.Asof, j.Type)
+	}
+	if j.MatchLeft.Name != "t.ts" || j.MatchRight.Name != "q.ts" || j.MatchOp != ">=" {
+		t.Errorf("MATCH_CONDITION = %q %q %q", j.MatchLeft.Name, j.MatchOp, j.MatchRight.Name)
+	}
+	if j.Left.Name != "t.sym" || j.Right.Name != "q.sym" {
+		t.Errorf("ON = %q = %q", j.Left.Name, j.Right.Name)
+	}
+	// ON is optional.
+	s2 := mustParseSelect(t, "SELECT * FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts)")
+	if s2.Joins[0].Left.Name != "" {
+		t.Errorf("expected no ON, got %q", s2.Joins[0].Left.Name)
+	}
+	// MATCH_CONDITION must use an inequality.
+	if _, err := NewParser("SELECT * FROM a t ASOF JOIN b q MATCH_CONDITION (t.x = q.x)").ParseStatement(); err == nil {
+		t.Error("expected error for = in MATCH_CONDITION")
+	}
+}
+
+func mustParseSelect(t *testing.T, sql string) *ast.Select {
+	t.Helper()
+	stmt, err := NewParser(sql).ParseStatement()
+	if err != nil {
+		t.Fatalf("parse error for %q: %v", sql, err)
+	}
+	s, ok := stmt.(*ast.Select)
+	if !ok {
+		t.Fatalf("expected *ast.Select, got %T", stmt)
+	}
+	return s
+}
+
 func TestParseBetween(t *testing.T) {
 	stmt, err := NewParser("SELECT * FROM t WHERE n BETWEEN 5 AND 10").ParseStatement()
 	if err != nil {

@@ -69,6 +69,7 @@ const (
 	TokenNot        TokenType = "NOT"
 	TokenNull       TokenType = "NULL"
 	TokenBetween    TokenType = "BETWEEN"
+	TokenAsof       TokenType = "ASOF"
 	TokenWith       TokenType = "WITH"
 	TokenOwner      TokenType = "OWNER"
 	TokenEncoding   TokenType = "ENCODING"
@@ -181,6 +182,7 @@ var keywords = map[string]TokenType{
 	"NOT":        TokenNot,
 	"NULL":       TokenNull,
 	"BETWEEN":    TokenBetween,
+	"ASOF":       TokenAsof,
 	"WITH":       TokenWith,
 	"OWNER":      TokenOwner,
 	"ENCODING":   TokenEncoding,

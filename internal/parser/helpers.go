@@ -61,7 +61,7 @@ func (p *Parser) parseFromAndJoin() (ast.Identifier, []*ast.JoinClause, error) {
 
 	// Optional chain of JOINs
 	var joins []*ast.JoinClause
-	for p.cur.Type == TokenNatural || p.cur.Type == TokenInner || p.cur.Type == TokenLeft || p.cur.Type == TokenRight || p.cur.Type == TokenFull || p.cur.Type == TokenCross || p.cur.Type == TokenJoin {
+	for p.cur.Type == TokenNatural || p.cur.Type == TokenInner || p.cur.Type == TokenLeft || p.cur.Type == TokenRight || p.cur.Type == TokenFull || p.cur.Type == TokenCross || p.cur.Type == TokenJoin || p.cur.Type == TokenAsof {
 		join, err := p.parseSingleJoin()
 		if err != nil {
 			return ast.Identifier{}, nil, err
@@ -75,6 +75,12 @@ func (p *Parser) parseFromAndJoin() (ast.Identifier, []*ast.JoinClause, error) {
 // parseSingleJoin parses one JOIN clause (the current token is a join keyword or
 // NATURAL). Supports explicit ON, USING (col, ...), and NATURAL joins.
 func (p *Parser) parseSingleJoin() (*ast.JoinClause, error) {
+	// ASOF JOIN t MATCH_CONDITION (left op right) [ON a = b]: for each left row,
+	// the nearest right row satisfying the (inequality) match condition.
+	if p.cur.Type == TokenAsof {
+		return p.parseAsofJoin()
+	}
+
 	// Optional NATURAL prefix.
 	natural := false
 	if p.cur.Type == TokenNatural {
@@ -191,6 +197,76 @@ func (p *Parser) parseSingleJoin() (*ast.JoinClause, error) {
 	p.next()
 
 	return &ast.JoinClause{Type: joinType, Table: joinTable, Left: left, Right: right}, nil
+}
+
+// parseAsofJoin parses `ASOF JOIN table MATCH_CONDITION (a op b) [ON c = d]`.
+// The current token is ASOF.
+func (p *Parser) parseAsofJoin() (*ast.JoinClause, error) {
+	p.next() // ASOF
+	if !p.expect(TokenJoin) {
+		return nil, p.errorf("expected JOIN after ASOF")
+	}
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected table name after ASOF JOIN")
+	}
+	joinTable, err := p.parseTableRef()
+	if err != nil {
+		return nil, err
+	}
+
+	if p.cur.Type != TokenIdent || !strings.EqualFold(p.cur.Literal, "MATCH_CONDITION") {
+		return nil, p.errorf("expected MATCH_CONDITION after ASOF JOIN table")
+	}
+	p.next()
+	if !p.expect(TokenLParen) {
+		return nil, p.errorf("expected ( after MATCH_CONDITION")
+	}
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected column in MATCH_CONDITION")
+	}
+	matchLeft := ast.Identifier{Name: p.cur.Literal}
+	p.next()
+	op, ok := whereOperator(p.cur.Type)
+	if !ok || op == "=" || op == "<>" {
+		return nil, p.errorf("MATCH_CONDITION requires an inequality operator (<, <=, >, >=)")
+	}
+	p.next()
+	if p.cur.Type != TokenIdent {
+		return nil, p.errorf("expected column in MATCH_CONDITION")
+	}
+	matchRight := ast.Identifier{Name: p.cur.Literal}
+	p.next()
+	if !p.expect(TokenRParen) {
+		return nil, p.errorf("expected ) after MATCH_CONDITION")
+	}
+
+	jc := &ast.JoinClause{
+		Type:       "ASOF",
+		Table:      joinTable,
+		Asof:       true,
+		MatchLeft:  matchLeft,
+		MatchRight: matchRight,
+		MatchOp:    op,
+	}
+
+	// Optional ON equality (ASOF joins often also match on a key, e.g. symbol).
+	if p.cur.Type == TokenOn {
+		p.next()
+		if p.cur.Type != TokenIdent {
+			return nil, p.errorf("expected column in ON")
+		}
+		jc.Left = ast.Identifier{Name: p.cur.Literal}
+		p.next()
+		if !p.expect(TokenEq) {
+			return nil, p.errorf("expected = in ON")
+		}
+		if p.cur.Type != TokenIdent {
+			return nil, p.errorf("expected column in ON")
+		}
+		jc.Right = ast.Identifier{Name: p.cur.Literal}
+		p.next()
+	}
+	return jc, nil
 }
 
 // parseTableRef parses a FROM/JOIN table reference: "[schema.]table [[AS] alias]".

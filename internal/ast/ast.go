@@ -222,12 +222,19 @@ type StarRename struct {
 func (Select) stmtNode() {}
 
 type JoinClause struct {
-	Type    string // "INNER", "LEFT", "RIGHT", "FULL", "CROSS"
+	Type    string // "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "ASOF"
 	Table   Identifier
 	Left    Identifier
 	Right   Identifier
 	Natural bool     // NATURAL JOIN: join on all common column names (no ON)
 	Using   []string // JOIN ... USING (col, ...): join on the named common columns
+	// ASOF JOIN fields (Type == "ASOF"): for each left row, the nearest right row
+	// satisfying MATCH_CONDITION (MatchLeft MatchOp MatchRight) and the optional
+	// ON equality (Left = Right). MatchOp is one of >, >=, <, <=.
+	Asof       bool
+	MatchLeft  Identifier
+	MatchRight Identifier
+	MatchOp    string
 }
 
 type SelectFunction struct {

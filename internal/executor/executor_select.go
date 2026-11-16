@@ -330,6 +330,13 @@ func (e *Executor) foldJoin(j *ast.JoinClause, accRows [][]interface{}, accCols 
 		return out, unionCols, nil
 	}
 
+	// ASOF JOIN: for each left row keep the nearest right row satisfying the
+	// MATCH_CONDITION (and the optional ON equality). Like a LEFT join, every
+	// left row survives (right columns are NULL when there is no match).
+	if j.Asof {
+		return e.foldAsofJoin(j, accRows, rightRows, unionCols, rightW)
+	}
+
 	// Build the AND-ed equality pairs (as union-row indices). For NATURAL/USING
 	// the same pairs are coalesced (right duplicate dropped from output).
 	coalesce := j.Natural || len(j.Using) > 0
@@ -477,6 +484,64 @@ func (e *Executor) foldJoin(j *ast.JoinClause, accRows [][]interface{}, accCols 
 		return nil, nil, fmt.Errorf("unsupported join type: %s", joinType)
 	}
 	return out, newCols, nil
+}
+
+// foldAsofJoin implements ASOF JOIN: each accumulated (left) row is paired with
+// the nearest right row whose MATCH_CONDITION holds — for `left >= right` /
+// `left > right` the right row with the greatest match value, for `<` / `<=` the
+// smallest — restricted to rows that also satisfy the optional ON equality.
+// Unmatched left rows keep NULLs on the right (LEFT-join semantics).
+func (e *Executor) foldAsofJoin(j *ast.JoinClause, accRows, rightRows [][]interface{}, unionCols []joinColumn, rightW int) ([][]interface{}, []joinColumn, error) {
+	mLeftIdx, err := resolveJoinColumn(unionCols, j.MatchLeft.Name)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ASOF MATCH_CONDITION: %w", err)
+	}
+	mRightIdx, err := resolveJoinColumn(unionCols, j.MatchRight.Name)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ASOF MATCH_CONDITION: %w", err)
+	}
+	hasOn := j.Left.Name != ""
+	onLeftIdx, onRightIdx := -1, -1
+	if hasOn {
+		if onLeftIdx, err = resolveJoinColumn(unionCols, j.Left.Name); err != nil {
+			return nil, nil, fmt.Errorf("ASOF ON: %w", err)
+		}
+		if onRightIdx, err = resolveJoinColumn(unionCols, j.Right.Name); err != nil {
+			return nil, nil, fmt.Errorf("ASOF ON: %w", err)
+		}
+	}
+
+	op := j.MatchOp
+	wantMax := op == ">" || op == ">=" // nearest-earlier picks the greatest match value
+
+	out := make([][]interface{}, 0, len(accRows))
+	for _, l := range accRows {
+		var best []interface{}
+		var bestVal interface{}
+		for _, r := range rightRows {
+			u := concatRow(l, r)
+			if hasOn && fmt.Sprintf("%v", u[onLeftIdx]) != fmt.Sprintf("%v", u[onRightIdx]) {
+				continue
+			}
+			lv, rv := u[mLeftIdx], u[mRightIdx]
+			if !whereMatches(lv, op, rv) {
+				continue
+			}
+			if best == nil {
+				best, bestVal = r, rv
+				continue
+			}
+			c := compareCells(rv, bestVal)
+			if (wantMax && c > 0) || (!wantMax && c < 0) {
+				best, bestVal = r, rv
+			}
+		}
+		if best == nil {
+			best = make([]interface{}, rightW) // no match: right side NULL
+		}
+		out = append(out, concatRow(l, best))
+	}
+	return out, unionCols, nil
 }
 
 func concatRow(l, r []interface{}) []interface{} {
