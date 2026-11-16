@@ -88,27 +88,11 @@ var bypassPatterns = []struct {
 		},
 	},
 	{
-		pattern: "pg_catalog.pg_type",
-		result: BypassResult{
-			Columns: []string{"oid", "typname", "typtype", "typlen"},
-			Rows:    [][]interface{}{},
-			Tag:     "SELECT 0",
-		},
-	},
-	{
 		pattern: "pg_catalog.pg_enum",
 		result: BypassResult{
 			Columns: []string{"oid", "enumtypid", "enumlabel"},
 			Rows:    [][]interface{}{},
 			Tag:     "SELECT 0",
-		},
-	},
-	{
-		pattern: "format_type(nullif",
-		result: BypassResult{
-			Columns: []string{"oid", "typname", "typtype", "typlen", "relkind", "base_type_name", "description"},
-			Rows:    [][]interface{}{},
-			Tag:     "SELECT 1",
 		},
 	},
 	{
@@ -120,6 +104,11 @@ var bypassPatterns = []struct {
 			Tag:     "SELECT 0",
 		},
 	},
+	// NOTE: the "format_type(nullif" pg_type queries are intentionally NOT
+	// bypassed here — they fall through to the catalog's getPgTypeFull, which
+	// returns the full type catalog (and filters by typname when the driver asks
+	// for one specific type). Bypassing them to an empty result made DBeaver NPE
+	// while resolving each column's data type.
 	{
 		// Generic empty-probe fallback. MUST stay last so the specific
 		// column-bearing probes above win first; a client runs "WHERE 1<>1" to

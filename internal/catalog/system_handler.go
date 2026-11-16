@@ -81,7 +81,7 @@ var systemRoutes = []systemRoute{
 	{hasAny("CURRENT_DATABASE()"), func(c *Catalog, _, _ string) *SystemResult { return c.getCurrentDatabase() }},
 	{hasAny("SHOW SEARCH_PATH"), func(c *Catalog, _, db string) *SystemResult { return c.getSearchPath(db) }},
 	{hasAny("SELECT VERSION()"), func(c *Catalog, _, _ string) *SystemResult { return c.getVersion() }},
-	{hasAny("FORMAT_TYPE(NULLIF"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgTypeFull() }},
+	{hasAny("FORMAT_TYPE(NULLIF"), func(c *Catalog, upper, _ string) *SystemResult { return c.getPgTypeFull(upper) }},
 	{hasAny("PG_GET_KEYWORDS"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgKeywords() }},
 	{hasAny("PG_CATALOG.PG_DATABASE", "FROM PG_DATABASE"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgDatabase() }},
 	{func(u string) bool { return strings.Contains(u, "PG_SETTINGS") && strings.Contains(u, "RESET_VAL") },
@@ -339,10 +339,49 @@ func (c *Catalog) getPgEnum() *SystemResult {
 	}
 }
 
-func (c *Catalog) getPgTypeFull() *SystemResult {
-	return &SystemResult{
-		Columns: []string{"oid", "oid_1", "typname", "typnamespace", "typowner", "typlen", "typbyval", "typtype", "typcategory", "typispreferred", "typisdefined", "typdelim", "typrelid", "typsubscript", "typelem", "typarray", "typinput", "typoutput", "typreceive", "typsend", "typmodin", "typmodout", "typanalyze", "typalign", "typstorage", "typnotnull", "typbasetype", "typtypmod", "typndims", "typcollation", "typdefaultbin", "typdefault", "typacl", "relkind", "base_type_name", "description"},
-		Rows: [][]interface{}{
+// typnameFilter extracts the value of a `typname = 'X'` predicate from an
+// upper-cased query (after parameter substitution), so a type lookup by name
+// returns only that type.
+func typnameFilter(upper string) (string, bool) {
+	search := upper
+	for {
+		idx := strings.Index(search, "TYPNAME")
+		if idx < 0 {
+			return "", false
+		}
+		rest := strings.TrimLeft(search[idx+len("TYPNAME"):], " ")
+		if strings.HasPrefix(rest, "=") { // a `typname = '...'` predicate, not a SELECT-list ref
+			rest = strings.TrimLeft(rest[1:], " ")
+			if strings.HasPrefix(rest, "'") {
+				rest = rest[1:]
+				if end := strings.Index(rest, "'"); end >= 0 {
+					return rest[:end], true
+				}
+			}
+		}
+		search = search[idx+len("TYPNAME"):]
+	}
+}
+
+func (c *Catalog) getPgTypeFull(upper string) *SystemResult {
+	cols := []string{"oid", "oid_1", "typname", "typnamespace", "typowner", "typlen", "typbyval", "typtype", "typcategory", "typispreferred", "typisdefined", "typdelim", "typrelid", "typsubscript", "typelem", "typarray", "typinput", "typoutput", "typreceive", "typsend", "typmodin", "typmodout", "typanalyze", "typalign", "typstorage", "typnotnull", "typbasetype", "typtypmod", "typndims", "typcollation", "typdefaultbin", "typdefault", "typacl", "relkind", "base_type_name", "description"}
+	res := c.pgTypeRows(cols)
+	// A lookup by name (DBeaver resolves each column's type this way) returns
+	// only the matching row; the name is at column index 2 (typname).
+	if want, ok := typnameFilter(upper); ok {
+		filtered := make([][]interface{}, 0, 1)
+		for _, row := range res {
+			if len(row) > 2 && strings.EqualFold(fmt.Sprintf("%v", row[2]), want) {
+				filtered = append(filtered, row)
+			}
+		}
+		res = filtered
+	}
+	return &SystemResult{Columns: cols, Rows: res, Tag: fmt.Sprintf("SELECT %d", len(res))}
+}
+
+func (c *Catalog) pgTypeRows(_ []string) [][]interface{} {
+	return [][]interface{}{
 			{"16", "16", "bool", "11", "10", "1", "t", "b", "B", "t", "t", ",", "0", "-", "0", "1000", "boolin", "boolout", "boolrecv", "boolsend", "-", "-", "-", "c", "p", "f", "0", "-1", "0", "0", nil, nil, nil, nil, nil, "boolean, format 't'/'f'"},
 			{"17", "17", "bytea", "11", "10", "-1", "f", "b", "U", "f", "t", ",", "0", "-", "0", "1001", "byteain", "byteaout", "bytearecv", "byteasend", "-", "-", "-", "i", "x", "f", "0", "-1", "0", "0", nil, nil, nil, nil, nil, "variable-length string, binary values escaped"},
 			{"18", "18", "char", "11", "10", "1", "t", "b", "Z", "f", "t", ",", "0", "-", "0", "1002", "charin", "charout", "charrecv", "charsend", "-", "-", "-", "c", "p", "f", "0", "-1", "0", "0", nil, nil, nil, nil, nil, "single character"},
@@ -538,8 +577,6 @@ func (c *Catalog) getPgTypeFull() *SystemResult {
 			{"14728", "14728", "_time_stamp", "14704", "10", "-1", "f", "b", "A", "f", "t", ",", "0", "array_subscript_handler", "14729", "0", "array_in", "array_out", "array_recv", "array_send", "-", "-", "array_typanalyze", "d", "x", "f", "0", "-1", "0", "0", nil, nil, nil, nil, nil, nil},
 			{"14731", "14731", "yes_or_no", "14704", "10", "-1", "f", "d", "S", "f", "t", ",", "0", "-", "0", "14730", "domain_in", "varcharout", "domain_recv", "varcharsend", "-", "-", "-", "i", "x", "f", "1043", "7", "0", "950", nil, nil, nil, nil, "character varying(3)", nil},
 			{"14730", "14730", "_yes_or_no", "14704", "10", "-1", "f", "b", "A", "f", "t", ",", "0", "array_subscript_handler", "14731", "0", "array_in", "array_out", "array_recv", "array_send", "-", "-", "array_typanalyze", "i", "x", "f", "0", "-1", "0", "950", nil, nil, nil, nil, nil, nil},
-		},
-		Tag: "SELECT 195",
 	}
 }
 

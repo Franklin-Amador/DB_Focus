@@ -114,10 +114,13 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat CatalogProvi
 			}
 		case 'P':
 			sess.descValid = false // a new statement invalidates the describe cache
+			sess.bindParams = nil
 			if err := handleParse(rw, payload, &lastPrepared); err != nil {
 				log.Printf("[conn] parse error: %v", err)
 			}
 		case 'B':
+			sess.bindParams = parseBindParams(payload)
+			sess.descValid = false // new bindings invalidate the describe cache
 			writeBindComplete(rw)
 			rw.Flush()
 		case 'D':
@@ -297,6 +300,7 @@ func handleParse(rw *bufio.ReadWriter, payload []byte, lastPrepared *string) err
 // the executor) WITHOUT writing to the wire. kind ("select1" | "set" | "result")
 // tells the caller how to frame the Describe/Execute replies.
 func computeExtended(handler QueryHandler, cat CatalogProvider, query string, sess *session) (cols []string, rows [][]interface{}, tag string, kind string, err error) {
+	query = substituteParams(query, sess.bindParams)
 	if isSelectOne(query) {
 		return nil, nil, "SELECT 1", "select1", nil
 	}

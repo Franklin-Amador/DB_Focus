@@ -31,6 +31,10 @@ type session struct {
 	descCols   []string
 	descRows   [][]interface{}
 	descTag    string
+
+	// bindParams holds the values of the last Bind, inlined into the prepared
+	// query at Describe/Execute time (the engine has no placeholder planning).
+	bindParams []string
 }
 
 // QueryHandler handles SQL queries and returns results for the wire layer.
