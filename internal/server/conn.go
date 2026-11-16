@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -166,11 +167,13 @@ func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogPr
 		}
 
 		if isSelectOne(stmt) {
+			logQuery("Q:select1", stmt)
 			handleSelectOne(rw)
 			continue
 		}
 
 		if result := checkBypass(stmt); result != nil {
+			logQuery("Q:bypass", stmt)
 			log.Printf("[msg Q] bypass query")
 			handleBypass(rw, result)
 			continue
@@ -178,6 +181,7 @@ func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogPr
 
 		// SET search_path changes the session schema (like PostgreSQL).
 		if target := searchPathTarget(stmt); target != "" {
+			logQuery("Q:set-path", stmt)
 			sess.schema = target
 			log.Printf("[msg Q] search_path -> %s", target)
 			writeEmptyRowDescription(rw)
@@ -186,6 +190,7 @@ func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogPr
 		}
 
 		if sysResult, ok := cat.HandleSystemQueryForSession(stmt, sess.database, sess.schema); ok {
+			logQuery(fmt.Sprintf("Q:system:%drows", len(sysResult.Rows)), stmt)
 			log.Printf("[msg Q] system query handled")
 			writeSystemResult(rw, sysResult)
 			continue
@@ -193,6 +198,7 @@ func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogPr
 
 		result, err := executeQuery(handler, stmt, sess)
 		if err != nil {
+			logQuery("Q:exec-ERROR: "+err.Error(), stmt)
 			log.Printf("[msg Q] handler error: %v", err)
 			writeError(rw, err.Error())
 			writeReady(rw)
@@ -200,10 +206,12 @@ func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogPr
 			return nil
 		}
 		if result == nil {
+			logQuery("Q:exec:ok-nil", stmt)
 			writeEmptyRowDescription(rw)
 			writeCommandComplete(rw, "OK")
 			continue
 		}
+		logQuery(fmt.Sprintf("Q:exec:%drows", len(result.Rows)), stmt)
 		if len(result.Columns) > 0 {
 			var sample []interface{}
 			if len(result.Rows) > 0 {
@@ -297,6 +305,7 @@ func handleExecuteWithDatabase(rw *bufio.ReadWriter, handler QueryHandler, lastP
 
 	log.Printf("[msg E] checking if SELECT 1...")
 	if isSelectOne(lastPrepared) {
+		logQuery("E:select1", lastPrepared)
 		writeDataRowSelectOne(rw)
 		writeCommandComplete(rw, "SELECT 1")
 		log.Printf("[msg E] sent CommandComplete: SELECT 1")
@@ -306,6 +315,7 @@ func handleExecuteWithDatabase(rw *bufio.ReadWriter, handler QueryHandler, lastP
 
 	log.Printf("[msg E] checking bypass...")
 	if result := checkBypass(lastPrepared); result != nil {
+		logQuery("E:bypass", lastPrepared)
 		log.Printf("[msg E] bypass query")
 		handleBypass(rw, result)
 		rw.Flush()
@@ -313,6 +323,7 @@ func handleExecuteWithDatabase(rw *bufio.ReadWriter, handler QueryHandler, lastP
 	}
 
 	if target := searchPathTarget(lastPrepared); target != "" {
+		logQuery("E:set-path", lastPrepared)
 		sess.schema = target
 		writeCommandComplete(rw, "SET")
 		rw.Flush()
@@ -323,6 +334,7 @@ func handleExecuteWithDatabase(rw *bufio.ReadWriter, handler QueryHandler, lastP
 	result, err := executeQuery(handler, lastPrepared, sess)
 	log.Printf("[msg E] handler.Handle() returned")
 	if err != nil {
+		logQuery("E:exec-ERROR: "+err.Error(), lastPrepared)
 		log.Printf("[msg E] handler error: %v", err)
 		writeError(rw, err.Error())
 		writeReady(rw) // ← importante para resincronizar
@@ -337,11 +349,13 @@ func handleExecuteWithDatabase(rw *bufio.ReadWriter, handler QueryHandler, lastP
 	// 	return
 	// }
 	if result == nil {
+		logQuery("E:exec:ok-nil", lastPrepared)
 		writeCommandComplete(rw, "OK")
 		log.Printf("[msg E] sent CommandComplete: OK")
 		rw.Flush()
 		return
 	}
+	logQuery(fmt.Sprintf("E:exec:%drows", len(result.Rows)), lastPrepared)
 	log.Printf("[msg E] result is not nil, tag=%q, cols=%d, rows=%d", result.Tag, len(result.Columns), len(result.Rows))
 	if len(result.Columns) > 0 {
 		var sample []interface{}

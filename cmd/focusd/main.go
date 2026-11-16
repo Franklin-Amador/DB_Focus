@@ -21,7 +21,15 @@ func main() {
 	maxConns := flag.Int("max-conns", 20, "max concurrent connections")
 	bufSize := flag.Int("buf-size", 4096, "buffer size per connection in bytes")
 	queryTimeout := flag.Duration("query-timeout", 60*time.Second, "max duration for a GUI query (0 = no limit)")
+	queryLog := flag.String("query-log", "", "if set, append every wire query and its disposition to this file (diagnostic)")
 	flag.Parse()
+
+	if *queryLog != "" {
+		if err := server.EnableQueryLog(*queryLog); err != nil {
+			log.Fatalf("focus: failed to open query log %q: %v", *queryLog, err)
+		}
+		log.Printf("focus: query log enabled -> %s", *queryLog)
+	}
 
 	cluster := catalog.NewCluster()
 
