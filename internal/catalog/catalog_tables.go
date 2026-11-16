@@ -338,25 +338,36 @@ func (c *Catalog) ForeignKeyReferencers(parentSchema, parentTable string) []FKRe
 
 	var refs []FKReferencer
 	for srcQualified, table := range allTables {
+		childSchema, childName := "public", srcQualified
+		if parts := splitQualifiedName(srcQualified); len(parts) == 2 {
+			childSchema, childName = parts[0], parts[1]
+		}
 		for _, constraint := range table.Constraints {
 			if constraint.Type != constants.ConstraintForeignKey {
 				continue
 			}
 			ref := constraint.ReferencedTable
-			if ref != parentTable && ref != parentQualified {
+			// A qualified reference must match exactly; a bare reference resolves
+			// within the child table's own schema (SQL default), so it only
+			// matches a parent in that same schema. This prevents a FK that names
+			// "autor" in one schema from being enforced against a different
+			// schema's "autor" during a cascade.
+			matched := ref == parentQualified
+			if !matched {
+				if parts := splitQualifiedName(ref); len(parts) != 2 && ref == parentTable && childSchema == parentSchema {
+					matched = true
+				}
+			}
+			if !matched {
 				continue
 			}
 			fkIdx := columnIndex(table.Columns, constraint.ColumnName)
 			if fkIdx == -1 {
 				continue
 			}
-			schema, name := parentTable, srcQualified
-			if parts := splitQualifiedName(srcQualified); len(parts) == 2 {
-				schema, name = parts[0], parts[1]
-			}
 			refs = append(refs, FKReferencer{
-				Schema:        schema,
-				TableName:     name,
+				Schema:        childSchema,
+				TableName:     childName,
 				Table:         table,
 				FKColumn:      constraint.ColumnName,
 				FKColIndex:    fkIdx,

@@ -38,18 +38,25 @@ func (e *Executor) enforceDeleteReferences(schema, tableName string, table *cata
 	if err != nil {
 		return err
 	}
-	visited := map[string]bool{}
-	for _, row := range deleted {
-		if err := e.cascadeDeleteRow(schema, tableName, table, row, refs, visited, 0); err != nil {
-			return err
+	// Two phases so a cascade is not left half-applied when a RESTRICT (or a
+	// SET NULL on a NOT NULL column) deeper in the graph blocks the delete:
+	// phase 1 walks the whole cascade checking only, phase 2 applies. Each phase
+	// uses its own visited set (phase 2 must revisit what phase 1 saw).
+	for _, apply := range []bool{false, true} {
+		visited := map[string]bool{}
+		for _, row := range deleted {
+			if err := e.cascadeDeleteRow(schema, tableName, table, row, refs, visited, 0, apply); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
 // cascadeDeleteRow enforces the referential action of each child FK against one
-// parent row being removed.
-func (e *Executor) cascadeDeleteRow(schema, tableName string, table *catalog.Table, row []interface{}, refs []catalog.FKReferencer, visited map[string]bool, depth int) error {
+// parent row being removed. When apply is false it only checks for RESTRICT /
+// NOT-NULL violations (walking CASCADE children too) without mutating anything.
+func (e *Executor) cascadeDeleteRow(schema, tableName string, table *catalog.Table, row []interface{}, refs []catalog.FKReferencer, visited map[string]bool, depth int, apply bool) error {
 	if depth > maxCascadeDepth {
 		return fmt.Errorf("foreign key cascade too deep (possible cycle) deleting from %s", qualifiedName(schemaOrPublic(schema), tableName))
 	}
@@ -74,16 +81,24 @@ func (e *Executor) cascadeDeleteRow(schema, tableName string, table *catalog.Tab
 					continue
 				}
 				visited[key] = true
-				if err := e.cascadeDeleteRow(ref.Schema, ref.TableName, ref.Table, childRow, childRefs, visited, depth+1); err != nil {
+				if err := e.cascadeDeleteRow(ref.Schema, ref.TableName, ref.Table, childRow, childRefs, visited, depth+1, apply); err != nil {
 					return err
 				}
 			}
-			deleteRowsWhere(ref.Table, ref.FKColIndex, value)
-			e.persistTableWarn(ref.Table, ref.Schema)
+			if apply {
+				deleteRowsWhere(ref.Table, ref.FKColIndex, value)
+				e.persistTableWarn(ref.Table, ref.Schema)
+			}
 
 		case "SET NULL":
-			if setNullRowsWhere(ref.Table, ref.FKColIndex, value) {
-				e.persistTableWarn(ref.Table, ref.Schema)
+			if fkColumnNotNull(ref) && hasMatchingRow(ref.Table, ref.FKColIndex, value) {
+				return fmt.Errorf("cannot SET NULL on table %s column %s: it is declared NOT NULL",
+					qualifiedName(ref.Schema, ref.TableName), ref.FKColumn)
+			}
+			if apply {
+				if setNullRowsWhere(ref.Table, ref.FKColIndex, value) {
+					e.persistTableWarn(ref.Table, ref.Schema)
+				}
 			}
 
 		default: // RESTRICT / NO ACTION
@@ -94,6 +109,12 @@ func (e *Executor) cascadeDeleteRow(schema, tableName string, table *catalog.Tab
 		}
 	}
 	return nil
+}
+
+// fkColumnNotNull reports whether a child FK column is declared NOT NULL (so it
+// cannot receive a SET NULL referential action).
+func fkColumnNotNull(ref catalog.FKReferencer) bool {
+	return ref.FKColIndex >= 0 && ref.FKColIndex < len(ref.Table.Columns) && ref.Table.Columns[ref.FKColIndex].NotNull
 }
 
 // enforceUpdateReferences applies ON UPDATE referential actions when the updated
@@ -123,21 +144,26 @@ func (e *Executor) enforceUpdateReferences(schema, tableName string, table *cata
 	}
 
 	parentLabel := qualifiedName(schemaOrPublic(schema), tableName)
-	visited := map[string]bool{}
-	for _, oldVal := range oldValues {
-		if catalog.ValuesEqual(oldVal, newValue) {
-			continue
-		}
-		if err := e.cascadeUpdateValue(parentLabel, refs, oldVal, newValue, visited, 0); err != nil {
-			return err
+	// Two phases (check, then apply) so a blocked update never leaves a cascade
+	// half-applied; see enforceDeleteReferences.
+	for _, apply := range []bool{false, true} {
+		visited := map[string]bool{}
+		for _, oldVal := range oldValues {
+			if catalog.ValuesEqual(oldVal, newValue) {
+				continue
+			}
+			if err := e.cascadeUpdateValue(parentLabel, refs, oldVal, newValue, visited, 0, apply); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
 // cascadeUpdateValue propagates a changed key value (oldValue -> newValue) to the
-// child foreign keys in refs.
-func (e *Executor) cascadeUpdateValue(parentLabel string, refs []catalog.FKReferencer, oldValue, newValue interface{}, visited map[string]bool, depth int) error {
+// child foreign keys in refs. When apply is false it only checks for RESTRICT /
+// NOT-NULL violations without mutating anything.
+func (e *Executor) cascadeUpdateValue(parentLabel string, refs []catalog.FKReferencer, oldValue, newValue interface{}, visited map[string]bool, depth int, apply bool) error {
 	if depth > maxCascadeDepth {
 		return fmt.Errorf("foreign key cascade too deep (possible cycle) updating %s", parentLabel)
 	}
@@ -148,8 +174,10 @@ func (e *Executor) cascadeUpdateValue(parentLabel string, refs []catalog.FKRefer
 		}
 		switch normalizeAction(ref.OnUpdate) {
 		case "CASCADE":
-			setColumnRowsWhere(ref.Table, ref.FKColIndex, oldValue, newValue)
-			e.persistTableWarn(ref.Table, ref.Schema)
+			if apply {
+				setColumnRowsWhere(ref.Table, ref.FKColIndex, oldValue, newValue)
+				e.persistTableWarn(ref.Table, ref.Schema)
+			}
 			// Propagate further if this child's FK column is itself referenced.
 			grand := e.catalog.ForeignKeyReferencers(ref.Schema, ref.TableName)
 			var relevant []catalog.FKReferencer
@@ -163,15 +191,21 @@ func (e *Executor) cascadeUpdateValue(parentLabel string, refs []catalog.FKRefer
 				if !visited[key] {
 					visited[key] = true
 					childLabel := qualifiedName(ref.Schema, ref.TableName)
-					if err := e.cascadeUpdateValue(childLabel, relevant, oldValue, newValue, visited, depth+1); err != nil {
+					if err := e.cascadeUpdateValue(childLabel, relevant, oldValue, newValue, visited, depth+1, apply); err != nil {
 						return err
 					}
 				}
 			}
 
 		case "SET NULL":
-			if setNullRowsWhere(ref.Table, ref.FKColIndex, oldValue) {
-				e.persistTableWarn(ref.Table, ref.Schema)
+			if fkColumnNotNull(ref) {
+				return fmt.Errorf("cannot SET NULL on table %s column %s: it is declared NOT NULL",
+					qualifiedName(ref.Schema, ref.TableName), ref.FKColumn)
+			}
+			if apply {
+				if setNullRowsWhere(ref.Table, ref.FKColIndex, oldValue) {
+					e.persistTableWarn(ref.Table, ref.Schema)
+				}
 			}
 
 		default: // RESTRICT / NO ACTION

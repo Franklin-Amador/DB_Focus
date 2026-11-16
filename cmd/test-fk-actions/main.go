@@ -151,6 +151,31 @@ func main() {
 	wantCount(ctx, e, "tree", 2)
 	fmt.Println("OK  self-FK RESTRICT bloquea sin deadlock")
 
+	fmt.Println("=== H · SET NULL sobre columna NOT NULL se bloquea (y no muta) ===")
+	run(ctx, e, "CREATE TABLE p2 (id INT PRIMARY KEY)")
+	run(ctx, e, "CREATE TABLE c2 (id INT PRIMARY KEY, p_id INT NOT NULL REFERENCES p2(id) ON DELETE SET NULL)")
+	run(ctx, e, "INSERT INTO p2 VALUES (1)")
+	run(ctx, e, "INSERT INTO c2 VALUES (1, 1)")
+	mustFail(ctx, e, "DELETE FROM p2 WHERE id = 1", "DELETE con SET NULL sobre NOT NULL")
+	wantCount(ctx, e, "c2", 1) // la fila hija no se tocó
+	if got := fmt.Sprintf("%v", cell(ctx, e, "SELECT p_id FROM c2 WHERE id = 1")); got != "1" {
+		log.Fatalf("H: c2.p_id no debía mutar, got %v", got)
+	}
+	fmt.Println("OK  bloqueado en la fase de chequeo; hija intacta")
+
+	fmt.Println("=== I · cascada no parcial: RESTRICT bloquea antes de cascadear (two-phase) ===")
+	run(ctx, e, "CREATE TABLE root (id INT PRIMARY KEY)")
+	run(ctx, e, "CREATE TABLE casc (id INT PRIMARY KEY, root_id INT REFERENCES root(id) ON DELETE CASCADE)")
+	run(ctx, e, "CREATE TABLE rest (id INT PRIMARY KEY, root_id INT REFERENCES root(id))") // RESTRICT default
+	run(ctx, e, "INSERT INTO root VALUES (1)")
+	run(ctx, e, "INSERT INTO casc VALUES (1, 1)")
+	run(ctx, e, "INSERT INTO rest VALUES (1, 1)")
+	mustFail(ctx, e, "DELETE FROM root WHERE id = 1", "DELETE con CASCADE+RESTRICT mezclados")
+	wantCount(ctx, e, "casc", 1) // NO se cascadeó parcialmente
+	wantCount(ctx, e, "rest", 1)
+	wantCount(ctx, e, "root", 1)
+	fmt.Println("OK  el RESTRICT bloqueó todo; la rama CASCADE no se aplicó")
+
 	fmt.Println("=== G · persistencia de las acciones (reload) ===")
 	testFKActionPersistence(ctx)
 
