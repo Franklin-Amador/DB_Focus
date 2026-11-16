@@ -113,6 +113,7 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat CatalogProvi
 				return
 			}
 		case 'P':
+			sess.descValid = false // a new statement invalidates the describe cache
 			if err := handleParse(rw, payload, &lastPrepared); err != nil {
 				log.Printf("[conn] parse error: %v", err)
 			}
@@ -120,9 +121,9 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat CatalogProvi
 			writeBindComplete(rw)
 			rw.Flush()
 		case 'D':
-			handleDescribe(rw, lastPrepared)
+			handleDescribe(rw, handler, cat, payload, lastPrepared, sess)
 		case 'E':
-			handleExecute(rw, handler, lastPrepared, sess)
+			handleExecute(rw, handler, cat, lastPrepared, sess)
 		case 'S':
 			if err := writeReady(rw); err != nil {
 				log.Printf("[msg S] writeReady error: %v", err)
@@ -282,103 +283,145 @@ func handleParse(rw *bufio.ReadWriter, payload []byte, lastPrepared *string) err
 	return nil
 }
 
-func handleDescribe(rw *bufio.ReadWriter, lastPrepared string) {
-	if isSelectOne(lastPrepared) {
-		writeRowDescriptionSelectOne(rw)
-		log.Printf("[msg D] sent RowDescription")
-	} else {
+// computeExtended resolves an extended-protocol query through the same layers as
+// the simple-query path (SELECT 1, bypass, SET search_path, system catalog, then
+// the executor) WITHOUT writing to the wire. kind ("select1" | "set" | "result")
+// tells the caller how to frame the Describe/Execute replies.
+func computeExtended(handler QueryHandler, cat CatalogProvider, query string, sess *session) (cols []string, rows [][]interface{}, tag string, kind string, err error) {
+	if isSelectOne(query) {
+		return nil, nil, "SELECT 1", "select1", nil
+	}
+	if result := checkBypass(query); result != nil {
+		return result.Columns, result.Rows, result.Tag, "result", nil
+	}
+	if target := searchPathTarget(query); target != "" {
+		sess.schema = target
+		return nil, nil, "SET", "set", nil
+	}
+	if sysResult, ok := cat.HandleSystemQueryForSession(query, sess.database, sess.schema); ok {
+		return sysResult.Columns, sysResult.Rows, sysResult.Tag, "result", nil
+	}
+	result, err := executeQuery(handler, query, sess)
+	if err != nil {
+		return nil, nil, "", "", err
+	}
+	if result == nil {
+		return nil, nil, "OK", "result", nil
+	}
+	return result.Columns, result.Rows, result.Tag, "result", nil
+}
+
+// handleDescribe answers a Describe ('S' statement or 'P' portal). It resolves
+// the prepared query now and caches the outcome, then sends the real
+// RowDescription so the client has a field structure for the rows Execute will
+// send. This fixes the JDBC "received tuples, but no field structure" error that
+// came from always replying NoData here.
+func handleDescribe(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogProvider, payload []byte, lastPrepared string, sess *session) {
+	statement := len(payload) > 0 && payload[0] == 'S'
+
+	cols, rows, tag, kind, err := computeExtended(handler, cat, lastPrepared, sess)
+	if err != nil {
+		// Report nothing now; Execute will re-run and surface the error.
+		sess.descValid = false
+		if statement {
+			writeParameterDescription(rw)
+		}
 		writeNoData(rw)
-		log.Printf("[msg D] sent NoData")
+		rw.Flush()
+		return
+	}
+
+	// Cache the successful outcome so Execute replays it (single execution).
+	sess.descQuery = lastPrepared
+	sess.descValid = true
+	sess.descKind = kind
+	sess.descCols = cols
+	sess.descRows = rows
+	sess.descTag = tag
+	logQuery(fmt.Sprintf("D:%s:%drows", kind, len(rows)), lastPrepared)
+
+	if statement {
+		writeParameterDescription(rw)
+	}
+	if kind == "result" && len(cols) > 0 {
+		var sample []interface{}
+		if len(rows) > 0 {
+			sample = rows[0]
+		}
+		writeRowDescriptionForResult(rw, cols, sample)
+	} else {
+		// SELECT 1 still needs its field structure; SET/empty results have none.
+		if kind == "select1" {
+			writeRowDescriptionSelectOne(rw)
+		} else {
+			writeNoData(rw)
+		}
 	}
 	rw.Flush()
 }
 
-func handleExecuteWithDatabase(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared string, sess *session) {
-	log.Printf("[msg E] executing: %q", lastPrepared) // agrega esto
+// handleExecute replays the result Describe already computed for this exact
+// query (so there is one execution and the RowDescription already went out), or
+// resolves and sends it fresh when the client executed without describing.
+func handleExecute(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogProvider, lastPrepared string, sess *session) {
+	if sess.descValid && sess.descQuery == lastPrepared {
+		sess.descValid = false
+		switch sess.descKind {
+		case "select1":
+			writeDataRowSelectOne(rw)
+			writeCommandComplete(rw, "SELECT 1")
+		case "set":
+			writeCommandComplete(rw, "SET")
+		default: // result — RowDescription was already sent by Describe
+			for _, row := range sess.descRows {
+				writeDataRow(rw, row)
+			}
+			writeCommandComplete(rw, sess.descTag)
+		}
+		rw.Flush()
+		return
+	}
+	handleExecuteFresh(rw, handler, cat, lastPrepared, sess)
+}
 
+// handleExecuteFresh runs the extended-protocol query and sends the full reply
+// (RowDescription + DataRows + CommandComplete) for a client that executed
+// without a preceding Describe.
+func handleExecuteFresh(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogProvider, lastPrepared string, sess *session) {
 	if lastPrepared == "" {
 		writeError(rw, "no prepared query")
-		// NO writeReady() aquí - esperar Sync
 		rw.Flush()
 		return
 	}
-
-	log.Printf("[msg E] checking if SELECT 1...")
-	if isSelectOne(lastPrepared) {
-		logQuery("E:select1", lastPrepared)
-		writeDataRowSelectOne(rw)
-		writeCommandComplete(rw, "SELECT 1")
-		log.Printf("[msg E] sent CommandComplete: SELECT 1")
-		rw.Flush()
-		return
-	}
-
-	log.Printf("[msg E] checking bypass...")
-	if result := checkBypass(lastPrepared); result != nil {
-		logQuery("E:bypass", lastPrepared)
-		log.Printf("[msg E] bypass query")
-		handleBypass(rw, result)
-		rw.Flush()
-		return
-	}
-
-	if target := searchPathTarget(lastPrepared); target != "" {
-		logQuery("E:set-path", lastPrepared)
-		sess.schema = target
-		writeCommandComplete(rw, "SET")
-		rw.Flush()
-		return
-	}
-
-	log.Printf("[msg E] calling handler.Handle()...")
-	result, err := executeQuery(handler, lastPrepared, sess)
-	log.Printf("[msg E] handler.Handle() returned")
+	cols, rows, tag, kind, err := computeExtended(handler, cat, lastPrepared, sess)
 	if err != nil {
 		logQuery("E:exec-ERROR: "+err.Error(), lastPrepared)
-		log.Printf("[msg E] handler error: %v", err)
 		writeError(rw, err.Error())
-		writeReady(rw) // ← importante para resincronizar
+		writeReady(rw) // resync
 		rw.Flush()
 		return
 	}
-
-	// if err != nil {
-	// 	log.Printf("[msg E] handler error: %v", err)
-	// 	// Devolver vacío en vez de error para no matar la conexión
-	// 	writeCommandComplete(rw, "SELECT 0")
-	// 	return
-	// }
-	if result == nil {
-		logQuery("E:exec:ok-nil", lastPrepared)
-		writeCommandComplete(rw, "OK")
-		log.Printf("[msg E] sent CommandComplete: OK")
-		rw.Flush()
-		return
-	}
-	logQuery(fmt.Sprintf("E:exec:%drows", len(result.Rows)), lastPrepared)
-	log.Printf("[msg E] result is not nil, tag=%q, cols=%d, rows=%d", result.Tag, len(result.Columns), len(result.Rows))
-	if len(result.Columns) > 0 {
-		var sample []interface{}
-		if len(result.Rows) > 0 {
-			sample = result.Rows[0]
+	switch kind {
+	case "select1":
+		writeDataRowSelectOne(rw)
+		writeCommandComplete(rw, "SELECT 1")
+	case "set":
+		writeCommandComplete(rw, "SET")
+	default:
+		logQuery(fmt.Sprintf("E:exec:%drows", len(rows)), lastPrepared)
+		if len(cols) > 0 {
+			var sample []interface{}
+			if len(rows) > 0 {
+				sample = rows[0]
+			}
+			writeRowDescriptionForResult(rw, cols, sample)
+			for _, row := range rows {
+				writeDataRow(rw, row)
+			}
 		}
-		writeRowDescriptionForResult(rw, result.Columns, sample)
-		for _, row := range result.Rows {
-			writeDataRow(rw, row)
-		}
-	} else if len(result.Rows) > 0 {
-		// Hay filas pero no columnas — problema en el executor
-		log.Printf("[msg E] WARNING: rows without columns, skipping data")
+		writeCommandComplete(rw, tag)
 	}
-	log.Printf("[msg E] about to send CommandComplete with tag: %q", result.Tag)
-	writeCommandComplete(rw, result.Tag)
-	log.Printf("[msg E] sent CommandComplete: %s", result.Tag)
 	rw.Flush()
-	log.Printf("[msg E] flushed buffer")
-}
-
-func handleExecute(rw *bufio.ReadWriter, handler QueryHandler, lastPrepared string, sess *session) {
-	handleExecuteWithDatabase(rw, handler, lastPrepared, sess)
 }
 
 func executeQuery(handler QueryHandler, query string, sess *session) (*QueryResult, error) {

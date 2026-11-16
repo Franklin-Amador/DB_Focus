@@ -19,6 +19,18 @@ type CatalogProvider interface {
 type session struct {
 	database string
 	schema   string
+
+	// Extended-protocol describe cache. In the extended flow the client sends
+	// Describe (expecting a RowDescription) before Execute. The engine resolves
+	// results lazily, so Describe runs the query, stashes the outcome here, and
+	// Execute replays it — a single execution with a correct field structure,
+	// which fixes "received tuples, but no field structure for them".
+	descQuery  string // the prepared query the cache belongs to
+	descValid  bool   // a result (success) is cached for descQuery
+	descKind   string // "select1" | "set" | "result"
+	descCols   []string
+	descRows   [][]interface{}
+	descTag    string
 }
 
 // QueryHandler handles SQL queries and returns results for the wire layer.

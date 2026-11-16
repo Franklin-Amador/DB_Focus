@@ -109,6 +109,13 @@ func writeNoData(rw *bufio.ReadWriter) error {
 	return writeMessage(rw, 'n', nil)
 }
 
+// writeParameterDescription sends a ParameterDescription ('t') with no bound
+// parameter types (the engine does not plan placeholders). Sent before the
+// RowDescription in a statement Describe.
+func writeParameterDescription(rw *bufio.ReadWriter) error {
+	return writeMessage(rw, 't', []byte{0, 0}) // int16 count = 0
+}
+
 func writeAuthRequestCleartext(rw *bufio.ReadWriter) error {
 	return writeMessage(rw, 'R', int32ToBytes(3))
 }

@@ -88,14 +88,6 @@ var bypassPatterns = []struct {
 		},
 	},
 	{
-		pattern: "WHERE 1<>1",
-		result: BypassResult{
-			Columns: []string{},
-			Rows:    [][]interface{}{},
-			Tag:     "SELECT 0",
-		},
-	},
-	{
 		pattern: "pg_catalog.pg_type",
 		result: BypassResult{
 			Columns: []string{"oid", "typname", "typtype", "typlen"},
@@ -117,6 +109,26 @@ var bypassPatterns = []struct {
 			Columns: []string{"oid", "typname", "typtype", "typlen", "relkind", "base_type_name", "description"},
 			Rows:    [][]interface{}{},
 			Tag:     "SELECT 1",
+		},
+	},
+	{
+		// JDBC drivers probe column metadata with "... FROM pg_class WHERE 1<>1".
+		pattern: "reltype FROM pg_catalog.pg_class",
+		result: BypassResult{
+			Columns: []string{"reltype"},
+			Rows:    [][]interface{}{},
+			Tag:     "SELECT 0",
+		},
+	},
+	{
+		// Generic empty-probe fallback. MUST stay last so the specific
+		// column-bearing probes above win first; a client runs "WHERE 1<>1" to
+		// learn a result's columns, so returning zero columns here breaks it.
+		pattern: "WHERE 1<>1",
+		result: BypassResult{
+			Columns: []string{"col"},
+			Rows:    [][]interface{}{},
+			Tag:     "SELECT 0",
 		},
 	},
 }
