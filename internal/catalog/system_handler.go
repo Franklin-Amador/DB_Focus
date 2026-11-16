@@ -84,7 +84,17 @@ var systemRoutes = []systemRoute{
 	{hasAny("FORMAT_TYPE(NULLIF"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgTypeFull() }},
 	{hasAny("PG_GET_KEYWORDS"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgKeywords() }},
 	{hasAny("PG_CATALOG.PG_DATABASE", "FROM PG_DATABASE"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgDatabase() }},
-	{hasAny("PG_CATALOG.PG_SETTINGS"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgSettings() }},
+	{func(u string) bool { return strings.Contains(u, "PG_SETTINGS") && strings.Contains(u, "RESET_VAL") },
+		func(c *Catalog, _, db string) *SystemResult {
+			// JDBC drivers read reset_val of search_path to learn the default schema.
+			schema := resolveDatabaseSchema(db)
+			val := "\"$user\", public"
+			if schema != "public" {
+				val = schema + ", public"
+			}
+			return &SystemResult{Columns: []string{"reset_val"}, Rows: [][]interface{}{{val}}, Tag: "SELECT 1"}
+		}},
+	{hasAny("PG_CATALOG.PG_SETTINGS", "FROM PG_SETTINGS"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgSettings() }},
 	{isPsqlDtQuery, func(c *Catalog, upper, db string) *SystemResult {
 		includeTables, includeViews := relationKindsFromQuery(upper)
 		return c.getDtRelations(db, includeTables, includeViews)
@@ -220,18 +230,17 @@ func (c *Catalog) getPgRoles() *SystemResult {
 // some drivers drop the schema).
 func (c *Catalog) getPgNamespace() *SystemResult {
 	rows := [][]interface{}{
-		{"14704", "14704", "information_schema", "10", "{postgres=UC/postgres,=U/postgres}", nil},
-		{"11", "11", "pg_catalog", "10", "{postgres=UC/postgres,=U/postgres}", "system catalog schema"},
-		{"99", "99", "pg_toast", "10", nil, "reserved schema for TOAST tables"},
-		{"2200", "2200", "public", "10", "{postgres=UC/postgres,=U/postgres}", "standard public schema"},
+		{int32(14704), int32(14704), "information_schema", int32(10), "{postgres=UC/postgres,=U/postgres}", nil},
+		{int32(11), int32(11), "pg_catalog", int32(10), "{postgres=UC/postgres,=U/postgres}", "system catalog schema"},
+		{int32(99), int32(99), "pg_toast", int32(10), nil, "reserved schema for TOAST tables"},
+		{int32(2200), int32(2200), "public", int32(10), "{postgres=UC/postgres,=U/postgres}", "standard public schema"},
 	}
-	oid := 16384
+	oid := int32(16384)
 	for _, s := range c.ListSchemas() {
 		if s.Name == "public" {
 			continue
 		}
-		id := fmt.Sprintf("%d", oid)
-		rows = append(rows, []interface{}{id, id, s.Name, "10", nil, nil})
+		rows = append(rows, []interface{}{oid, oid, s.Name, int32(10), nil, nil})
 		oid++
 	}
 	return &SystemResult{
