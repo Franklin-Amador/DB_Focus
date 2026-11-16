@@ -384,6 +384,175 @@ func (p *Parser) parseCreateProcedure() (ast.Statement, error) {
 	return stmt, nil
 }
 
+// parseCreateFunction parses a practical subset of CREATE FUNCTION:
+//
+//	CREATE [OR REPLACE] FUNCTION name([p TYPE, ...])
+//	    RETURNS { TABLE (col TYPE, ...) | SETOF type | type }
+//	    [LANGUAGE x] [other decorations]
+//	    AS $$ [BEGIN] RETURN QUERY <SELECT>; [END;] $$
+//
+// The SELECT is captured and run when the function is used in a FROM clause.
+// General plpgsql control flow is not supported.
+func (p *Parser) parseCreateFunction(replace bool) (ast.Statement, error) {
+	p.next() // consume FUNCTION
+	stmt := &ast.CreateFunction{Replace: replace}
+
+	if p.cur.Type == TokenIf {
+		p.next()
+		if !p.expect(TokenNot) || !p.expect(TokenExists) {
+			return nil, p.errorf("expected IF NOT EXISTS")
+		}
+		stmt.IfNotExists = true
+	}
+
+	stmt.Name = p.parseQualifiedIdent()
+	if stmt.Name.Name == "" {
+		return nil, p.errorf("expected function name")
+	}
+
+	if !p.expect(TokenLParen) {
+		return nil, p.errorf("expected ( after function name")
+	}
+	for p.cur.Type != TokenRParen && p.cur.Type != TokenEOF {
+		// Accept "name TYPE" or a bare "TYPE" (unnamed parameter). An optional
+		// leading IN/OUT/INOUT mode is skipped.
+		if up := strings.ToUpper(p.cur.Literal); up == "IN" || up == "OUT" || up == "INOUT" {
+			p.next()
+		}
+		first := p.cur.Literal
+		p.next()
+		param := ast.Parameter{}
+		if p.cur.Type == TokenRParen || p.cur.Type == TokenComma {
+			param.Type = first // unnamed parameter: only a type was given
+		} else {
+			param.Name = ast.Identifier{Name: first}
+			param.Type = p.cur.Literal
+			p.next()
+		}
+		stmt.Parameters = append(stmt.Parameters, param)
+		if p.cur.Type == TokenComma {
+			p.next()
+			continue
+		}
+		break
+	}
+	if !p.expect(TokenRParen) {
+		return nil, p.errorf("expected ) after function parameters")
+	}
+
+	if p.cur.Type != TokenReturns {
+		return nil, p.errorf("expected RETURNS")
+	}
+	p.next()
+	switch {
+	case p.cur.Type == TokenTable:
+		p.next()
+		if !p.expect(TokenLParen) {
+			return nil, p.errorf("expected ( after RETURNS TABLE")
+		}
+		for p.cur.Type != TokenRParen && p.cur.Type != TokenEOF {
+			colName := p.cur.Literal
+			p.next()
+			colType := p.cur.Literal
+			p.next()
+			stmt.Returns = append(stmt.Returns, ast.Parameter{Name: ast.Identifier{Name: colName}, Type: colType})
+			if p.cur.Type == TokenComma {
+				p.next()
+				continue
+			}
+			break
+		}
+		if !p.expect(TokenRParen) {
+			return nil, p.errorf("expected ) after RETURNS TABLE columns")
+		}
+	case strings.EqualFold(p.cur.Literal, "SETOF"):
+		stmt.SetOf = true
+		p.next()
+		stmt.ReturnsType = p.cur.Literal
+		p.next()
+	default:
+		stmt.ReturnsType = p.cur.Literal
+		p.next()
+	}
+
+	// Skip decorations between RETURNS and AS (LANGUAGE x, STABLE, VOLATILE,
+	// STRICT, SECURITY DEFINER, COST n, ...) until the body marker.
+	for p.cur.Type != TokenAs && p.cur.Type != TokenDollarString && p.cur.Type != TokenEOF {
+		if strings.EqualFold(p.cur.Literal, "LANGUAGE") {
+			p.next()
+			stmt.Language = p.cur.Literal
+		}
+		p.next()
+	}
+	if p.cur.Type == TokenAs {
+		p.next()
+	}
+
+	var content string
+	switch p.cur.Type {
+	case TokenDollarString:
+		content = p.cur.Literal
+		p.next()
+	case TokenString:
+		content = p.cur.Literal
+		p.next()
+	default:
+		return nil, p.errorf("expected $$...$$ or '...' function body after AS")
+	}
+
+	sel, selText, err := parseFunctionBody(content)
+	if err != nil {
+		return nil, err
+	}
+	stmt.Query = sel
+	stmt.QueryText = selText
+	return stmt, nil
+}
+
+// parseFunctionBody extracts the SELECT the function returns from its body
+// text, tolerating a leading BEGIN / RETURN QUERY and a trailing ; END;.
+func parseFunctionBody(content string) (*ast.Select, string, error) {
+	inner := NewParser(content)
+	for inner.cur.Type != TokenSelect && inner.cur.Type != TokenWith && inner.cur.Type != TokenEOF {
+		inner.next()
+	}
+	if inner.cur.Type == TokenEOF {
+		return nil, "", fmt.Errorf("function body must contain a SELECT (use RETURN QUERY <select>)")
+	}
+	start := inner.cur.Pos
+	node, err := inner.parseSelect()
+	if err != nil {
+		return nil, "", err
+	}
+	sel, ok := node.(*ast.Select)
+	if !ok {
+		return nil, "", fmt.Errorf("function body is not a SELECT")
+	}
+	text := strings.TrimSpace(inner.sliceFrom(start))
+	text = strings.TrimRight(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(text), ";")), ";")
+	return sel, text, nil
+}
+
+func (p *Parser) parseDropFunction() (ast.Statement, error) {
+	p.next() // consume FUNCTION
+	ifExists, err := p.parseOptionalIfExists()
+	if err != nil {
+		return nil, err
+	}
+	name := p.parseQualifiedIdent()
+	if name.Name == "" {
+		return nil, p.errorf("expected function name")
+	}
+	// Tolerate an optional argument-type signature: DROP FUNCTION f(int, text).
+	if p.cur.Type == TokenLParen {
+		for p.cur.Type != TokenRParen && p.cur.Type != TokenEOF {
+			p.next()
+		}
+		p.expect(TokenRParen)
+	}
+	return &ast.DropFunction{Name: name, IfExists: ifExists}, nil
+}
+
 func (p *Parser) parseCreateTrigger() (ast.Statement, error) {
 	p.next()
 	if p.cur.Type != TokenIdent {
@@ -619,10 +788,14 @@ func (p *Parser) parseCreate() (ast.Statement, error) {
 			return nil, p.errorf("expected REPLACE after OR")
 		}
 		p.next()
-		if p.cur.Type != TokenView {
-			return nil, p.errorf("expected VIEW after CREATE OR REPLACE")
+		switch p.cur.Type {
+		case TokenView:
+			return p.parseCreateView(true)
+		case TokenFunction:
+			return p.parseCreateFunction(true)
+		default:
+			return nil, p.errorf("expected VIEW or FUNCTION after CREATE OR REPLACE")
 		}
-		return p.parseCreateView(true)
 	}
 
 	if parse, ok := createParsers[p.cur.Type]; ok {

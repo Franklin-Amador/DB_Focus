@@ -210,6 +210,21 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 		return nil, err
 	}
 
+	// Snapshot the affected rows before mutating so AFTER triggers can see the
+	// OLD (pre-update) and NEW (post-update) images. NEW mirrors what
+	// performUpdate writes: the target column set to the new value.
+	var oldRows, newRows [][]interface{}
+	if e.triggersEnabled {
+		oldRows, _ = e.snapshotMatchedRows(table, stmt.Where)
+		for _, r := range oldRows {
+			nr := append([]interface{}(nil), r...)
+			if colIdx >= 0 && colIdx < len(nr) {
+				nr[colIdx] = stmt.Value.Value
+			}
+			newRows = append(newRows, nr)
+		}
+	}
+
 	// Perform update
 	updateCount, err := e.performUpdate(table, stmt, colIdx)
 	if err != nil {
@@ -220,11 +235,13 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 	// Persist to storage
 	e.persistTableWarn(table, schema)
 
-	// Execute AFTER UPDATE triggers
+	// Execute AFTER UPDATE triggers, once per affected row (FOR EACH ROW).
 	if e.triggersEnabled {
 		qual := qualifiedName(schema, stmt.Table.Name)
-		if err := e.executeTriggers(ctx, qual, constants.TriggerAfter, constants.TriggerUpdate, nil, nil); err != nil {
-			return nil, fmt.Errorf("AFTER UPDATE trigger failed: %w", err)
+		for i := range oldRows {
+			if err := e.executeTriggers(ctx, qual, constants.TriggerAfter, constants.TriggerUpdate, oldRows[i], newRows[i]); err != nil {
+				return nil, fmt.Errorf("AFTER UPDATE trigger failed: %w", err)
+			}
 		}
 	}
 
@@ -270,6 +287,13 @@ func (e *Executor) executeDelete(ctx context.Context, stmt *ast.Delete) (*Result
 		return nil, err
 	}
 
+	// Snapshot the rows about to be deleted so AFTER triggers can see the OLD
+	// image (NEW is nil for DELETE).
+	var oldRows [][]interface{}
+	if e.triggersEnabled {
+		oldRows, _ = e.snapshotMatchedRows(table, stmt.Where)
+	}
+
 	// Perform deletion
 	deleteCount, err := e.performDelete(table, stmt)
 	if err != nil {
@@ -280,11 +304,13 @@ func (e *Executor) executeDelete(ctx context.Context, stmt *ast.Delete) (*Result
 	// Persist to storage
 	e.persistTableWarn(table, schema)
 
-	// Execute AFTER DELETE triggers
+	// Execute AFTER DELETE triggers, once per deleted row (FOR EACH ROW).
 	if e.triggersEnabled {
 		qual := qualifiedName(schema, stmt.Table.Name)
-		if err := e.executeTriggers(ctx, qual, constants.TriggerAfter, constants.TriggerDelete, nil, nil); err != nil {
-			return nil, fmt.Errorf("AFTER DELETE trigger failed: %w", err)
+		for _, old := range oldRows {
+			if err := e.executeTriggers(ctx, qual, constants.TriggerAfter, constants.TriggerDelete, old, nil); err != nil {
+				return nil, fmt.Errorf("AFTER DELETE trigger failed: %w", err)
+			}
 		}
 	}
 

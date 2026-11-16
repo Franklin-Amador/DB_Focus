@@ -1,10 +1,128 @@
 package catalog
 
 import (
+	"strconv"
 	"testing"
 
 	"dbf/internal/ast"
 )
+
+// TestPgAttributeIncludesViewColumns guards the fix that lets a JDBC driver
+// (DBeaver) resolve a view's columns by oid. Before the fix pg_attribute only
+// listed table columns, so views appeared with no columns and were unusable.
+func TestPgAttributeIncludesViewColumns(t *testing.T) {
+	c := New()
+
+	cols := []Column{{Name: "id", Type: "INT"}, {Name: "name", Type: "TEXT"}}
+	if err := c.CreateTable("users", cols, nil); err != nil {
+		t.Fatalf("create table users: %v", err)
+	}
+	viewCols := []Column{{Name: "uid", Type: "TEXT"}, {Name: "label", Type: "TEXT"}}
+	if err := c.CreateView("v_users", viewCols, &ast.Select{Table: ast.Identifier{Name: "users"}, Star: true}); err != nil {
+		t.Fatalf("create view v_users: %v", err)
+	}
+
+	viewOID := relationOID("public", "v_users")
+	query := "SELECT c.relname, a.* FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid WHERE a.attrelid = " +
+		itoa(viewOID)
+	res, ok := c.HandleSystemQueryForDatabase(query, "public")
+	if !ok {
+		t.Fatalf("pg_attribute query should be handled")
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 view columns, got %d: %v", len(res.Rows), res.Rows)
+	}
+	// attname is the last projected column.
+	got := map[string]bool{}
+	for _, row := range res.Rows {
+		got[row[len(row)-1].(string)] = true
+	}
+	if !got["uid"] || !got["label"] {
+		t.Fatalf("expected view columns uid+label, got %v", got)
+	}
+}
+
+// TestPgClassResolvesSchemaByNamespaceOID guards that relations show up under
+// the schema DBeaver asks for via "WHERE relnamespace = <oid>", not just the
+// session's search_path head.
+func TestPgClassResolvesSchemaByNamespaceOID(t *testing.T) {
+	c := New()
+	if err := c.CreateSchema("ventas"); err != nil {
+		t.Fatalf("create schema ventas: %v", err)
+	}
+	cols := []Column{{Name: "id", Type: "INT"}}
+	if err := c.CreateTable("facturas", cols, nil, "ventas"); err != nil {
+		t.Fatalf("create table facturas: %v", err)
+	}
+
+	nsOID := schemaOID("ventas")
+	// Session schema is public, but the query asks for the ventas namespace.
+	query := "SELECT c.oid, c.relname FROM pg_catalog.pg_class c WHERE c.relnamespace = " + itoa(nsOID)
+	res, ok := c.HandleSystemQueryForDatabase(query, "public")
+	if !ok {
+		t.Fatalf("pg_class query should be handled")
+	}
+	found := false
+	for _, row := range res.Rows {
+		if row[2] == "facturas" {
+			found = true
+			if row[3] != nsOID {
+				t.Fatalf("expected relnamespace %d for facturas, got %v", nsOID, row[3])
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected facturas under ventas namespace, got %v", res.Rows)
+	}
+}
+
+// TestPgProcListsFunctions guards that DBeaver's function listing (pg_proc,
+// filtered by pronamespace oid) returns the schema's functions with prokind='f'.
+func TestPgProcListsFunctions(t *testing.T) {
+	c := New()
+	if err := c.CreateFunction(&Function{
+		Name:    "fn_listar",
+		Schema:  "public",
+		Returns: []Column{{Name: "id", Type: "INTEGER"}, {Name: "titulo", Type: "VARCHAR"}},
+		Query:   &ast.Select{Table: ast.Identifier{Name: "cursos"}, Star: true},
+	}, false, false); err != nil {
+		t.Fatalf("create function: %v", err)
+	}
+
+	nsOID := schemaOID("public")
+	query := "SELECT P.OID AS POID, P.* FROM PG_CATALOG.PG_PROC P WHERE P.PRONAMESPACE=" + itoa(nsOID) + " ORDER BY P.PRONAME"
+	res, ok := c.HandleSystemQueryForDatabase(query, "public")
+	if !ok {
+		t.Fatalf("pg_proc query should be handled")
+	}
+	idx := func(name string) int {
+		for i, col := range res.Columns {
+			if col == name {
+				return i
+			}
+		}
+		t.Fatalf("pg_proc result missing column %q", name)
+		return -1
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 function row, got %d", len(res.Rows))
+	}
+	row := res.Rows[0]
+	if row[idx("proname")] != "fn_listar" {
+		t.Fatalf("expected proname fn_listar, got %v", row[idx("proname")])
+	}
+	if row[idx("prokind")] != "f" {
+		t.Fatalf("expected prokind 'f', got %v", row[idx("prokind")])
+	}
+	if row[idx("proretset")] != true {
+		t.Fatalf("expected proretset true for RETURNS TABLE, got %v", row[idx("proretset")])
+	}
+	if row[idx("pronamespace")] != nsOID {
+		t.Fatalf("expected pronamespace %d, got %v", nsOID, row[idx("pronamespace")])
+	}
+}
+
+func itoa(n int32) string { return strconv.Itoa(int(n)) }
 
 func TestHandleSystemQueryForDatabaseFiltersTables(t *testing.T) {
 	c := New()

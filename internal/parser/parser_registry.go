@@ -62,6 +62,7 @@ func init() {
 		TokenSchema:    (*Parser).parseCreateSchema,
 		TokenDatabase:  (*Parser).parseCreateDatabase,
 		TokenProcedure: (*Parser).parseCreateProcedure,
+		TokenFunction:  func(p *Parser) (ast.Statement, error) { return p.parseCreateFunction(false) },
 		TokenTrigger:   (*Parser).parseCreateTrigger,
 		TokenJob:       (*Parser).parseCreateJob,
 	}
@@ -73,6 +74,7 @@ func init() {
 		TokenSchema:    (*Parser).parseDropSchema,
 		TokenDatabase:  (*Parser).parseDropDatabase,
 		TokenProcedure: (*Parser).parseDropProcedure,
+		TokenFunction:  (*Parser).parseDropFunction,
 		TokenTrigger:   (*Parser).parseDropTrigger,
 		TokenJob:       (*Parser).parseDropJob,
 	}

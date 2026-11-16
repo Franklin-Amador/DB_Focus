@@ -7,7 +7,7 @@ import { runQuery } from './editor.js';
 import { loadDatabases, getDatabases, loadSchemas, getSchemas } from './schemas.js';
 
 let schemaData  = [];
-let objectsData = { triggers: [], jobs: [], procedures: [] };
+let objectsData = { triggers: [], jobs: [], procedures: [], functions: [] };
 let tableNames = [], colNames = [];
 
 export async function loadSidebar() {
@@ -17,7 +17,8 @@ export async function loadSidebar() {
     await loadSchemas();
     const [schemaRes, objRes] = await Promise.all([apiSchema(), apiObjects()]);
     schemaData  = Array.isArray(schemaRes) ? schemaRes : [];
-    objectsData = objRes    || { triggers: [], jobs: [], procedures: [] };
+    objectsData = objRes    || { triggers: [], jobs: [], procedures: [], functions: [] };
+    if (!objectsData.functions) objectsData.functions = [];
 
     tableNames = schemaData.map(t => t.name);
     colNames   = schemaData.flatMap(t => (t.columns||[]).map(c => c.name));
@@ -127,6 +128,22 @@ export function renderSidebar(filter) {
             </div>`;
   }), procs.length);
 
+  // ── Functions
+  const fns = (objectsData.functions || []).filter(fn => !f || fn.name.toLowerCase().includes(f));
+  html += sectionHTML(icon('proc'), 'Functions', 'sec-funcs', fns.map(fn => {
+    const sig = (fn.params && fn.params.length ? fn.params.join(', ') : 'no params') +
+                (fn.returns ? ' → ' + fn.returns : '');
+    // JSON.stringify encodes the JS-string context (quotes, backslashes,
+    // newlines) and escAttr then encodes the HTML-attribute context, so a
+    // crafted object name (quoted identifiers may contain ') cannot break out
+    // of the inline handler. escAttr alone is not enough: it turns ' into &#39;
+    // which the browser decodes back to ' inside onclick.
+    return `<div class="t-item" title="${escAttr(sig)}" onclick="insertSelectFrom(${escAttr(JSON.stringify(fn.name))})">
+              <span class="ico">ƒ</span>
+              <span class="lbl">${escHtml(fn.name)}</span>
+            </div>`;
+  }), fns.length);
+
   // ── Triggers
   const trigs = objectsData.triggers.filter(t => !f || t.name.toLowerCase().includes(f));
   html += sectionHTML(icon('trigger'), 'Triggers', 'sec-trigs', trigs.map(t =>
@@ -195,6 +212,11 @@ export function insertColRef(table, col) {
 
 export function insertCall(name) {
   state.editor.setValue(`CALL ${name}();`);
+  state.editor.focus();
+}
+
+export function insertSelectFrom(name) {
+  state.editor.setValue(`SELECT * FROM ${name}();`);
   state.editor.focus();
 }
 

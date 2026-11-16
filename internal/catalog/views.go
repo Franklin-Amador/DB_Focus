@@ -135,6 +135,23 @@ func (c *Catalog) GetAllViewsInSchema(schema string) map[string]*View {
 	return result
 }
 
+// GetAllViewsAcrossSchemas returns every view keyed by "schema.name", mirroring
+// GetAllTables. Used by the pg_attribute responder so a JDBC driver can resolve
+// a view's columns by oid (without this a view shows up with no columns and is
+// unusable as a relation).
+func (c *Catalog) GetAllViewsAcrossSchemas() map[string]*View {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	result := make(map[string]*View)
+	for schema, views := range c.views {
+		for name, v := range views {
+			result[schema+"."+name] = v
+		}
+	}
+	return result
+}
+
 // FindDependentViews returns names of views that depend on the given view
 func (c *Catalog) FindDependentViews(viewName, schema string) []string {
 	c.mu.RLock()

@@ -15,6 +15,7 @@ func newCatalog(name string, cl *Cluster) *Catalog {
 		tables:     make(map[string]map[string]*Table),
 		views:      make(map[string]map[string]*View),
 		procedures: make(map[string]*Procedure),
+		functions:  make(map[string]*Function),
 		triggers:   make(map[string][]*Trigger),
 		jobs:       make(map[string]*Job),
 	}

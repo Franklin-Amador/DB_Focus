@@ -278,6 +278,27 @@ func (p *Parser) parseTableRef() (ast.Identifier, error) {
 		id.Schema, id.Name = parts[0], parts[1]
 	}
 	p.next()
+	// A set-returning function call as a row source: FROM fn_name(arg, ...).
+	// A name followed by "(" is unambiguously a call (tables never are).
+	if p.cur.Type == TokenLParen {
+		id.IsCall = true
+		p.next()
+		for p.cur.Type != TokenRParen && p.cur.Type != TokenEOF {
+			lit, err := p.parseLiteral()
+			if err != nil {
+				return ast.Identifier{}, err
+			}
+			id.Args = append(id.Args, lit)
+			if p.cur.Type == TokenComma {
+				p.next()
+				continue
+			}
+			break
+		}
+		if !p.expect(TokenRParen) {
+			return ast.Identifier{}, p.errorf("expected ) after function arguments")
+		}
+	}
 	switch {
 	case p.cur.Type == TokenAs:
 		p.next()

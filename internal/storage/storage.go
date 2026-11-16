@@ -37,6 +37,12 @@ type ProcedureStore interface {
 	DeleteProcedure(name string) error
 }
 
+// FunctionStore persists SQL functions.
+type FunctionStore interface {
+	SaveFunction(fn *catalog.Function, schema string) error
+	DeleteFunction(name, schema string) error
+}
+
 // TriggerStore persists triggers.
 type TriggerStore interface {
 	SaveTrigger(trigger *catalog.Trigger) error
@@ -80,6 +86,7 @@ type Backend interface {
 	TableStore
 	ViewStore
 	ProcedureStore
+	FunctionStore
 	TriggerStore
 	JobStore
 	SchemaStore

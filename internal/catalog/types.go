@@ -84,12 +84,27 @@ type Job struct {
 	Mu       sync.RWMutex
 }
 
+// Function is a practical subset of a PostgreSQL function: a set-returning or
+// scalar function whose body is a single SELECT (captured as Query/QueryText).
+// It is run when the function is referenced in a FROM clause.
+type Function struct {
+	Name        string
+	Schema      string
+	Parameters  []ast.Parameter
+	Returns     []Column // RETURNS TABLE columns (output schema)
+	SetOf       bool
+	ReturnsType string
+	Query       *ast.Select
+	QueryText   string // canonical SELECT SQL, re-parsed on load
+}
+
 type Catalog struct {
 	name       string                       // database this catalog belongs to
 	cluster    *Cluster                     // owning cluster (nil when detached)
 	tables     map[string]map[string]*Table // schema -> table -> *Table
 	views      map[string]map[string]*View  // schema -> view -> *View
 	procedures map[string]*Procedure
+	functions  map[string]*Function // key: "schema.name"
 	triggers   map[string][]*Trigger // key: table name, value: triggers for that table
 	jobs       map[string]*Job
 	mu         sync.RWMutex

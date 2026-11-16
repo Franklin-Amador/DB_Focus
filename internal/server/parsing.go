@@ -258,6 +258,37 @@ func isReadOnlyQuery(query string) bool {
 	return false
 }
 
+// transactionControl recognizes transaction-control and session statements that
+// the engine has no real support for but that clients (DBeaver, pgjdbc) send
+// around their work. The engine auto-commits every statement, so these are
+// no-ops answered with the matching command tag — without this a bare BEGIN
+// reaches the parser and errors ("unexpected token BEGIN"), which aborts the
+// surrounding operation and the client's metadata refresh. SHOW TRANSACTION
+// ISOLATION LEVEL returns a row so the driver can read it.
+func transactionControl(query string) (cols []string, rows [][]interface{}, tag string, ok bool) {
+	s := strings.ToUpper(strings.TrimSpace(strings.TrimRight(strings.TrimSpace(query), ";")))
+	s = strings.Join(strings.Fields(s), " ") // collapse newlines/extra spaces
+	switch {
+	case s == "BEGIN", s == "BEGIN TRANSACTION", s == "BEGIN WORK", s == "START TRANSACTION":
+		return nil, nil, "BEGIN", true
+	case s == "COMMIT", s == "COMMIT TRANSACTION", s == "COMMIT WORK", s == "END TRANSACTION":
+		return nil, nil, "COMMIT", true
+	case s == "ROLLBACK", s == "ROLLBACK TRANSACTION", s == "ROLLBACK WORK", s == "ABORT":
+		return nil, nil, "ROLLBACK", true
+	case strings.HasPrefix(s, "ROLLBACK TO "):
+		return nil, nil, "ROLLBACK", true
+	case strings.HasPrefix(s, "SAVEPOINT "):
+		return nil, nil, "SAVEPOINT", true
+	case strings.HasPrefix(s, "RELEASE "):
+		return nil, nil, "RELEASE", true
+	case strings.HasPrefix(s, "SET TRANSACTION "), strings.HasPrefix(s, "SET SESSION CHARACTERISTICS"):
+		return nil, nil, "SET", true
+	case strings.HasPrefix(s, "SHOW") && strings.Contains(s, "TRANSACTION ISOLATION LEVEL"):
+		return []string{"transaction_isolation"}, [][]interface{}{{"read committed"}}, "SHOW", true
+	}
+	return nil, nil, "", false
+}
+
 func isSelectOne(query string) bool {
 	q := strings.TrimSpace(query)
 	q = strings.TrimRight(q, ";")

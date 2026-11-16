@@ -72,6 +72,15 @@ func (e *Executor) executeSelectMain(ctx context.Context, stmt *ast.Select) (*Re
 		return e.executeSelectNoTable(stmt)
 	}
 
+	// Handle a set-returning function call as the row source: FROM fn(args).
+	if stmt.Table.IsCall {
+		fnTable, err := e.resolveFunctionTable(ctx, stmt.Table)
+		if err != nil {
+			return nil, err
+		}
+		return e.executeSelectFromTable(ctx, stmt, fnTable)
+	}
+
 	// Handle JOIN queries
 	if stmt.Join != nil {
 		return e.executeJoinSelect(ctx, stmt)

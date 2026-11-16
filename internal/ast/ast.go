@@ -16,6 +16,10 @@ type Identifier struct {
 	// (e.g. ROW_NUMBER() OVER (...)). Name is then empty and Alias carries the
 	// output column name.
 	Window *WindowFunc
+	// IsCall marks a FROM reference that is a set-returning function call
+	// (e.g. FROM fn_listar_cursos()); Args carries the call arguments.
+	IsCall bool
+	Args   []Literal
 }
 
 // WindowFunc is a window-function call: FUNC(arg) OVER (PARTITION BY ... ORDER BY ...).
@@ -331,6 +335,33 @@ type CreateProcedure struct {
 }
 
 func (CreateProcedure) stmtNode() {}
+
+// CreateFunction is a practical subset of PostgreSQL's CREATE FUNCTION: a
+// set-returning (RETURNS TABLE / SETOF) or scalar function whose body is a
+// single RETURN QUERY <SELECT> (or a bare SELECT). The SELECT is captured as
+// Query (+ QueryText for stable persistence); the engine runs it when the
+// function is referenced in a FROM clause. General plpgsql is not supported.
+type CreateFunction struct {
+	Name        Identifier // schema carried in Alias (DDL convention)
+	Parameters  []Parameter
+	Returns     []Parameter // columns of RETURNS TABLE(...); empty for scalar/SETOF
+	ReturnsType string      // RETURNS <type> / SETOF <type> (when not TABLE)
+	SetOf       bool
+	Query       *Select // the SELECT the function returns
+	QueryText   string  // verbatim SELECT text, for stable persistence
+	Replace     bool
+	IfNotExists bool
+	Language    string
+}
+
+func (CreateFunction) stmtNode() {}
+
+type DropFunction struct {
+	Name     Identifier // schema in Alias
+	IfExists bool
+}
+
+func (DropFunction) stmtNode() {}
 
 type CallProcedure struct {
 	Name      Identifier

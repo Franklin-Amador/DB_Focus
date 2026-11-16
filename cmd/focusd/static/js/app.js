@@ -7,7 +7,7 @@ import {
 import { addTab, selectTab, closeTab, renameTab } from './tabs.js';
 import {
   loadSidebar, filterTree, toggleSection, toggleCols,
-  quickSelect, insertColRef, insertCall, toggleSidebar, closeSidebar,
+  quickSelect, insertColRef, insertCall, insertSelectFrom, toggleSidebar, closeSidebar,
 } from './sidebar.js';
 import {
   sortResults, filterResults, loadMoreRows, copyRowInsert,
@@ -78,7 +78,7 @@ Object.assign(window, {
   // pestañas de consulta (markup generado)
   addTab, selectTab, closeTab, renameTab,
   // sidebar (markup generado)
-  filterTree, toggleSection, toggleCols, quickSelect, insertColRef, insertCall,
+  filterTree, toggleSection, toggleCols, quickSelect, insertColRef, insertCall, insertSelectFrom,
   // resultados / historial (markup generado)
   sortResults, restoreHistory, filterResults, loadMoreRows, copyRowInsert,
   exportResultsCSV, exportResultsJSON, closeCellModal, copyCellModal,

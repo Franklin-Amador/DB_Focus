@@ -125,10 +125,18 @@ type apiProcInfo struct {
 	BodyText string   `json:"bodyText,omitempty"`
 }
 
+type apiFuncInfo struct {
+	Name       string   `json:"name"`
+	Params     []string `json:"params"`
+	Returns    string   `json:"returns,omitempty"`
+	Definition string   `json:"definition,omitempty"`
+}
+
 type apiObjectsResponse struct {
 	Triggers   []apiTriggerInfo `json:"triggers"`
 	Jobs       []apiJobInfo     `json:"jobs"`
 	Procedures []apiProcInfo    `json:"procedures"`
+	Functions  []apiFuncInfo    `json:"functions"`
 }
 
 type apiValidateResponse struct {
@@ -420,6 +428,12 @@ func handleAPIObjects(cl *catalog.Cluster) http.HandlerFunc {
 		jobs := cat.GetAllJobs()
 		procs := cat.GetAllProcedures()
 
+		schema := r.URL.Query().Get("schema")
+		if schema == "" {
+			schema = "public"
+		}
+		funcs := cat.ListFunctions(schema)
+
 		sort.Slice(triggers, func(i, j int) bool { return triggers[i].Name < triggers[j].Name })
 		sort.Slice(jobs, func(i, j int) bool { return jobs[i].Name < jobs[j].Name })
 		sort.Slice(procs, func(i, j int) bool { return procs[i].Name < procs[j].Name })
@@ -428,6 +442,7 @@ func handleAPIObjects(cl *catalog.Cluster) http.HandlerFunc {
 			Triggers:   make([]apiTriggerInfo, 0, len(triggers)),
 			Jobs:       make([]apiJobInfo, 0, len(jobs)),
 			Procedures: make([]apiProcInfo, 0, len(procs)),
+			Functions:  make([]apiFuncInfo, 0, len(funcs)),
 		}
 
 		for _, t := range triggers {
@@ -475,6 +490,29 @@ func handleAPIObjects(cl *catalog.Cluster) http.HandlerFunc {
 				Name:     p.Name,
 				Params:   params,
 				BodyText: body,
+			})
+		}
+		for _, fn := range funcs {
+			params := make([]string, len(fn.Parameters))
+			for i, param := range fn.Parameters {
+				params[i] = strings.TrimSpace(param.Name.Name + " " + param.Type)
+			}
+			returns := fn.ReturnsType
+			if len(fn.Returns) > 0 {
+				cols := make([]string, len(fn.Returns))
+				for i, rc := range fn.Returns {
+					cols[i] = rc.Name + " " + rc.Type
+				}
+				returns = "TABLE(" + strings.Join(cols, ", ") + ")"
+			}
+			if fn.SetOf {
+				returns = "SETOF " + fn.ReturnsType
+			}
+			resp.Functions = append(resp.Functions, apiFuncInfo{
+				Name:       fn.Name,
+				Params:     params,
+				Returns:    returns,
+				Definition: fn.QueryText,
 			})
 		}
 

@@ -191,6 +191,22 @@ func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogPr
 			continue
 		}
 
+		if cols, rows, tag, ok := transactionControl(stmt); ok {
+			logQuery("Q:txn:"+tag, stmt)
+			if len(cols) > 0 {
+				var sample []interface{}
+				if len(rows) > 0 {
+					sample = rows[0]
+				}
+				writeRowDescriptionForResult(rw, cols, sample)
+				for _, row := range rows {
+					writeDataRow(rw, row)
+				}
+			}
+			writeCommandComplete(rw, tag)
+			continue
+		}
+
 		if result := checkBypass(stmt); result != nil {
 			logQuery("Q:bypass", stmt)
 			log.Printf("[msg Q] bypass query")
@@ -311,6 +327,9 @@ func computeExtended(handler QueryHandler, cat CatalogProvider, query string, se
 	// system-catalog route and the executor, which need the real values.
 	if isSelectOne(query) {
 		return nil, nil, "SELECT 1", "select1", nil
+	}
+	if cols, rows, tag, ok := transactionControl(query); ok {
+		return cols, rows, tag, "result", nil
 	}
 	if result := checkBypass(query); result != nil {
 		return result.Columns, result.Rows, result.Tag, "result", nil

@@ -81,6 +81,8 @@ const (
 	TokenFalse      TokenType = "FALSE"
 	TokenIdentity   TokenType = "IDENTITY"
 	TokenProcedure  TokenType = "PROCEDURE"
+	TokenFunction   TokenType = "FUNCTION"
+	TokenReturns    TokenType = "RETURNS"
 	TokenBegin      TokenType = "BEGIN"
 	TokenCall       TokenType = "CALL"
 	TokenDeclare    TokenType = "DECLARE"
@@ -194,6 +196,8 @@ var keywords = map[string]TokenType{
 	"FALSE":      TokenFalse,
 	"IDENTITY":   TokenIdentity,
 	"PROCEDURE":  TokenProcedure,
+	"FUNCTION":   TokenFunction,
+	"RETURNS":    TokenReturns,
 	"BEGIN":      TokenBegin,
 	"CALL":       TokenCall,
 	"DECLARE":    TokenDeclare,

@@ -47,6 +47,78 @@ func oidFilterFromQuery(upper string) (int32, bool) {
 	return 0, false
 }
 
+// schemaOID derives a stable namespace oid from a schema name, so pg_namespace
+// (the schema listing) and pg_class.relnamespace agree on the same id — a JDBC
+// driver (DBeaver, pgAdmin) reads a schema's oid from pg_namespace and then
+// lists that schema's relations with "WHERE relnamespace = <oid>". The fixed
+// system/public oids match real PostgreSQL so clients that special-case them
+// keep working.
+func schemaOID(name string) int32 {
+	switch name {
+	case "public":
+		return 2200
+	case "pg_catalog":
+		return 11
+	case "information_schema":
+		return 14704
+	case "pg_toast":
+		return 99
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(name))
+	return int32(16384 + h.Sum32()%1000000)
+}
+
+// oidEqFilter extracts the oid of a "<key> = N" predicate from an (upper-cased,
+// parameter-substituted) query. Used to learn which namespace a driver's
+// per-schema metadata query is asking about.
+func oidEqFilter(upper, key string) (int32, bool) {
+	idx := strings.Index(upper, key)
+	for idx >= 0 {
+		rest := strings.TrimLeft(upper[idx+len(key):], " ")
+		if strings.HasPrefix(rest, "=") {
+			rest = strings.TrimLeft(rest[1:], " ")
+			j := 0
+			for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+				j++
+			}
+			if j > 0 {
+				if n, err := strconv.Atoi(rest[:j]); err == nil {
+					return int32(n), true
+				}
+			}
+		}
+		next := strings.Index(upper[idx+len(key):], key)
+		if next < 0 {
+			break
+		}
+		idx = idx + len(key) + next
+	}
+	return 0, false
+}
+
+// relnamespaceFilter extracts the oid of a "relnamespace = N" predicate —
+// DBeaver lists one schema's relations this way.
+func relnamespaceFilter(upper string) (int32, bool) {
+	return oidEqFilter(upper, "RELNAMESPACE")
+}
+
+// schemaForOID maps a namespace oid back to a schema name by scanning the known
+// schemas (system plus user), returning "" when none matches.
+func (c *Catalog) schemaForOID(oid int32) string {
+	for _, fixed := range []string{"public", "pg_catalog", "information_schema", "pg_toast"} {
+		if schemaOID(fixed) == oid {
+			return fixed
+		}
+	}
+	for _, s := range c.ListSchemas() {
+		if schemaOID(s.Name) == oid {
+			return s.Name
+		}
+	}
+	return ""
+}
+
 // SystemResult represents a result from a system catalog query
 type SystemResult struct {
 	Columns []string
@@ -137,7 +209,15 @@ var systemRoutes = []systemRoute{
 	{hasAny("PG_CATALOG.PG_SETTINGS", "FROM PG_SETTINGS"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgSettings() }},
 	{isPsqlDtQuery, func(c *Catalog, upper, db string) *SystemResult {
 		includeTables, includeViews := relationKindsFromQuery(upper)
-		return c.getDtRelations(db, includeTables, includeViews)
+		schema := resolveDatabaseSchema(db)
+		// DBeaver's navigator lists one schema via "WHERE relnamespace = <oid>";
+		// resolve it so each schema node shows its own relations.
+		if oid, ok := relnamespaceFilter(upper); ok {
+			if name := c.schemaForOID(oid); name != "" {
+				schema = name
+			}
+		}
+		return c.getDtRelations(schema, includeTables, includeViews)
 	}},
 	{hasAny("PG_CATALOG.PG_ROLES", "FROM PG_ROLES"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgRoles() }},
 	{func(u string) bool {
@@ -147,7 +227,9 @@ var systemRoutes = []systemRoute{
 	// pg_attribute before pg_class: the column query joins both, and must be
 	// answered as columns, not as a relation list.
 	{hasAny("PG_CATALOG.PG_ATTRIBUTE"), func(c *Catalog, upper, _ string) *SystemResult { return c.getPgAttribute(upper) }},
-	{hasAny("PG_CATALOG.PG_CLASS"), func(c *Catalog, _, db string) *SystemResult { return c.getPgClass(db) }},
+	{hasAny("PG_CATALOG.PG_CLASS"), func(c *Catalog, upper, db string) *SystemResult { return c.getPgClass(upper, db) }},
+	{hasAny("PG_CATALOG.PG_PROC", "FROM PG_PROC"), func(c *Catalog, upper, db string) *SystemResult { return c.getPgProc(upper, db) }},
+	{hasAny("PG_DEPEND"), func(c *Catalog, _, _ string) *SystemResult { return getPgDepend() }},
 	{hasAny("PG_CATALOG.PG_CONSTRAINT"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgConstraint() }},
 	{hasAny("PG_IS_IN_RECOVERY", "PG_IS_WAL_REPLAY_PAUSED"),
 		canned([]string{"inrecovery", "isreplaypaused"}, []interface{}{false, false}, "SELECT 1")},
@@ -159,6 +241,7 @@ var systemRoutes = []systemRoute{
 		canned([]string{"gss_authenticated", "encrypted"}, []interface{}{false, false}, "SELECT 1")},
 	{hasAny("INFORMATION_SCHEMA.TABLES"), func(c *Catalog, _, db string) *SystemResult { return c.getISchemaTables(db) }},
 	{hasAny("INFORMATION_SCHEMA.COLUMNS"), func(c *Catalog, _, db string) *SystemResult { return c.getISchemaColumns(db) }},
+	{hasAny("INFORMATION_SCHEMA.ROUTINES"), func(c *Catalog, _, db string) *SystemResult { return c.getISchemaRoutines(db) }},
 	{hasAny("INFORMATION_SCHEMA."), func(c *Catalog, _, _ string) *SystemResult { return emptyResult("SELECT 0") }},
 	{hasAny("WHERE 1<>1"), func(c *Catalog, _, _ string) *SystemResult { return emptyResult("SELECT 0") }},
 	{hasAny("PG_CATALOG."), func(c *Catalog, _, _ string) *SystemResult { return emptyResult("SELECT 0") }},
@@ -277,13 +360,12 @@ func (c *Catalog) getPgNamespace() *SystemResult {
 		{int32(99), int32(99), "pg_toast", int32(10), nil, "reserved schema for TOAST tables"},
 		{int32(2200), int32(2200), "public", int32(10), "{postgres=UC/postgres,=U/postgres}", "standard public schema"},
 	}
-	oid := int32(16384)
 	for _, s := range c.ListSchemas() {
 		if s.Name == "public" {
 			continue
 		}
+		oid := schemaOID(s.Name)
 		rows = append(rows, []interface{}{oid, oid, s.Name, int32(10), nil, nil})
-		oid++
 	}
 	return &SystemResult{
 		Columns: []string{"oid", "oid_1", "nspname", "nspowner", "nspacl", "description"},
@@ -640,8 +722,38 @@ func (c *Catalog) getISchemaColumns(currentDatabase string) *SystemResult {
 	}
 }
 
-func (c *Catalog) getPgClass(currentDatabase string) *SystemResult {
+// getISchemaRoutines lists the database's functions (information_schema.routines).
+func (c *Catalog) getISchemaRoutines(currentDatabase string) *SystemResult {
 	targetSchema := resolveDatabaseSchema(currentDatabase)
+	rows := make([][]interface{}, 0)
+	for _, fn := range c.ListFunctions(targetSchema) {
+		retType := fn.ReturnsType
+		if len(fn.Returns) > 0 {
+			retType = "record"
+		}
+		if retType == "" {
+			retType = "void"
+		}
+		rows = append(rows, []interface{}{c.Name(), fn.Schema, fn.Name, "FUNCTION", retType})
+	}
+	return &SystemResult{
+		Columns: []string{"routine_catalog", "routine_schema", "routine_name", "routine_type", "data_type"},
+		Rows:    rows,
+		Tag:     fmt.Sprintf("SELECT %d", len(rows)),
+	}
+}
+
+func (c *Catalog) getPgClass(upper, currentDatabase string) *SystemResult {
+	targetSchema := resolveDatabaseSchema(currentDatabase)
+	// DBeaver lists one schema at a time with "WHERE relnamespace = <oid>".
+	// Resolve that oid back to the schema it is asking about, so relations show
+	// up under the correct schema node (not just the session's search_path head).
+	if oid, ok := relnamespaceFilter(upper); ok {
+		if name := c.schemaForOID(oid); name != "" {
+			targetSchema = name
+		}
+	}
+	nsOID := schemaOID(targetSchema)
 
 	c.mu.RLock()
 	tables := c.tables[targetSchema]
@@ -654,11 +766,11 @@ func (c *Catalog) getPgClass(currentDatabase string) *SystemResult {
 			continue
 		}
 		oid := relationOID(targetSchema, name)
-		rows = append(rows, []interface{}{oid, oid, name, int32(2200), "r", int32(10), int32(0)})
+		rows = append(rows, []interface{}{oid, oid, name, nsOID, "r", int32(10), int32(0)})
 	}
 	for name := range views {
 		oid := relationOID(targetSchema, name)
-		rows = append(rows, []interface{}{oid, oid, name, int32(2200), "v", int32(10), int32(0)})
+		rows = append(rows, []interface{}{oid, oid, name, nsOID, "v", int32(10), int32(0)})
 	}
 	return &SystemResult{
 		Columns: []string{"oid", "oid2", "relname", "relnamespace", "relkind", "relowner", "reltype"},
@@ -687,6 +799,23 @@ func (c *Catalog) getPgAttribute(upper string) *SystemResult {
 		}
 		for i, col := range table.Columns {
 			rows = append(rows, []interface{}{oid, name, pgTypeOIDFor(col.Type), int32(i + 1), col.NotNull, int32(-1), false, col.Name})
+		}
+	}
+
+	// Views are relations too: a driver reads a view's columns the same way
+	// ("WHERE attrelid = <view oid>"). Without these rows DBeaver shows the view
+	// with no columns and cannot browse its data.
+	for vName, view := range c.GetAllViewsAcrossSchemas() {
+		schema, name := "public", vName
+		if parts := splitQualifiedName(vName); len(parts) == 2 {
+			schema, name = parts[0], parts[1]
+		}
+		oid := relationOID(schema, name)
+		if hasFilter && oid != wantOID {
+			continue
+		}
+		for i, col := range view.Columns {
+			rows = append(rows, []interface{}{oid, name, pgTypeOIDFor(col.Type), int32(i + 1), false, int32(-1), false, col.Name})
 		}
 	}
 	return &SystemResult{
@@ -720,6 +849,130 @@ func pgTypeOIDFor(declared string) int32 {
 		return 1114
 	default:
 		return 25 // text
+	}
+}
+
+// funcOID derives a stable object id for a function (distinct from a table of
+// the same name).
+func funcOID(schema, name string) int32 {
+	return relationOID(schema, "func:"+name)
+}
+
+// getPgProc answers DBeaver's function listing:
+//
+//	SELECT p.oid as poid, p.*, ... FROM pg_catalog.pg_proc p
+//	WHERE p.pronamespace = <schema oid> ORDER BY p.proname
+//
+// It returns one row per function with the pg_proc columns DBeaver reads by
+// name (proname, prokind='f', prorettype, proargtypes, proargnames/modes, ...).
+func (c *Catalog) getPgProc(upper, currentDatabase string) *SystemResult {
+	targetSchema := resolveDatabaseSchema(currentDatabase)
+	if oid, ok := oidEqFilter(upper, "PRONAMESPACE"); ok {
+		if name := c.schemaForOID(oid); name != "" {
+			targetSchema = name
+		}
+	}
+	nsOID := schemaOID(targetSchema)
+
+	cols := []string{
+		"poid", "oid", "proname", "pronamespace", "proowner", "prolang",
+		"procost", "prorows", "provariadic", "prokind", "prosecdef",
+		"proleakproof", "proisstrict", "proretset", "provolatile", "proparallel",
+		"pronargs", "pronargdefaults", "prorettype", "proargtypes",
+		"proallargtypes", "proargmodes", "proargnames", "proargdefaults",
+		"prosrc", "probin", "proconfig", "proacl", "arg_defaults", "description",
+	}
+
+	rows := make([][]interface{}, 0)
+	for _, fn := range c.ListFunctions(targetSchema) {
+		oid := funcOID(targetSchema, fn.Name)
+
+		// IN parameters first, then RETURNS TABLE columns as OUT (mode 't').
+		var inOIDs []string
+		var allOIDs, modes, names []string
+		for _, p := range fn.Parameters {
+			t := pgTypeOIDFor(p.Type)
+			inOIDs = append(inOIDs, strconv.Itoa(int(t)))
+			allOIDs = append(allOIDs, strconv.Itoa(int(t)))
+			modes = append(modes, "i")
+			names = append(names, p.Name.Name)
+		}
+		for _, rc := range fn.Returns {
+			allOIDs = append(allOIDs, strconv.Itoa(int(pgTypeOIDFor(rc.Type))))
+			modes = append(modes, "t")
+			names = append(names, rc.Name)
+		}
+
+		retType := int32(2278) // void
+		retSet := fn.SetOf
+		if len(fn.Returns) > 0 {
+			retType = 2249 // record (RETURNS TABLE)
+			retSet = true
+		} else if fn.ReturnsType != "" {
+			retType = pgTypeOIDFor(fn.ReturnsType)
+		}
+
+		// proargtypes is an oidvector (space-separated); the *allargtypes/modes/
+		// names are array literals. Null them when there is nothing to describe.
+		var allArr, modeArr, nameArr interface{}
+		if len(allOIDs) > 0 {
+			allArr = "{" + strings.Join(allOIDs, ",") + "}"
+			modeArr = "{" + strings.Join(modes, ",") + "}"
+			nameArr = "{" + strings.Join(names, ",") + "}"
+		}
+
+		rows = append(rows, []interface{}{
+			oid, oid, fn.Name, nsOID, int32(10), int32(14),
+			float64(100), float64(1000), int32(0), "f", false,
+			false, false, retSet, "v", "u",
+			int32(len(fn.Parameters)), int32(0), retType, strings.Join(inOIDs, " "),
+			allArr, modeArr, nameArr, nil,
+			fn.QueryText, nil, nil, nil, nil, nil,
+		})
+	}
+
+	// Stored procedures live in the default (public) namespace; list them with
+	// prokind 'p' so DBeaver shows them under the schema's procedures too.
+	if targetSchema == "public" {
+		for _, p := range c.GetAllProcedures() {
+			oid := funcOID("public", "proc:"+p.Name)
+			var inOIDs, allOIDs, modes, names []string
+			for _, param := range p.Parameters {
+				t := strconv.Itoa(int(pgTypeOIDFor(param.Type)))
+				inOIDs = append(inOIDs, t)
+				allOIDs = append(allOIDs, t)
+				modes = append(modes, "i")
+				names = append(names, param.Name.Name)
+			}
+			var allArr, modeArr, nameArr interface{}
+			if len(allOIDs) > 0 {
+				allArr = "{" + strings.Join(allOIDs, ",") + "}"
+				modeArr = "{" + strings.Join(modes, ",") + "}"
+				nameArr = "{" + strings.Join(names, ",") + "}"
+			}
+			rows = append(rows, []interface{}{
+				oid, oid, p.Name, nsOID, int32(10), int32(14),
+				float64(100), float64(0), int32(0), "p", false,
+				false, false, false, "v", "u",
+				int32(len(p.Parameters)), int32(0), int32(2278), strings.Join(inOIDs, " "),
+				allArr, modeArr, nameArr, nil,
+				"", nil, nil, nil, nil, nil,
+			})
+		}
+	}
+
+	return &SystemResult{Columns: cols, Rows: rows, Tag: fmt.Sprintf("SELECT %d", len(rows))}
+}
+
+// getPgDepend answers the object-dependency query DBeaver runs for the
+// "Dependencies" tab (a big pg_depend join filtered by refobjid). The engine
+// tracks no such dependencies, so it returns an empty set with the columns the
+// driver reads by name — which reads as "no dependencies" instead of erroring.
+func getPgDepend() *SystemResult {
+	return &SystemResult{
+		Columns: []string{"deptype", "classid", "objid", "relkind", "attname", "adefval", "type", "ownertable", "refname", "nspname"},
+		Rows:    [][]interface{}{},
+		Tag:     "SELECT 0",
 	}
 }
 

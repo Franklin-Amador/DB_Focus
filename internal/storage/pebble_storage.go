@@ -209,6 +209,58 @@ func (ps *PebbleStorage) DeleteProcedure(name string) error {
 	return nil
 }
 
+func (ps *PebbleStorage) SaveFunction(fn *catalog.Function, schema string) error {
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
+
+	if schema == "" {
+		schema = "public"
+	}
+
+	buf := gobBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer gobBufPool.Put(buf)
+
+	enc := gob.NewEncoder(buf)
+	fd := FunctionData{
+		Name:        fn.Name,
+		Schema:      schema,
+		Parameters:  fn.Parameters,
+		SetOf:       fn.SetOf,
+		ReturnsType: fn.ReturnsType,
+		Query:       fn.Query,
+		QueryText:   fn.QueryText,
+	}
+	fd.Returns = make([]ColumnData, len(fn.Returns))
+	for i, col := range fn.Returns {
+		fd.Returns[i] = ColumnData{Name: col.Name, Type: col.Type, NotNull: col.NotNull, Identity: col.Identity, IdentityValue: col.IdentityValue}
+	}
+	if err := enc.Encode(fd); err != nil {
+		return fmt.Errorf("failed to encode function %s.%s: %w", schema, fn.Name, err)
+	}
+
+	key := ps.key("func:" + schema + ":" + fn.Name)
+	if err := ps.core.db.Set(key, buf.Bytes(), ps.core.wal); err != nil {
+		return fmt.Errorf("failed to save function %s.%s: %w", schema, fn.Name, err)
+	}
+	return nil
+}
+
+func (ps *PebbleStorage) DeleteFunction(name, schema string) error {
+	ps.core.mu.Lock()
+	defer ps.core.mu.Unlock()
+
+	if schema == "" {
+		schema = "public"
+	}
+
+	key := ps.key("func:" + schema + ":" + name)
+	if err := ps.core.db.Delete(key, ps.core.wal); err != nil && err != pebble.ErrNotFound {
+		return fmt.Errorf("failed to delete function %s.%s: %w", schema, name, err)
+	}
+	return nil
+}
+
 func (ps *PebbleStorage) SaveView(view *catalog.View, schema string) error {
 	ps.core.mu.Lock()
 	defer ps.core.mu.Unlock()
@@ -358,6 +410,19 @@ type ProcedureData struct {
 	Parameters []ast.Parameter
 	Body       []ast.Statement
 	BodyText   string
+}
+
+type FunctionData struct {
+	Name        string
+	Schema      string
+	Parameters  []ast.Parameter
+	Returns     []ColumnData
+	SetOf       bool
+	ReturnsType string
+	Query       *ast.Select
+	// QueryText is the canonical SELECT SQL, re-parsed on load so AST shape
+	// changes do not invalidate persisted functions.
+	QueryText string
 }
 
 type ViewData struct {
@@ -1081,6 +1146,39 @@ func (ps *PebbleStorage) loadDatabase(cat *catalog.Catalog) error {
 			}
 			if err := cat.LoadView(vd.Name, cols, query, vd.Schema); err != nil {
 				log.Printf("[storage] warning: failed to load view %s.%s: %v", vd.Schema, vd.Name, err)
+			}
+		} else if strings.HasPrefix(key, "func:") {
+			val := append([]byte(nil), iter.Value()...)
+			var fd FunctionData
+			dec := gob.NewDecoder(bytes.NewReader(val))
+			if err := dec.Decode(&fd); err != nil {
+				log.Printf("[storage] warning: failed to decode function %s: %v", strings.TrimPrefix(key, "func:"), err)
+				continue
+			}
+			returns := make([]catalog.Column, len(fd.Returns))
+			for i, col := range fd.Returns {
+				returns[i] = catalog.Column{Name: col.Name, Type: col.Type, NotNull: col.NotNull, Identity: col.Identity, IdentityValue: col.IdentityValue}
+			}
+			// Prefer re-parsing the stored SELECT text (AST-independent).
+			query := fd.Query
+			if fd.QueryText != "" {
+				if reparsed, perr := parseViewQuery(fd.QueryText); perr == nil {
+					query = reparsed
+				} else {
+					log.Printf("[storage] warning: failed to re-parse function %s.%s text, using stored AST: %v", fd.Schema, fd.Name, perr)
+				}
+			}
+			if err := cat.LoadFunction(&catalog.Function{
+				Name:        fd.Name,
+				Schema:      fd.Schema,
+				Parameters:  fd.Parameters,
+				Returns:     returns,
+				SetOf:       fd.SetOf,
+				ReturnsType: fd.ReturnsType,
+				Query:       query,
+				QueryText:   fd.QueryText,
+			}); err != nil {
+				log.Printf("[storage] warning: failed to load function %s.%s: %v", fd.Schema, fd.Name, err)
 			}
 		}
 	}

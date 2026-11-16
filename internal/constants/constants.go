@@ -77,6 +77,8 @@ const (
 	ResultDropDatabase    = "DROP DATABASE"
 	ResultCreateProcedure = "CREATE PROCEDURE"
 	ResultDropProcedure   = "DROP PROCEDURE"
+	ResultCreateFunction  = "CREATE FUNCTION"
+	ResultDropFunction    = "DROP FUNCTION"
 	ResultCreateTrigger   = "CREATE TRIGGER"
 	ResultDropTrigger     = "DROP TRIGGER"
 	ResultCreateJob       = "CREATE JOB"

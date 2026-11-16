@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"dbf/internal/ast"
 	"dbf/internal/constants"
@@ -99,6 +100,15 @@ func (e *Executor) executeTriggers(ctx context.Context, table, timing, event str
 	}()
 
 	triggers := e.catalog.GetTriggers(table, timing, event)
+	if len(triggers) == 0 {
+		return nil
+	}
+
+	// Bind NEW.<col> / OLD.<col> to the affected row's values so a trigger body
+	// can reference them, e.g. INSERT INTO audit VALUES (NEW.id, NEW.nombre).
+	// NEW is the post-image (INSERT/UPDATE), OLD the pre-image (UPDATE/DELETE).
+	rowRefs := e.triggerRowRefs(table, oldRow, newRow)
+
 	for _, trigger := range triggers {
 		// Execute each statement in the trigger body
 		for _, stmt := range trigger.Body {
@@ -107,13 +117,50 @@ func (e *Executor) executeTriggers(ctx context.Context, table, timing, event str
 				return err
 			}
 
-			// TODO: Support OLD and NEW row references
-			// For now, execute statements as-is
-			if _, err := e.Execute(ctx, stmt); err != nil {
+			bound := stmt
+			if len(rowRefs) > 0 {
+				bound = e.substituteParameters(stmt, rowRefs)
+			}
+			if _, err := e.Execute(ctx, bound); err != nil {
 				return fmt.Errorf("trigger %s failed at depth %d: %w", trigger.Name, e.triggerDepth, err)
 			}
 		}
 	}
 
 	return nil
+}
+
+// triggerRowRefs builds the NEW.<col>/OLD.<col> substitution map for a trigger
+// body from the affected row(s). Keys are generated for the common case
+// spellings (NEW/new prefix; column name as defined, lower, and upper) so a
+// body referencing NEW.nombre resolves regardless of case. A nil row (e.g. OLD
+// on INSERT, NEW on DELETE) contributes no keys.
+func (e *Executor) triggerRowRefs(table string, oldRow, newRow []interface{}) map[string]string {
+	tbl, err := e.catalog.GetTable(table)
+	if err != nil {
+		return nil
+	}
+	refs := make(map[string]string)
+	bind := func(prefix string, row []interface{}) {
+		if row == nil {
+			return
+		}
+		for i, col := range tbl.Columns {
+			if i >= len(row) {
+				break
+			}
+			val := ""
+			if row[i] != nil {
+				val = fmt.Sprintf("%v", row[i])
+			}
+			for _, pfx := range []string{strings.ToUpper(prefix), strings.ToLower(prefix)} {
+				for _, name := range []string{col.Name, strings.ToLower(col.Name), strings.ToUpper(col.Name)} {
+					refs[pfx+"."+name] = val
+				}
+			}
+		}
+	}
+	bind("NEW", newRow)
+	bind("OLD", oldRow)
+	return refs
 }

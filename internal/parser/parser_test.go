@@ -393,6 +393,98 @@ func TestDropIndex(t *testing.T) {
 	}
 }
 
+func TestCreateFunctionReturnsTable(t *testing.T) {
+	input := `CREATE OR REPLACE FUNCTION fn_listar_cursos()
+RETURNS TABLE (id INTEGER, titulo VARCHAR, creditos INTEGER)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT c.id, c.titulo, c.creditos FROM cursos c;
+END;
+$$`
+	stmt, err := NewParser(input).ParseStatement()
+	if err != nil {
+		t.Fatalf("parse CREATE FUNCTION: %v", err)
+	}
+	fn, ok := stmt.(*ast.CreateFunction)
+	if !ok {
+		t.Fatalf("expected *ast.CreateFunction, got %T", stmt)
+	}
+	if !fn.Replace {
+		t.Fatalf("expected Replace=true")
+	}
+	if fn.Name.Name != "fn_listar_cursos" {
+		t.Fatalf("expected name fn_listar_cursos, got %s", fn.Name.Name)
+	}
+	if len(fn.Returns) != 3 || fn.Returns[0].Name.Name != "id" || fn.Returns[2].Name.Name != "creditos" {
+		t.Fatalf("expected 3 RETURNS TABLE columns, got %+v", fn.Returns)
+	}
+	if fn.Query == nil {
+		t.Fatalf("expected a parsed body SELECT")
+	}
+	if fn.QueryText == "" {
+		t.Fatalf("expected captured QueryText")
+	}
+}
+
+func TestCreateFunctionWithParam(t *testing.T) {
+	input := `CREATE FUNCTION fn_cursos(min_cred INTEGER)
+RETURNS TABLE (titulo VARCHAR) AS $$
+BEGIN RETURN QUERY SELECT c.titulo FROM cursos c WHERE c.creditos >= min_cred; END;
+$$`
+	stmt, err := NewParser(input).ParseStatement()
+	if err != nil {
+		t.Fatalf("parse CREATE FUNCTION with param: %v", err)
+	}
+	fn := stmt.(*ast.CreateFunction)
+	if len(fn.Parameters) != 1 || fn.Parameters[0].Name.Name != "min_cred" || fn.Parameters[0].Type != "INTEGER" {
+		t.Fatalf("expected param min_cred INTEGER, got %+v", fn.Parameters)
+	}
+}
+
+func TestFromFunctionCall(t *testing.T) {
+	stmt, err := NewParser("SELECT * FROM fn_listar_cursos()").ParseStatement()
+	if err != nil {
+		t.Fatalf("parse FROM function call: %v", err)
+	}
+	sel := stmt.(*ast.Select)
+	if !sel.Table.IsCall {
+		t.Fatalf("expected Table.IsCall=true for fn_listar_cursos()")
+	}
+	if sel.Table.Name != "fn_listar_cursos" {
+		t.Fatalf("expected function name fn_listar_cursos, got %s", sel.Table.Name)
+	}
+}
+
+func TestFromFunctionCallWithArgs(t *testing.T) {
+	stmt, err := NewParser("SELECT * FROM fn_cursos(5) f").ParseStatement()
+	if err != nil {
+		t.Fatalf("parse FROM function call with args: %v", err)
+	}
+	sel := stmt.(*ast.Select)
+	if !sel.Table.IsCall || len(sel.Table.Args) != 1 || sel.Table.Args[0].Value != "5" {
+		t.Fatalf("expected one arg 5, got %+v", sel.Table.Args)
+	}
+	if sel.Table.Alias != "f" {
+		t.Fatalf("expected alias f, got %s", sel.Table.Alias)
+	}
+}
+
+func TestDropFunction(t *testing.T) {
+	stmt, err := NewParser("DROP FUNCTION IF EXISTS fn_cursos(int)").ParseStatement()
+	if err != nil {
+		t.Fatalf("parse DROP FUNCTION: %v", err)
+	}
+	df, ok := stmt.(*ast.DropFunction)
+	if !ok {
+		t.Fatalf("expected *ast.DropFunction, got %T", stmt)
+	}
+	if !df.IfExists || df.Name.Name != "fn_cursos" {
+		t.Fatalf("expected IF EXISTS fn_cursos, got %+v", df)
+	}
+}
+
 func TestDescribe(t *testing.T) {
 	for _, input := range []string{"DESCRIBE users;", "DESC users;"} {
 		p := NewParser(input)
