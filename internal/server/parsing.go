@@ -136,6 +136,25 @@ func substituteParams(query string, params []string) string {
 	return b.String()
 }
 
+// countParams returns the highest placeholder number ($1, $2, ...) in a query,
+// i.e. how many parameters a prepared statement declares.
+func countParams(query string) int {
+	max := 0
+	for i := 0; i < len(query); i++ {
+		if query[i] == '$' && i+1 < len(query) && query[i+1] >= '1' && query[i+1] <= '9' {
+			j := i + 1
+			for j < len(query) && query[j] >= '0' && query[j] <= '9' {
+				j++
+			}
+			if n, err := strconv.Atoi(query[i+1 : j]); err == nil && n > max {
+				max = n
+			}
+			i = j - 1
+		}
+	}
+	return max
+}
+
 func quoteParam(val string) string {
 	if isStrictNumeric(val) {
 		return val

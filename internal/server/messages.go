@@ -115,11 +115,16 @@ func writeNoData(rw *bufio.ReadWriter) error {
 	return writeMessage(rw, 'n', nil)
 }
 
-// writeParameterDescription sends a ParameterDescription ('t') with no bound
-// parameter types (the engine does not plan placeholders). Sent before the
-// RowDescription in a statement Describe.
-func writeParameterDescription(rw *bufio.ReadWriter) error {
-	return writeMessage(rw, 't', []byte{0, 0}) // int16 count = 0
+// writeParameterDescription sends a ParameterDescription ('t') announcing count
+// parameters, each with type oid 0 ("unspecified" — the client sends values and
+// the engine infers). Reporting the real count matters: strict drivers (lib/pq)
+// reject a Query whose argument count differs from what Describe announced. Sent
+// before the RowDescription in a statement Describe.
+func writeParameterDescription(rw *bufio.ReadWriter, count int) error {
+	buf := make([]byte, 2+4*count)
+	binary.BigEndian.PutUint16(buf, uint16(count))
+	// type oids left as 0 (unspecified)
+	return writeMessage(rw, 't', buf)
 }
 
 func writeAuthRequestCleartext(rw *bufio.ReadWriter) error {

@@ -20,17 +20,13 @@ type session struct {
 	database string
 	schema   string
 
-	// Extended-protocol describe cache. In the extended flow the client sends
-	// Describe (expecting a RowDescription) before Execute. The engine resolves
-	// results lazily, so Describe runs the query, stashes the outcome here, and
-	// Execute replays it — a single execution with a correct field structure,
-	// which fixes "received tuples, but no field structure for them".
-	descQuery  string // the prepared query the cache belongs to
-	descValid  bool   // a result (success) is cached for descQuery
-	descKind   string // "select1" | "set" | "result"
-	descCols   []string
-	descRows   [][]interface{}
-	descTag    string
+	// Extended-protocol state. In the extended flow the client sends Describe
+	// (expecting a RowDescription) before Execute. The engine resolves results
+	// lazily, so Describe computes the result once to emit the field structure,
+	// and Execute recomputes to emit the rows — recomputing matters because the
+	// client may Bind its parameters AFTER Describe, so only Execute sees them.
+	// `described` tells Execute that Describe already sent the RowDescription.
+	described bool
 
 	// bindParams holds the values of the last Bind, inlined into the prepared
 	// query at Describe/Execute time (the engine has no placeholder planning).

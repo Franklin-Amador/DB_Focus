@@ -113,14 +113,13 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat CatalogProvi
 				return
 			}
 		case 'P':
-			sess.descValid = false // a new statement invalidates the describe cache
+			sess.described = false
 			sess.bindParams = nil
 			if err := handleParse(rw, payload, &lastPrepared); err != nil {
 				log.Printf("[conn] parse error: %v", err)
 			}
 		case 'B':
 			sess.bindParams = parseBindParams(payload)
-			sess.descValid = false // new bindings invalidate the describe cache
 			writeBindComplete(rw)
 			rw.Flush()
 		case 'D':
@@ -139,7 +138,7 @@ func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat CatalogProvi
 			// extended-protocol response stream intact (an ErrorResponse here made
 			// the driver discard the result set, so grids and the metadata tree
 			// came back empty).
-			sess.descValid = false
+			sess.described = false
 			writeCloseComplete(rw)
 			rw.Flush()
 		case 'H':
@@ -332,78 +331,54 @@ func computeExtended(handler QueryHandler, cat CatalogProvider, query string, se
 // RowDescription so the client has a field structure for the rows Execute will
 // send. This fixes the JDBC "received tuples, but no field structure" error that
 // came from always replying NoData here.
+// handleDescribe answers a Describe ('S' statement or 'P' portal). It computes
+// the query once to emit the real RowDescription (field structure), so the
+// client has it before Execute sends the rows. It does NOT cache the rows: the
+// client may Bind parameters after Describe, so Execute recomputes to pick them
+// up. This fixes the "received tuples, but no field structure" error.
 func handleDescribe(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogProvider, payload []byte, lastPrepared string, sess *session) {
 	statement := len(payload) > 0 && payload[0] == 'S'
 
-	cols, rows, tag, kind, err := computeExtended(handler, cat, lastPrepared, sess)
+	cols, rows, _, kind, err := computeExtended(handler, cat, lastPrepared, sess)
 	if err != nil {
-		// Report nothing now; Execute will re-run and surface the error.
-		sess.descValid = false
+		// Report nothing now; Execute re-runs and surfaces the error.
+		sess.described = false
 		if statement {
-			writeParameterDescription(rw)
+			writeParameterDescription(rw, countParams(lastPrepared))
 		}
 		writeNoData(rw)
 		rw.Flush()
 		return
 	}
-
-	// Cache the successful outcome so Execute replays it (single execution).
-	sess.descQuery = lastPrepared
-	sess.descValid = true
-	sess.descKind = kind
-	sess.descCols = cols
-	sess.descRows = rows
-	sess.descTag = tag
-	logQuery(fmt.Sprintf("D:%s:%drows", kind, len(rows)), lastPrepared)
+	sess.described = true
+	logQuery(fmt.Sprintf("D:%s:%dcols", kind, len(cols)), lastPrepared)
 
 	if statement {
-		writeParameterDescription(rw)
+		writeParameterDescription(rw, countParams(lastPrepared))
 	}
-	if kind == "result" && len(cols) > 0 {
+	switch {
+	case kind == "select1":
+		writeRowDescriptionSelectOne(rw)
+	case kind == "result" && len(cols) > 0:
 		var sample []interface{}
 		if len(rows) > 0 {
 			sample = rows[0]
 		}
 		writeRowDescriptionForResult(rw, cols, sample)
-	} else {
-		// SELECT 1 still needs its field structure; SET/empty results have none.
-		if kind == "select1" {
-			writeRowDescriptionSelectOne(rw)
-		} else {
-			writeNoData(rw)
-		}
+	default: // SET / empty result
+		writeNoData(rw)
 	}
 	rw.Flush()
 }
 
-// handleExecute replays the result Describe already computed for this exact
-// query (so there is one execution and the RowDescription already went out), or
-// resolves and sends it fresh when the client executed without describing.
+// handleExecute runs the query with the parameters bound so far and sends the
+// rows. It recomputes rather than replaying Describe's result, so parameters
+// bound after Describe take effect; the RowDescription is sent here only when no
+// Describe preceded this Execute.
 func handleExecute(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogProvider, lastPrepared string, sess *session) {
-	if sess.descValid && sess.descQuery == lastPrepared {
-		sess.descValid = false
-		switch sess.descKind {
-		case "select1":
-			writeDataRowSelectOne(rw)
-			writeCommandComplete(rw, "SELECT 1")
-		case "set":
-			writeCommandComplete(rw, "SET")
-		default: // result — RowDescription was already sent by Describe
-			for _, row := range sess.descRows {
-				writeDataRow(rw, row)
-			}
-			writeCommandComplete(rw, sess.descTag)
-		}
-		rw.Flush()
-		return
-	}
-	handleExecuteFresh(rw, handler, cat, lastPrepared, sess)
-}
+	described := sess.described
+	sess.described = false
 
-// handleExecuteFresh runs the extended-protocol query and sends the full reply
-// (RowDescription + DataRows + CommandComplete) for a client that executed
-// without a preceding Describe.
-func handleExecuteFresh(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogProvider, lastPrepared string, sess *session) {
 	if lastPrepared == "" {
 		writeError(rw, "no prepared query")
 		rw.Flush()
@@ -425,15 +400,15 @@ func handleExecuteFresh(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogP
 		writeCommandComplete(rw, "SET")
 	default:
 		logQuery(fmt.Sprintf("E:exec:%drows", len(rows)), lastPrepared)
-		if len(cols) > 0 {
+		if !described && len(cols) > 0 { // no Describe sent the structure yet
 			var sample []interface{}
 			if len(rows) > 0 {
 				sample = rows[0]
 			}
 			writeRowDescriptionForResult(rw, cols, sample)
-			for _, row := range rows {
-				writeDataRow(rw, row)
-			}
+		}
+		for _, row := range rows {
+			writeDataRow(rw, row)
 		}
 		writeCommandComplete(rw, tag)
 	}
