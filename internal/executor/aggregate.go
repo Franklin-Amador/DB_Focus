@@ -6,8 +6,19 @@ import (
 	"strings"
 )
 
-// aggregateFuncs lists the supported aggregate function names.
-var aggregateFuncs = []string{"COUNT", "SUM", "AVG", "MIN", "MAX"}
+// aggregateFuncs lists the supported aggregate function names. MAX_BY/MIN_BY
+// are two-argument aggregates (value, order).
+var aggregateFuncs = []string{"COUNT", "SUM", "AVG", "MIN", "MAX", "MAX_BY", "MIN_BY"}
+
+// aggregateArgs splits an aggregate's inner argument text into its comma-
+// separated arguments (e.g. "status, updated_at" -> ["status", "updated_at"]).
+func aggregateArgs(arg string) []string {
+	parts := strings.Split(arg, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
+}
 
 // parseAggregate recognizes an aggregate projection like "SUM(precio)" or
 // "COUNT(*)". It returns the canonical (upper-case) function name and the raw
@@ -26,13 +37,33 @@ func parseAggregate(name string) (fn string, arg string, ok bool) {
 	return "", "", false
 }
 
-// computeAggregate reduces a set of rows to a single aggregate value for the
-// given function. colIdx is the index of the aggregated column, or -1 for
-// COUNT(*). SUM/AVG parse cell values numerically; MIN/MAX order values
-// numerically when possible and lexicographically otherwise; NULLs are ignored
-// (except COUNT(*), which counts every row).
-func computeAggregate(fn string, rows [][]interface{}, colIdx int) interface{} {
+// computeAggregate reduces rows to a single value. colIdx is the aggregated
+// column (-1 for COUNT(*)); colIdx2 is the ordering column for MAX_BY/MIN_BY
+// (ignored by the single-argument aggregates).
+func computeAggregate(fn string, rows [][]interface{}, colIdx, colIdx2 int) interface{} {
 	switch fn {
+	case "MAX_BY", "MIN_BY":
+		var best interface{}      // value at the extremum of the order column
+		var bestOrder interface{} // current extremum of the order column
+		for _, r := range rows {
+			if colIdx < 0 || colIdx >= len(r) || colIdx2 < 0 || colIdx2 >= len(r) {
+				continue
+			}
+			o := r[colIdx2]
+			if o == nil { // ignore rows whose ordering value is NULL
+				continue
+			}
+			if bestOrder == nil {
+				bestOrder, best = o, r[colIdx]
+				continue
+			}
+			c := compareCells(o, bestOrder)
+			if (fn == "MAX_BY" && c > 0) || (fn == "MIN_BY" && c < 0) {
+				bestOrder, best = o, r[colIdx]
+			}
+		}
+		return best
+
 	case "COUNT":
 		if colIdx < 0 {
 			return len(rows)

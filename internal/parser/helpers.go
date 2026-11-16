@@ -456,6 +456,20 @@ func (p *Parser) parseWindowCall() (*ast.WindowFunc, string, error) {
 	default:
 		return nil, "", p.errorf("unexpected %s in %s(...) argument", p.cur.Type, funcName)
 	}
+
+	// Two-argument aggregates: MAX_BY(value, order) / MIN_BY(value, order).
+	if isTwoArgAggregate(upper) {
+		if p.cur.Type != TokenComma {
+			return nil, "", p.errorf("%s requires two arguments (value, order)", upper)
+		}
+		p.next()
+		if p.cur.Type != TokenIdent {
+			return nil, "", p.errorf("expected the ordering column in %s(...)", funcName)
+		}
+		arg = arg + ", " + p.cur.Literal
+		p.next()
+	}
+
 	if !p.expect(TokenRParen) {
 		return nil, "", p.errorf("expected ) after %s argument", funcName)
 	}
@@ -465,6 +479,9 @@ func (p *Parser) parseWindowCall() (*ast.WindowFunc, string, error) {
 	}
 
 	text := funcName + "(" + arg + ")"
+	if isTwoArgAggregate(upper) && p.cur.Type == TokenOver {
+		return nil, "", p.errorf("%s does not support an OVER clause yet", upper)
+	}
 	if p.cur.Type != TokenOver {
 		if isRankingFunc(upper) {
 			return nil, "", p.errorf("%s requires an OVER clause", upper)
@@ -518,10 +535,16 @@ func (p *Parser) sliceFrom(start int) string {
 // supported aggregate function name.
 func isAggregateFunc(upper string) bool {
 	switch upper {
-	case "COUNT", "SUM", "AVG", "MIN", "MAX":
+	case "COUNT", "SUM", "AVG", "MIN", "MAX", "MAX_BY", "MIN_BY":
 		return true
 	}
 	return false
+}
+
+// isTwoArgAggregate reports whether an aggregate takes two arguments
+// (value, ordering): MAX_BY / MIN_BY.
+func isTwoArgAggregate(upper string) bool {
+	return upper == "MAX_BY" || upper == "MIN_BY"
 }
 
 // isRankingFunc reports whether an (already upper-cased) identifier is a

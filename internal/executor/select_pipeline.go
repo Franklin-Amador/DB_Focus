@@ -440,11 +440,12 @@ func firstAggregateRef(stmt *ast.Select) string {
 // groupCol is one column of the grouped rowset: either an aggregate computed
 // per group or a plain column (first value of the group).
 type groupCol struct {
-	name   string // output name (alias or expression text)
-	expr   string // source expression text
-	aggFn  string // "" for a plain column
-	srcIdx int    // source column index; -1 for COUNT(*) or a missing expression
-	hidden bool   // not part of the select list (needed by windows/QUALIFY/ORDER BY)
+	name    string // output name (alias or expression text)
+	expr    string // source expression text
+	aggFn   string // "" for a plain column
+	srcIdx  int    // source column index; -1 for COUNT(*) or a missing expression
+	srcIdx2 int    // second source column (order) for MAX_BY/MIN_BY; -1 otherwise
+	hidden  bool   // not part of the select list (needed by windows/QUALIFY/ORDER BY)
 }
 
 // groupRows reduces rs to one row per group. The output rowset carries every
@@ -499,14 +500,29 @@ func groupRows(stmt *ast.Select, rs *rowset) (*rowset, error) {
 		return -1
 	}
 	add := func(name, expr string, hidden bool) error {
-		gc := groupCol{name: name, expr: expr, hidden: hidden, srcIdx: -1}
+		gc := groupCol{name: name, expr: expr, hidden: hidden, srcIdx: -1, srcIdx2: -1}
 		if expr == "" {
 			cols = append(cols, gc) // placeholder expression → NULL
 			return nil
 		}
 		if fn, arg, ok := parseAggregate(expr); ok {
 			gc.aggFn = fn
-			if arg != "" && arg != "*" {
+			switch {
+			case fn == "MAX_BY" || fn == "MIN_BY":
+				parts := aggregateArgs(arg)
+				if len(parts) != 2 {
+					return fmt.Errorf("%s requires two arguments (value, order)", fn)
+				}
+				vIdx, err := rs.resolve(parts[0])
+				if err != nil {
+					return fmt.Errorf("%s: %w", expr, err)
+				}
+				oIdx, err := rs.resolve(parts[1])
+				if err != nil {
+					return fmt.Errorf("%s: %w", expr, err)
+				}
+				gc.srcIdx, gc.srcIdx2 = vIdx, oIdx
+			case arg != "" && arg != "*":
 				idx, err := rs.resolve(arg)
 				if err != nil {
 					return fmt.Errorf("%s: %w", expr, err)
@@ -576,7 +592,7 @@ func groupRows(stmt *ast.Select, rs *rowset) (*rowset, error) {
 		for i, c := range cols {
 			switch {
 			case c.aggFn != "":
-				row[i] = computeAggregate(c.aggFn, groupRows, c.srcIdx)
+				row[i] = computeAggregate(c.aggFn, groupRows, c.srcIdx, c.srcIdx2)
 			case c.srcIdx >= 0 && len(groupRows) > 0 && c.srcIdx < len(groupRows[0]):
 				row[i] = groupRows[0][c.srcIdx] // non-aggregate: first value of the group
 			default:
