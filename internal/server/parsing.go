@@ -95,35 +95,62 @@ func parseBindParams(payload []byte) []string {
 	return params
 }
 
-// substituteParams inlines bound parameters ($1, $2, ...) into a query. A value
-// that looks numeric is inserted bare; otherwise it is single-quoted (with the
-// SQL '' escape), so the system-catalog routes can read the real values of
-// introspection queries such as "... WHERE typname = $1".
+// maxSubstitutedQueryLen caps the size of a query after parameter inlining, so a
+// few large parameters cannot amplify it without bound.
+const maxSubstitutedQueryLen = 1 << 20 // 1 MiB
+
+// substituteParams inlines bound parameters ($1, $2, ...) into a query in a
+// SINGLE left-to-right pass, so an inserted value is never re-scanned (a value
+// that itself contains "$1" cannot trigger a second substitution). A value that
+// is strictly numeric is inserted bare; every other value is single-quoted with
+// the SQL '' escape, so it cannot break out of its string literal. This lets the
+// system-catalog routes read the real values of introspection queries such as
+// "... WHERE typname = $1".
+//
+// It is a compatibility shim for an engine with no placeholder planning, not a
+// trust boundary: a client that can Bind parameters can already run arbitrary
+// SQL over the simple-query protocol.
 func substituteParams(query string, params []string) string {
-	if len(params) == 0 {
+	if len(params) == 0 || !strings.ContainsRune(query, '$') {
 		return query
 	}
-	for i := len(params); i >= 1; i-- { // high-to-low so $1 does not match $10
-		val := params[i-1]
-		rep := "'" + strings.ReplaceAll(val, "'", "''") + "'"
-		if isNumericLiteral(val) {
-			rep = val
+	var b strings.Builder
+	for i := 0; i < len(query); {
+		if query[i] == '$' && i+1 < len(query) && query[i+1] >= '1' && query[i+1] <= '9' {
+			j := i + 1
+			for j < len(query) && query[j] >= '0' && query[j] <= '9' {
+				j++
+			}
+			if n, err := strconv.Atoi(query[i+1 : j]); err == nil && n >= 1 && n <= len(params) {
+				b.WriteString(quoteParam(params[n-1]))
+				if b.Len() > maxSubstitutedQueryLen {
+					return query // refuse to amplify; the original will fail naturally
+				}
+				i = j
+				continue
+			}
 		}
-		query = strings.ReplaceAll(query, "$"+strconv.Itoa(i), rep)
+		b.WriteByte(query[i])
+		i++
 	}
-	return query
+	return b.String()
 }
 
-func isNumericLiteral(s string) bool {
-	if s == "" {
-		return false
+func quoteParam(val string) string {
+	if isStrictNumeric(val) {
+		return val
 	}
-	for _, r := range s {
-		if (r < '0' || r > '9') && r != '.' && r != '-' {
-			return false
-		}
+	return "'" + strings.ReplaceAll(val, "'", "''") + "'"
+}
+
+// isStrictNumeric reports whether s is a well-formed number, so inlining it bare
+// cannot inject syntax (e.g. "--" or "1 OR 1=1" are rejected and get quoted).
+func isStrictNumeric(s string) bool {
+	if _, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return true
 	}
-	return true
+	_, err := strconv.ParseFloat(s, 64)
+	return err == nil
 }
 
 func isSelectOne(query string) bool {

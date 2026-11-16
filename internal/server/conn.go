@@ -300,7 +300,9 @@ func handleParse(rw *bufio.ReadWriter, payload []byte, lastPrepared *string) err
 // the executor) WITHOUT writing to the wire. kind ("select1" | "set" | "result")
 // tells the caller how to frame the Describe/Execute replies.
 func computeExtended(handler QueryHandler, cat CatalogProvider, query string, sess *session) (cols []string, rows [][]interface{}, tag string, kind string, err error) {
-	query = substituteParams(query, sess.bindParams)
+	// Route on the ORIGINAL prepared text so a parameter value cannot steer the
+	// query onto a different fast path. Parameters are inlined only for the
+	// system-catalog route and the executor, which need the real values.
 	if isSelectOne(query) {
 		return nil, nil, "SELECT 1", "select1", nil
 	}
@@ -311,6 +313,7 @@ func computeExtended(handler QueryHandler, cat CatalogProvider, query string, se
 		sess.schema = target
 		return nil, nil, "SET", "set", nil
 	}
+	query = substituteParams(query, sess.bindParams)
 	if sysResult, ok := cat.HandleSystemQueryForSession(query, sess.database, sess.schema); ok {
 		return sysResult.Columns, sysResult.Rows, sysResult.Tag, "result", nil
 	}
