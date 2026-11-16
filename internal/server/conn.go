@@ -69,6 +69,13 @@ func ListenAndServeWithConfig(addr string, handler QueryHandler, cat CatalogProv
 func handleConnWithBufSize(conn net.Conn, handler QueryHandler, cat CatalogProvider, bufSize int) {
 	defer conn.Close()
 	remoteAddr := conn.RemoteAddr().String()
+	// A panic while serving one connection must not take down the server: recover
+	// it, log it, and let this goroutine (and only this connection) end.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[conn] recovered panic from %s: %v", remoteAddr, r)
+		}
+	}()
 	rw := bufio.NewReadWriter(
 		bufio.NewReaderSize(conn, bufSize),
 		bufio.NewWriterSize(conn, bufSize),
@@ -298,7 +305,7 @@ func handleParse(rw *bufio.ReadWriter, payload []byte, lastPrepared *string) err
 // the simple-query path (SELECT 1, bypass, SET search_path, system catalog, then
 // the executor) WITHOUT writing to the wire. kind ("select1" | "set" | "result")
 // tells the caller how to frame the Describe/Execute replies.
-func computeExtended(handler QueryHandler, cat CatalogProvider, query string, sess *session) (cols []string, rows [][]interface{}, tag string, kind string, err error) {
+func computeExtended(handler QueryHandler, cat CatalogProvider, query string, sess *session, describe bool) (cols []string, rows [][]interface{}, tag string, kind string, err error) {
 	// Route on the ORIGINAL prepared text so a parameter value cannot steer the
 	// query onto a different fast path. Parameters are inlined only for the
 	// system-catalog route and the executor, which need the real values.
@@ -309,12 +316,24 @@ func computeExtended(handler QueryHandler, cat CatalogProvider, query string, se
 		return result.Columns, result.Rows, result.Tag, "result", nil
 	}
 	if target := searchPathTarget(query); target != "" {
+		if describe {
+			// Apply the search_path change only at Execute, so a Describe that
+			// precedes it does not mutate session state twice.
+			return nil, nil, "SET", "skip", nil
+		}
 		sess.schema = target
 		return nil, nil, "SET", "set", nil
 	}
 	query = substituteParams(query, sess.bindParams)
 	if sysResult, ok := cat.HandleSystemQueryForSession(query, sess.database, sess.schema); ok {
 		return sysResult.Columns, sysResult.Rows, sysResult.Tag, "result", nil
+	}
+	// A Describe must not run a state-changing statement: Execute runs it, and
+	// running it here too would duplicate the write. Skip the executor during
+	// Describe for anything that is not a read-only query (the field structure of
+	// an INSERT/UPDATE/DELETE/DDL/CALL is empty anyway → NoData).
+	if describe && !isReadOnlyQuery(query) {
+		return nil, nil, "", "skip", nil
 	}
 	result, err := executeQuery(handler, query, sess)
 	if err != nil {
@@ -339,7 +358,7 @@ func computeExtended(handler QueryHandler, cat CatalogProvider, query string, se
 func handleDescribe(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogProvider, payload []byte, lastPrepared string, sess *session) {
 	statement := len(payload) > 0 && payload[0] == 'S'
 
-	cols, rows, _, kind, err := computeExtended(handler, cat, lastPrepared, sess)
+	cols, rows, _, kind, err := computeExtended(handler, cat, lastPrepared, sess, true)
 	if err != nil {
 		// Report nothing now; Execute re-runs and surfaces the error.
 		sess.described = false
@@ -384,7 +403,7 @@ func handleExecute(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogProvid
 		rw.Flush()
 		return
 	}
-	cols, rows, tag, kind, err := computeExtended(handler, cat, lastPrepared, sess)
+	cols, rows, tag, kind, err := computeExtended(handler, cat, lastPrepared, sess, false)
 	if err != nil {
 		logQuery("E:exec-ERROR: "+err.Error(), lastPrepared)
 		writeError(rw, err.Error())

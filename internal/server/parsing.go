@@ -137,13 +137,16 @@ func substituteParams(query string, params []string) string {
 }
 
 // countParams returns the highest placeholder number ($1, $2, ...) in a query,
-// i.e. how many parameters a prepared statement declares.
+// i.e. how many parameters a prepared statement declares. The result is clamped
+// to the wire protocol's ceiling (a ParameterDescription count is a uint16), so
+// a pathological placeholder such as "$900000000" cannot drive a huge downstream
+// allocation. Digit runs are also capped so Atoi never scans an unbounded span.
 func countParams(query string) int {
 	max := 0
 	for i := 0; i < len(query); i++ {
 		if query[i] == '$' && i+1 < len(query) && query[i+1] >= '1' && query[i+1] <= '9' {
 			j := i + 1
-			for j < len(query) && query[j] >= '0' && query[j] <= '9' {
+			for j < len(query) && query[j] >= '0' && query[j] <= '9' && j-i <= 6 {
 				j++
 			}
 			if n, err := strconv.Atoi(query[i+1 : j]); err == nil && n > max {
@@ -151,6 +154,9 @@ func countParams(query string) int {
 			}
 			i = j - 1
 		}
+	}
+	if max > maxWireParams {
+		max = maxWireParams
 	}
 	return max
 }
@@ -181,6 +187,29 @@ func isStrictNumeric(s string) bool {
 		}
 	}
 	return s != "."
+}
+
+// isReadOnlyQuery reports whether a query only reads (so running it twice — once
+// to resolve the Describe field structure, once at Execute — cannot change data).
+// Used to keep Describe from executing a state-changing statement (INSERT/UPDATE/
+// DELETE/DDL/CALL): those are skipped at Describe and run exactly once at Execute.
+// The engine has no data-modifying CTEs, so WITH is read-only here.
+func isReadOnlyQuery(query string) bool {
+	q := strings.TrimLeft(query, " \t\r\n(")
+	end := 0
+	for end < len(q) {
+		c := q[end]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+			end++
+			continue
+		}
+		break
+	}
+	switch strings.ToUpper(q[:end]) {
+	case "SELECT", "WITH", "VALUES", "TABLE", "SHOW", "EXPLAIN", "DESCRIBE", "DESC":
+		return true
+	}
+	return false
 }
 
 func isSelectOne(query string) bool {

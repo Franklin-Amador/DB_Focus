@@ -115,12 +115,25 @@ func writeNoData(rw *bufio.ReadWriter) error {
 	return writeMessage(rw, 'n', nil)
 }
 
+// maxWireParams is the protocol ceiling for a ParameterDescription: the count is
+// a uint16, so no more than 65535 parameters can ever be announced. It also caps
+// the allocation below so a query with an absurd placeholder number (e.g. "$9e8")
+// cannot drive a multi-gigabyte buffer.
+const maxWireParams = 65535
+
 // writeParameterDescription sends a ParameterDescription ('t') announcing count
 // parameters, each with type oid 0 ("unspecified" — the client sends values and
 // the engine infers). Reporting the real count matters: strict drivers (lib/pq)
 // reject a Query whose argument count differs from what Describe announced. Sent
-// before the RowDescription in a statement Describe.
+// before the RowDescription in a statement Describe. count is clamped to the
+// protocol maximum to bound the allocation.
 func writeParameterDescription(rw *bufio.ReadWriter, count int) error {
+	if count < 0 {
+		count = 0
+	}
+	if count > maxWireParams {
+		count = maxWireParams
+	}
 	buf := make([]byte, 2+4*count)
 	binary.BigEndian.PutUint16(buf, uint16(count))
 	// type oids left as 0 (unspecified)
