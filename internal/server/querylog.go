@@ -31,10 +31,12 @@ func EnableQueryLog(path string) error {
 	if path == "" {
 		return nil
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	// Owner-only: the log records query shapes and may otherwise capture values.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
+	_ = f.Chmod(0o600) // tighten a pre-existing file too
 	qlFile = f
 	fmt.Fprintf(f, "\n=== query log opened %s ===\n", time.Now().Format(time.RFC3339))
 	_ = f.Sync()
@@ -49,7 +51,35 @@ func logQuery(disposition, query string) {
 	if qlFile == nil {
 		return
 	}
-	oneLine := strings.Join(strings.Fields(query), " ")
+	oneLine := redactLiterals(strings.Join(strings.Fields(query), " "))
 	fmt.Fprintf(qlFile, "%s\t%-16s\t%s\n", time.Now().Format("15:04:05.000"), disposition, oneLine)
 	_ = qlFile.Sync()
+}
+
+// redactLiterals replaces every single-quoted string literal with '?', so the
+// diagnostic log captures query shape without persisting values (passwords,
+// PII). SQL's doubled-quote escape ('') inside a literal is handled.
+func redactLiterals(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] != '\'' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		b.WriteString("'?'")
+		i++ // opening quote
+		for i < len(s) {
+			if s[i] == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i += 2 // escaped '' — stay inside the literal
+					continue
+				}
+				i++ // closing quote
+				break
+			}
+			i++
+		}
+	}
+	return b.String()
 }
