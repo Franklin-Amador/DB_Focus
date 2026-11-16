@@ -51,35 +51,74 @@ func logQuery(disposition, query string) {
 	if qlFile == nil {
 		return
 	}
+	// Redact both the query and the disposition (executor errors can echo a
+	// literal value, e.g. "duplicate value '...'").
 	oneLine := redactLiterals(strings.Join(strings.Fields(query), " "))
-	fmt.Fprintf(qlFile, "%s\t%-16s\t%s\n", time.Now().Format("15:04:05.000"), disposition, oneLine)
+	disp := redactLiterals(disposition)
+	fmt.Fprintf(qlFile, "%s\t%-16s\t%s\n", time.Now().Format("15:04:05.000"), disp, oneLine)
 	_ = qlFile.Sync()
 }
 
-// redactLiterals replaces every single-quoted string literal with '?', so the
-// diagnostic log captures query shape without persisting values (passwords,
-// PII). SQL's doubled-quote escape ('') inside a literal is handled.
+// redactLiterals replaces string values with '?' so the diagnostic log captures
+// query shape without persisting data (passwords, PII). It covers single-quoted
+// literals (with the '' escape) and dollar-quoted bodies ($$...$$ / $tag$...$tag$,
+// used by procedure bodies). It is deliberately conservative: on anything it
+// cannot pair it over-redacts rather than leaking. This is defense-in-depth for a
+// local, opt-in, owner-only (0600) diagnostic file, not a security boundary, so
+// it does not aim to match the engine lexer byte-for-byte.
 func redactLiterals(s string) string {
 	var b strings.Builder
-	for i := 0; i < len(s); {
-		if s[i] != '\'' {
+	i := 0
+	for i < len(s) {
+		switch {
+		case s[i] == '\'':
+			b.WriteString("'?'")
+			i++ // opening quote
+			for i < len(s) {
+				if s[i] == '\'' {
+					if i+1 < len(s) && s[i+1] == '\'' {
+						i += 2 // escaped '' — stay inside the literal
+						continue
+					}
+					i++ // closing quote
+					break
+				}
+				i++
+			}
+		case s[i] == '$':
+			if tag, ok := dollarQuoteTag(s, i); ok {
+				b.WriteString(tag + "?" + tag)
+				i += len(tag)
+				if end := strings.Index(s[i:], tag); end >= 0 {
+					i += end + len(tag)
+				} else {
+					i = len(s) // unterminated — redact to end
+				}
+				continue
+			}
 			b.WriteByte(s[i])
 			i++
-			continue
-		}
-		b.WriteString("'?'")
-		i++ // opening quote
-		for i < len(s) {
-			if s[i] == '\'' {
-				if i+1 < len(s) && s[i+1] == '\'' {
-					i += 2 // escaped '' — stay inside the literal
-					continue
-				}
-				i++ // closing quote
-				break
-			}
+		default:
+			b.WriteByte(s[i])
 			i++
 		}
 	}
 	return b.String()
+}
+
+// dollarQuoteTag returns the dollar-quote tag ($$ or $name$) starting at i, if
+// s[i:] opens one.
+func dollarQuoteTag(s string, i int) (string, bool) {
+	j := i + 1
+	for j < len(s) {
+		c := s[j]
+		if c == '$' {
+			return s[i : j+1], true
+		}
+		if c != '_' && !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') {
+			return "", false
+		}
+		j++
+	}
+	return "", false
 }
