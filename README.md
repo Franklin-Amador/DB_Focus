@@ -102,6 +102,13 @@ postgresql://postgres:4444@localhost:4444/postgres
   - **Funciones de ventana**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()` y los agregados `COUNT(*|col)`, `SUM`, `AVG`, `MIN`, `MAX` seguidos de `OVER (...)`. `OVER ()` vacío es válido (toda la tabla es una partición).
   - `QUALIFY`: filtra **después** de calcular las ventanas. El predicado tiene la misma forma que `WHERE` y el lado izquierdo puede ser una columna, un alias del `SELECT`, un agregado o una ventana inline: `QUALIFY ROW_NUMBER() OVER (PARTITION BY categoria ORDER BY monto DESC) = 1`.
   - Funciona sobre tablas, JOINs (columnas calificadas), CTEs, vistas y consultas con `GROUP BY` — en ese caso la ventana opera sobre las filas ya agrupadas y puede referenciar agregados: `RANK() OVER (ORDER BY SUM(monto) DESC)`.
+- **Atajos estilo Snowflake** (menos tipeo):
+  - `SELECT * EXCLUDE (col, ...)` — todas las columnas menos las listadas (acepta una sola sin paréntesis).
+  - `SELECT * RENAME (col AS alias, ...)` — renombra columnas en la salida de `*`.
+  - `SELECT * ILIKE 'patrón'` — solo las columnas cuyo nombre matchea el patrón (`%`, `_`, case-insensitive).
+  - `GROUP BY ALL` — agrupa por todos los items no-agregados del `SELECT`.
+  - `MAX_BY(valor, orden)` / `MIN_BY(valor, orden)` — el `valor` de la fila con el mayor/menor `orden` (sin subquery). Escalar, con `GROUP BY` y con `GROUP BY ALL`.
+  - `FROM izq ASOF JOIN der MATCH_CONDITION (izq.c op der.c) [ON izq.k = der.k]` — por cada fila izquierda, la fila derecha más cercana que cumple la desigualdad (`>=`/`>` toma la mayor; `<=`/`<` la menor), con clave `ON` opcional; semántica LEFT (derecha `NULL` si no hay match).
 - `WITH` cte_name AS (SELECT ...) [, cte_name2 AS (SELECT ...)] SELECT ...
 - `CREATE TABLE` tabla (columna tipo [IDENTITY] [PRIMARY KEY] [UNIQUE] [NOT NULL] [REFERENCES tabla(columna) [ON DELETE acción] [ON UPDATE acción]], ..., [FOREIGN KEY (columna) REFERENCES tabla(columna) [ON DELETE acción] [ON UPDATE acción]])
   - La clave foránea se puede declarar **inline en la columna** (`padre_id INT REFERENCES padre(id)`) o a nivel de tabla (`FOREIGN KEY (padre_id) REFERENCES padre(id)`), ambas en una sola línea.
@@ -276,6 +283,11 @@ go run ./cmd/test-aggregates
 go run ./cmd/test-multi-join
 go run ./cmd/test-natural-join
 go run ./cmd/test-qualify
+
+# Atajos estilo Snowflake
+go run ./cmd/test-snowflake-select  # SELECT * EXCLUDE/RENAME/ILIKE, GROUP BY ALL
+go run ./cmd/test-maxby             # MAX_BY / MIN_BY (value, order)
+go run ./cmd/test-asof-join         # ASOF JOIN ... MATCH_CONDITION
 
 # Vistas
 go run ./cmd/test-views

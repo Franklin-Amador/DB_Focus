@@ -1689,3 +1689,52 @@ persistencia/schemas). README actualizado (sintaxis FK + notas + lista de regres
 - Optimización de rangos sobre índices **compuestos** (hoy solo igualdad por prefijo).
 - `NULL` como literal en `INSERT` no está soportado (`parseLiteral` no maneja `TokenNull`); los NULL
   se insertan omitiendo la columna.
+
+---
+
+### Session: November 16, 2026 - Atajos estilo Snowflake (6 features) + 2 revisiones de seguridad
+
+**Objetivo**: agregar 6 conveniencias de Snowflake pedidas por el usuario (imagen). Entregadas en
+tandas, cada una con test y commit propio.
+
+**Status**: ✅ COMPLETED
+
+**Features** (`git`: 77c3fe7, 1bfedf7, c583571):
+1. ✅ **SELECT * EXCLUDE (cols)** — proyecta todo menos las columnas listadas.
+2. ✅ **SELECT * RENAME (col AS alias)** — renombra en la salida de `*`.
+3. ✅ **SELECT * ILIKE 'patrón'** — filtra columnas por nombre (`%`/`_`, case-insensitive).
+4. ✅ **GROUP BY ALL** — agrupa por todos los items no-agregados del select.
+5. ✅ **MAX_BY / MIN_BY(valor, orden)** — agregado de 2 args; valor en el extremo del orden.
+6. ✅ **ASOF JOIN ... MATCH_CONDITION (a op b) [ON k=k]** — join por cercanía (nearest-earlier/later).
+
+**Implementación**:
+- AST (`Select.StarExclude/StarRename/StarILike/GroupByAll`, tipo `StarRename`;
+  `JoinClause.{Asof,MatchLeft,MatchRight,MatchOp}`).
+- Parser: `parseStarModifiers` (matchea por **literal** porque `RENAME` es keyword reservada de
+  ALTER mientras EXCLUDE/ILIKE son idents — gotcha real que costó un bug de "columnas vacías");
+  `parseGroupByClause` reconoce `ALL`; `isTwoArgAggregate` + `parseWindowCall` parsea el 2º arg de
+  MAX_BY/MIN_BY (sin OVER); token reservado `ASOF` (si no, `parseTableRef` se lo come como alias) +
+  `parseAsofJoin` (exige desigualdad en MATCH_CONDITION, ON opcional).
+- Executor: `projectRows` aplica EXCLUDE/RENAME/ILIKE (helpers `ilikeMatch` vía regexp,
+  `containsFold`, `starRename`); `needsGrouping`/`groupRows` expanden GROUP BY ALL;
+  `computeAggregate` toma un 2º índice + `groupCol.srcIdx2` para MAX_BY/MIN_BY; `foldAsofJoin` sobre
+  el motor de fold N-way, reusando `whereMatches`/`compareCells` (mismo comparador que todo el resto).
+
+**Revisiones de seguridad automáticas atendidas** (sobre el commit FK previo `b2be2e6`):
+- `harden` (commit `ce0bc5b`): (1) match de FK por esquema — una ref sin esquema resuelve en el
+  esquema de la hija; (2) cascada **two-phase** (chequeo total de RESTRICT/NOT-NULL antes de mutar,
+  evita cascadas a medias); (3) SET NULL sobre columna NOT NULL falla antes de mutar. Acusado
+  recibo: TOCTOU check→delete (sostener el lock reintroduce el deadlock self-FK) y colisión UNIQUE
+  en ON UPDATE CASCADE (modelo sin transacciones).
+- 2ª revisión (diferencial de resolución): la validación FK de INSERT resuelve bare→`public`
+  (`GetTable(ref)`), así que `ForeignKeyReferencers` ahora también matchea bare cuando el padre es
+  `public` (no solo mismo esquema) → sin orphan por diferencial. (Quedó mezclado en el commit
+  `77c3fe7`.)
+
+**Tests**: `cmd/test-snowflake-select`, `cmd/test-maxby`, `cmd/test-asof-join`; `parser_test.go`
+(`TestParseStarModifiers/GroupByAll/MaxBy/AsofJoin`); `cmd/test-fk-actions` ampliado (SET NULL sobre
+NOT NULL, cascada no parcial). Verificación (CGO_ENABLED=0): build/vet/test ✅; barrido de
+integración del motor ✅.
+
+**Fuera de alcance / follow-ups**: MAX_BY/MIN_BY como función de ventana (`OVER`); ASOF JOIN con
+MATCH_CONDITION compuesto o múltiples claves ON; `SELECT * REPLACE (expr AS col)`.
