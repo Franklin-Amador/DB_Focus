@@ -1,10 +1,54 @@
 package server
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"dbf/internal/catalog"
 )
+
+func TestDecodeBindValue(t *testing.T) {
+	if got := decodeBindValue([]byte("490133"), false); got != "490133" {
+		t.Errorf("text decode = %q, want 490133", got)
+	}
+	b4 := make([]byte, 4)
+	binary.BigEndian.PutUint32(b4, 490133)
+	if got := decodeBindValue(b4, true); got != "490133" {
+		t.Errorf("binary int4 decode = %q, want 490133", got)
+	}
+	b8 := make([]byte, 8)
+	binary.BigEndian.PutUint64(b8, 1234567890)
+	if got := decodeBindValue(b8, true); got != "1234567890" {
+		t.Errorf("binary int8 decode = %q, want 1234567890", got)
+	}
+	b2 := make([]byte, 2)
+	binary.BigEndian.PutUint16(b2, 42)
+	if got := decodeBindValue(b2, true); got != "42" {
+		t.Errorf("binary int2 decode = %q, want 42", got)
+	}
+}
+
+// TestParseBindParamsBinary is the regression for DBeaver/pgjdbc sending an oid
+// filter value in binary format: the 4-byte int must decode to its decimal text
+// so "WHERE c.oid = $1" matches instead of returning every table's columns.
+func TestParseBindParamsBinary(t *testing.T) {
+	var p []byte
+	p = append(p, 0)    // portal "" (cstring)
+	p = append(p, 0)    // statement "" (cstring)
+	p = append(p, 0, 1) // 1 format code
+	p = append(p, 0, 1) // format = binary
+	p = append(p, 0, 1) // 1 param
+	val := make([]byte, 4)
+	binary.BigEndian.PutUint32(val, 490133)
+	p = append(p, 0, 0, 0, 4) // length 4
+	p = append(p, val...)
+	p = append(p, 0, 0) // result format codes
+
+	params := parseBindParams(p)
+	if len(params) != 1 || params[0] != "490133" {
+		t.Fatalf("parseBindParams = %q, want [490133]", params)
+	}
+}
 
 // countingHandler records how many times the executor path runs, so a test can
 // assert that Describe does not execute a statement that Execute will run.

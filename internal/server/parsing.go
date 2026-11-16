@@ -52,7 +52,12 @@ func readCString(payload []byte, start int) (string, int, bool) {
 
 // parseBindParams extracts the parameter values from a Bind ('B') message so
 // they can be inlined into the prepared query (the engine has no real plan for
-// placeholders). Parameters are read as text; the format codes are skipped.
+// placeholders). The per-parameter format codes ARE honoured: a text parameter
+// is taken verbatim, but a BINARY parameter is decoded — pgjdbc (DBeaver) sends
+// integer filter values such as a table oid in binary (a 4-byte int), and
+// reading those raw bytes as a string made predicates like "c.oid = $1" never
+// match, so a metadata query returned every table's columns instead of one
+// table's.
 func parseBindParams(payload []byte) []string {
 	idx := 0
 	if _, next, ok := readCString(payload, idx); ok { // destination portal
@@ -69,7 +74,17 @@ func parseBindParams(payload []byte) []string {
 		return nil
 	}
 	fmtCount := int(binary.BigEndian.Uint16(payload[idx:]))
-	idx += 2 + fmtCount*2
+	idx += 2
+	// A format code of 1 means binary, 0 text. The array may be empty (all
+	// text), a single code (applies to every parameter) or one code per param.
+	formats := make([]uint16, fmtCount)
+	for i := 0; i < fmtCount; i++ {
+		if idx+2 > len(payload) {
+			return nil
+		}
+		formats[i] = binary.BigEndian.Uint16(payload[idx:])
+		idx += 2
+	}
 	if idx+2 > len(payload) {
 		return nil
 	}
@@ -89,10 +104,41 @@ func parseBindParams(payload []byte) []string {
 		if idx+int(length) > len(payload) {
 			break
 		}
-		params = append(params, string(payload[idx:idx+int(length)]))
+		raw := payload[idx : idx+int(length)]
 		idx += int(length)
+
+		binaryFmt := false
+		switch {
+		case fmtCount == 1:
+			binaryFmt = formats[0] == 1
+		case i < fmtCount:
+			binaryFmt = formats[i] == 1
+		}
+		params = append(params, decodeBindValue(raw, binaryFmt))
 	}
 	return params
+}
+
+// decodeBindValue renders a bound parameter as text for inlining. A text-format
+// value is used verbatim; a binary integer (1/2/4/8 bytes, big-endian signed) is
+// rendered in decimal so numeric predicates match. Any other binary payload is
+// passed through as raw bytes (best effort — the engine stores values as text).
+func decodeBindValue(raw []byte, binaryFmt bool) string {
+	if !binaryFmt {
+		return string(raw)
+	}
+	switch len(raw) {
+	case 1:
+		return strconv.FormatInt(int64(int8(raw[0])), 10)
+	case 2:
+		return strconv.FormatInt(int64(int16(binary.BigEndian.Uint16(raw))), 10)
+	case 4:
+		return strconv.FormatInt(int64(int32(binary.BigEndian.Uint32(raw))), 10)
+	case 8:
+		return strconv.FormatInt(int64(binary.BigEndian.Uint64(raw)), 10)
+	default:
+		return string(raw)
+	}
 }
 
 // maxSubstitutedQueryLen caps the size of a query after parameter inlining, so a
