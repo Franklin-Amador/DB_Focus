@@ -143,14 +143,25 @@ func quoteParam(val string) string {
 	return "'" + strings.ReplaceAll(val, "'", "''") + "'"
 }
 
-// isStrictNumeric reports whether s is a well-formed number, so inlining it bare
-// cannot inject syntax (e.g. "--" or "1 OR 1=1" are rejected and get quoted).
+// isStrictNumeric reports whether s is an unsigned decimal literal
+// (`[0-9]+(\.[0-9]+)?`), so inlining it bare cannot inject syntax. Signs,
+// exponents, hex, NaN and Inf (all accepted by strconv) are deliberately
+// rejected and get quoted instead.
 func isStrictNumeric(s string) bool {
-	if _, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return true
+	if s == "" {
+		return false
 	}
-	_, err := strconv.ParseFloat(s, 64)
-	return err == nil
+	seenDot := false
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+		case r == '.' && !seenDot:
+			seenDot = true
+		default:
+			return false
+		}
+	}
+	return s != "."
 }
 
 func isSelectOne(query string) bool {

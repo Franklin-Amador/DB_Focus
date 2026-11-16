@@ -4,8 +4,48 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strconv"
 	"strings"
 )
+
+// relationOID derives a stable object id for a table/view from its schema and
+// name, so pg_class (relation listing) and pg_attribute (columns) agree on the
+// same oid — a JDBC driver reads a table's oid from pg_class and then queries
+// its columns with "WHERE attrelid = <oid>".
+func relationOID(schema, name string) int32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(schema + "." + name))
+	return int32(100000 + h.Sum32()%1000000)
+}
+
+// oidFilterFromQuery extracts the numeric oid from a "c.oid = N" / "attrelid = N"
+// predicate of an (upper-cased, parameter-substituted) query.
+func oidFilterFromQuery(upper string) (int32, bool) {
+	for _, key := range []string{"ATTRELID", "C.OID", "OID"} {
+		idx := strings.Index(upper, key)
+		for idx >= 0 {
+			rest := strings.TrimLeft(upper[idx+len(key):], " ")
+			if strings.HasPrefix(rest, "=") {
+				rest = strings.TrimLeft(rest[1:], " ")
+				j := 0
+				for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+					j++
+				}
+				if j > 0 {
+					if n, err := strconv.Atoi(rest[:j]); err == nil {
+						return int32(n), true
+					}
+				}
+			}
+			next := strings.Index(upper[idx+len(key):], key)
+			if next < 0 {
+				break
+			}
+			idx = idx + len(key) + next
+		}
+	}
+	return 0, false
+}
 
 // SystemResult represents a result from a system catalog query
 type SystemResult struct {
@@ -104,8 +144,10 @@ var systemRoutes = []systemRoute{
 		return strings.Contains(u, "FROM PG_CATALOG.PG_NAMESPACE") && !strings.Contains(u, "PG_CATALOG.PG_CLASS")
 	}, func(c *Catalog, _, _ string) *SystemResult { return c.getPgNamespace() }},
 	{hasAny("PG_CATALOG.PG_ENUM"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgEnum() }},
+	// pg_attribute before pg_class: the column query joins both, and must be
+	// answered as columns, not as a relation list.
+	{hasAny("PG_CATALOG.PG_ATTRIBUTE"), func(c *Catalog, upper, _ string) *SystemResult { return c.getPgAttribute(upper) }},
 	{hasAny("PG_CATALOG.PG_CLASS"), func(c *Catalog, _, db string) *SystemResult { return c.getPgClass(db) }},
-	{hasAny("PG_CATALOG.PG_ATTRIBUTE"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgAttribute() }},
 	{hasAny("PG_CATALOG.PG_CONSTRAINT"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgConstraint() }},
 	{hasAny("PG_IS_IN_RECOVERY", "PG_IS_WAL_REPLAY_PAUSED"),
 		canned([]string{"inrecovery", "isreplaypaused"}, []interface{}{false, false}, "SELECT 1")},
@@ -607,17 +649,16 @@ func (c *Catalog) getPgClass(currentDatabase string) *SystemResult {
 	c.mu.RUnlock()
 
 	var rows [][]interface{}
-	oid := int32(1000)
 	for name := range tables {
 		if strings.HasPrefix(name, "pg_catalog.") || strings.HasPrefix(name, "pg_") {
 			continue
 		}
+		oid := relationOID(targetSchema, name)
 		rows = append(rows, []interface{}{oid, oid, name, int32(2200), "r", int32(10), int32(0)})
-		oid++
 	}
 	for name := range views {
+		oid := relationOID(targetSchema, name)
 		rows = append(rows, []interface{}{oid, oid, name, int32(2200), "v", int32(10), int32(0)})
-		oid++
 	}
 	return &SystemResult{
 		Columns: []string{"oid", "oid2", "relname", "relnamespace", "relkind", "relowner", "reltype"},
@@ -626,23 +667,59 @@ func (c *Catalog) getPgClass(currentDatabase string) *SystemResult {
 	}
 }
 
-func (c *Catalog) getPgAttribute() *SystemResult {
+func (c *Catalog) getPgAttribute(upper string) *SystemResult {
 	tables := c.GetAllTables()
+	wantOID, hasFilter := oidFilterFromQuery(upper)
+
 	var rows [][]interface{}
-	tableOid := int32(1000)
 	for tName, table := range tables {
-		if strings.HasPrefix(tName, "pg_catalog.") {
+		if strings.HasPrefix(tName, "pg_catalog.") || strings.HasPrefix(tName, "pg_") {
+			continue
+		}
+		schema, name := "public", tName
+		if parts := splitQualifiedName(tName); len(parts) == 2 {
+			schema, name = parts[0], parts[1]
+		}
+		oid := relationOID(schema, name)
+		// A driver asks for one table's columns via "WHERE attrelid = <oid>".
+		if hasFilter && oid != wantOID {
 			continue
 		}
 		for i, col := range table.Columns {
-			rows = append(rows, []interface{}{tableOid, col.Name, int32(25), int32(i + 1), col.NotNull, int32(-1), false})
+			rows = append(rows, []interface{}{oid, name, pgTypeOIDFor(col.Type), int32(i + 1), col.NotNull, int32(-1), false, col.Name})
 		}
-		tableOid++
 	}
 	return &SystemResult{
-		Columns: []string{"attrelid", "attname", "atttypid", "attnum", "attnotnull", "atttypmod", "attisdropped"},
+		// relname is projected first by the driver's "SELECT c.relname, a.*"; the
+		// trailing attname duplicate keeps the column reachable by name too.
+		Columns: []string{"attrelid", "relname", "atttypid", "attnum", "attnotnull", "atttypmod", "attisdropped", "attname"},
 		Rows:    rows,
 		Tag:     fmt.Sprintf("SELECT %d", len(rows)),
+	}
+}
+
+// pgTypeOIDFor maps a declared column type to a PostgreSQL type oid so a client
+// can resolve the column's data type.
+func pgTypeOIDFor(declared string) int32 {
+	switch strings.ToUpper(strings.TrimSpace(declared)) {
+	case "INT", "INTEGER", "INT4", "SERIAL":
+		return 23 // int4
+	case "BIGINT", "INT8", "BIGSERIAL":
+		return 20 // int8
+	case "SMALLINT", "INT2":
+		return 21 // int2
+	case "BOOL", "BOOLEAN":
+		return 16
+	case "REAL", "FLOAT4":
+		return 700
+	case "DOUBLE PRECISION", "FLOAT8", "FLOAT":
+		return 701
+	case "DATE":
+		return 1082
+	case "TIMESTAMP":
+		return 1114
+	default:
+		return 25 // text
 	}
 }
 
