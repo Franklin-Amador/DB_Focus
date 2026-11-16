@@ -89,6 +89,7 @@ var systemRoutes = []systemRoute{
 		includeTables, includeViews := relationKindsFromQuery(upper)
 		return c.getDtRelations(db, includeTables, includeViews)
 	}},
+	{hasAny("PG_CATALOG.PG_ROLES", "FROM PG_ROLES"), func(c *Catalog, _, _ string) *SystemResult { return c.getPgRoles() }},
 	{func(u string) bool {
 		return strings.Contains(u, "FROM PG_CATALOG.PG_NAMESPACE") && !strings.Contains(u, "PG_CATALOG.PG_CLASS")
 	}, func(c *Catalog, _, _ string) *SystemResult { return c.getPgNamespace() }},
@@ -196,14 +197,33 @@ func (c *Catalog) getDtRelations(currentDatabase string, includeTables bool, inc
 	}
 }
 
+// getPgRoles answers a JDBC driver's role enumeration (used to resolve object
+// owners). Returning at least the postgres superuser lets a client resolve
+// nspowner/relowner, without which some drivers skip every schema. Columns
+// follow the common "a.oid, a.*, description" projection.
+func (c *Catalog) getPgRoles() *SystemResult {
+	return &SystemResult{
+		Columns: []string{
+			"oid", "rolname", "rolsuper", "rolinherit", "rolcreaterole", "rolcreatedb",
+			"rolcanlogin", "rolreplication", "rolconnlimit", "rolbypassrls", "description",
+		},
+		Rows: [][]interface{}{
+			{int32(10), "postgres", true, true, true, true, true, true, int32(-1), true, nil},
+		},
+		Tag: "SELECT 1",
+	}
+}
+
 // getPgNamespace lists the system schemas plus every user schema, so \dn and
-// pg_namespace reflect CREATE SCHEMA.
+// pg_namespace reflect CREATE SCHEMA. All namespaces are owned by the postgres
+// role (oid 10) so a client can resolve the owner (an unresolvable owner makes
+// some drivers drop the schema).
 func (c *Catalog) getPgNamespace() *SystemResult {
 	rows := [][]interface{}{
 		{"14704", "14704", "information_schema", "10", "{postgres=UC/postgres,=U/postgres}", nil},
 		{"11", "11", "pg_catalog", "10", "{postgres=UC/postgres,=U/postgres}", "system catalog schema"},
 		{"99", "99", "pg_toast", "10", nil, "reserved schema for TOAST tables"},
-		{"2200", "2200", "public", "6171", "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}", "standard public schema"},
+		{"2200", "2200", "public", "10", "{postgres=UC/postgres,=U/postgres}", "standard public schema"},
 	}
 	oid := 16384
 	for _, s := range c.ListSchemas() {
