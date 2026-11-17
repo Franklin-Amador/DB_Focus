@@ -265,29 +265,94 @@ func handleSimpleQuery(rw *bufio.ReadWriter, handler QueryHandler, cat CatalogPr
 	return nil
 }
 
+// splitStatements splits a simple-query string into individual statements on
+// top-level semicolons. It is aware of single-quoted string literals AND of
+// dollar-quoting ($$...$$ and tagged $tag$...$tag$), so a semicolon inside a
+// function/procedure body (e.g. CREATE FUNCTION ... $function$ ...; ... $function$)
+// does not split the statement — which is exactly what psql/DBeaver send.
 func splitStatements(query string) []string {
 	var stmts []string
 	var current strings.Builder
 	inString := false
+	dollarTag := "" // open dollar-quote delimiter ("" when not inside one)
 
-	for i := 0; i < len(query); i++ {
-		ch := query[i]
-		if ch == '\'' {
-			inString = !inString
+	flush := func() {
+		if s := strings.TrimSpace(current.String()); s != "" {
+			stmts = append(stmts, s)
 		}
-		if ch == ';' && !inString {
-			if s := strings.TrimSpace(current.String()); s != "" {
-				stmts = append(stmts, s)
+		current.Reset()
+	}
+
+	for i := 0; i < len(query); {
+		ch := query[i]
+
+		if dollarTag != "" {
+			// Inside a dollar-quoted body: only its matching closing delimiter ends it.
+			if ch == '$' {
+				if d := dollarDelimAt(query, i); d == dollarTag {
+					current.WriteString(d)
+					i += len(d)
+					dollarTag = ""
+					continue
+				}
 			}
-			current.Reset()
+			current.WriteByte(ch)
+			i++
 			continue
 		}
-		current.WriteByte(ch)
+
+		if inString {
+			current.WriteByte(ch)
+			if ch == '\'' {
+				inString = false
+			}
+			i++
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inString = true
+			current.WriteByte(ch)
+			i++
+		case '$':
+			if d := dollarDelimAt(query, i); d != "" {
+				dollarTag = d
+				current.WriteString(d)
+				i += len(d)
+			} else {
+				current.WriteByte(ch)
+				i++
+			}
+		case ';':
+			flush()
+			i++
+		default:
+			current.WriteByte(ch)
+			i++
+		}
 	}
-	if s := strings.TrimSpace(current.String()); s != "" {
-		stmts = append(stmts, s)
-	}
+	flush()
 	return stmts
+}
+
+// dollarDelimAt returns the dollar-quote delimiter that starts at s[i] (which
+// must be '$'): "$$" or "$tag$" where tag is an identifier. It returns "" when
+// s[i] does not begin a valid delimiter.
+func dollarDelimAt(s string, i int) string {
+	j := i + 1
+	for j < len(s) {
+		c := s[j]
+		if c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			j++
+			continue
+		}
+		break
+	}
+	if j < len(s) && s[j] == '$' {
+		return s[i : j+1]
+	}
+	return ""
 }
 
 func handleSelectOne(rw *bufio.ReadWriter) error {
