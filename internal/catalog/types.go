@@ -78,11 +78,34 @@ type Procedure struct {
 type Trigger struct {
 	Name       string
 	Timing     string
-	Event      string
+	Event      string   // first event (backward compatibility)
+	Events     []string // all events for a multi-event trigger
 	Table      string
 	ForEachRow bool
-	Body       []ast.Statement
-	BodyText   string // Canonical AST-independent body SQL (re-parsed on load)
+	// UpdateColumns are the columns of an `UPDATE OF col, ...` trigger (stored;
+	// the trigger fires on any UPDATE of the table).
+	UpdateColumns []string
+	// ExecRoutine / ExecSchema name the function or procedure of a PostgreSQL
+	// `EXECUTE FUNCTION fn()` trigger. When set, the trigger runs that routine's
+	// body on fire; the inline Body is empty.
+	ExecRoutine string
+	ExecSchema  string
+	Body        []ast.Statement
+	BodyText    string // Canonical AST-independent body SQL (re-parsed on load)
+}
+
+// MatchesEvent reports whether the trigger fires for the given event, honoring a
+// multi-event trigger (Events) and falling back to the single Event field.
+func (t *Trigger) MatchesEvent(event string) bool {
+	if len(t.Events) > 0 {
+		for _, e := range t.Events {
+			if e == event {
+				return true
+			}
+		}
+		return false
+	}
+	return t.Event == event
 }
 
 type Job struct {

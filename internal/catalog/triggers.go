@@ -1,7 +1,6 @@
 package catalog
 
 import (
-	"dbf/internal/ast"
 	"dbf/internal/constants"
 	"fmt"
 	"sync/atomic"
@@ -10,32 +9,26 @@ import (
 // triggerOIDCounter generates unique OIDs for triggers
 var triggerOIDCounter int64 = 32768 // Start above procedure OIDs
 
-func (c *Catalog) CreateTrigger(name, timing, event, table string, forEachRow bool, body []ast.Statement, bodyText string) error {
+// CreateTrigger registers a new trigger (and a pg_catalog.pg_trigger row).
+// normalizeTrigger keeps Event / Events consistent for both the single- and
+// multi-event forms.
+func (c *Catalog) CreateTrigger(t *Trigger) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if triggers, exists := c.triggers[table]; exists {
-		for _, t := range triggers {
-			if t.Name == name {
-				return fmt.Errorf("trigger %s already exists on table %s", name, table)
+	if triggers, exists := c.triggers[t.Table]; exists {
+		for _, existing := range triggers {
+			if existing.Name == t.Name {
+				return fmt.Errorf("trigger %s already exists on table %s", t.Name, t.Table)
 			}
 		}
 	}
 
-	trigger := &Trigger{
-		Name:       name,
-		Timing:     timing,
-		Event:      event,
-		Table:      table,
-		ForEachRow: forEachRow,
-		Body:       body,
-		BodyText:   bodyText,
-	}
-
-	c.triggers[table] = append(c.triggers[table], trigger)
+	normalizeTrigger(t)
+	c.triggers[t.Table] = append(c.triggers[t.Table], t)
 
 	// Register in pg_catalog.pg_trigger
-	if err := c.registerTriggerInCatalog(name, timing, event, table); err != nil {
+	if err := c.registerTriggerInCatalog(t.Name, t.Timing, t.Events, t.Table); err != nil {
 		// Log but don't fail - trigger is still created in memory
 		fmt.Printf("warning: failed to register trigger in catalog: %v\n", err)
 	}
@@ -43,9 +36,20 @@ func (c *Catalog) CreateTrigger(name, timing, event, table string, forEachRow bo
 	return nil
 }
 
+// normalizeTrigger keeps the single Event field and the Events slice in sync,
+// tolerating data created through either form (or gob-decoded before Events).
+func normalizeTrigger(t *Trigger) {
+	if len(t.Events) == 0 && t.Event != "" {
+		t.Events = []string{t.Event}
+	}
+	if t.Event == "" && len(t.Events) > 0 {
+		t.Event = t.Events[0]
+	}
+}
+
 // registerTriggerInCatalog adds trigger to pg_catalog.pg_trigger
 // Caller must hold the write lock on c.mu
-func (c *Catalog) registerTriggerInCatalog(name, timing, event, tableName string) error {
+func (c *Catalog) registerTriggerInCatalog(name, timing string, events []string, tableName string) error {
 	triggerTable, err := c.getTableUnlocked(constants.CatalogTrigger)
 	if err != nil {
 		return err
@@ -53,18 +57,21 @@ func (c *Catalog) registerTriggerInCatalog(name, timing, event, tableName string
 
 	oid := atomic.AddInt64(&triggerOIDCounter, 1)
 
-	// Calculate tgtype bitmap: BEFORE=2, AFTER=0, INSERT=4, UPDATE=8, DELETE=16, ROW=1
+	// Calculate tgtype bitmap: BEFORE=2, AFTER=0, INSERT=4, UPDATE=8, DELETE=16, ROW=1.
+	// A multi-event trigger ORs the event bits into a single row.
 	tgtype := 0
 	if timing == constants.TriggerBefore {
 		tgtype |= 2
 	}
-	switch event {
-	case constants.TriggerInsert:
-		tgtype |= 4
-	case constants.TriggerUpdate:
-		tgtype |= 8
-	case constants.TriggerDelete:
-		tgtype |= 16
+	for _, event := range events {
+		switch event {
+		case constants.TriggerInsert:
+			tgtype |= 4
+		case constants.TriggerUpdate:
+			tgtype |= 8
+		case constants.TriggerDelete:
+			tgtype |= 16
+		}
 	}
 	tgtype |= 1 // FOR EACH ROW
 
@@ -95,7 +102,7 @@ func (c *Catalog) GetTriggers(table, timing, event string) []*Trigger {
 
 	result := make([]*Trigger, 0, len(triggers))
 	for _, t := range triggers {
-		if t.Timing == timing && t.Event == event {
+		if t.Timing == timing && t.MatchesEvent(event) {
 			result = append(result, t)
 		}
 	}
@@ -123,29 +130,20 @@ func (c *Catalog) DropTrigger(name, table string) error {
 
 // LoadTrigger loads a persisted trigger into the catalog (used on restart).
 // Unlike CreateTrigger, this does not re-register in pg_catalog.
-func (c *Catalog) LoadTrigger(name, timing, event, table string, forEachRow bool, body []ast.Statement, bodyText string) error {
-c.mu.Lock()
-defer c.mu.Unlock()
+func (c *Catalog) LoadTrigger(t *Trigger) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-// Check if trigger already exists
-if triggers, exists := c.triggers[table]; exists {
-for _, t := range triggers {
-if t.Name == name {
-return nil // Already loaded
-}
-}
-}
+	// Check if trigger already exists
+	if triggers, exists := c.triggers[t.Table]; exists {
+		for _, existing := range triggers {
+			if existing.Name == t.Name {
+				return nil // Already loaded
+			}
+		}
+	}
 
-trigger := &Trigger{
-Name:       name,
-Timing:     timing,
-Event:      event,
-Table:      table,
-ForEachRow: forEachRow,
-Body:       body,
-BodyText:   bodyText,
-}
-
-c.triggers[table] = append(c.triggers[table], trigger)
-return nil
+	normalizeTrigger(t)
+	c.triggers[t.Table] = append(c.triggers[t.Table], t)
+	return nil
 }

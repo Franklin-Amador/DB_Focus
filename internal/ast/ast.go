@@ -431,13 +431,24 @@ type DropProcedure struct {
 func (DropProcedure) stmtNode() {}
 
 type CreateTrigger struct {
-	Name       Identifier
-	Timing     string // "BEFORE", "AFTER", "INSTEAD OF"
-	Event      string // "INSERT", "UPDATE", "DELETE"
-	Table      Identifier
-	ForEachRow bool
-	Body       []Statement
-	BodyText   string // Verbatim SQL of the body, for stable persistence
+	Name   Identifier
+	Timing string // "BEFORE", "AFTER", "INSTEAD OF"
+	// Event is the first trigger event (kept for backward compatibility).
+	// Events holds all of them for a multi-event trigger
+	// (INSERT OR UPDATE OR DELETE).
+	Event  string
+	Events []string
+	// UpdateColumns are the columns of an `UPDATE OF col, ...` trigger (parsed
+	// and stored; the trigger still fires on any UPDATE of the table).
+	UpdateColumns []string
+	Table         Identifier
+	ForEachRow    bool
+	// ExecRoutine names the function/procedure of a PostgreSQL-style
+	// `EXECUTE FUNCTION fn()` / `EXECUTE PROCEDURE fn()` trigger (schema in
+	// Alias). Empty when the trigger has an inline BEGIN ... END body.
+	ExecRoutine Identifier
+	Body        []Statement
+	BodyText    string // Verbatim SQL of the body, for stable persistence
 }
 
 func (CreateTrigger) stmtNode() {}

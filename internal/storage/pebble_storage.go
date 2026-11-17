@@ -315,13 +315,17 @@ func (ps *PebbleStorage) SaveTrigger(trigger *catalog.Trigger) error {
 
 	enc := gob.NewEncoder(buf)
 	td := TriggerData{
-		Name:       trigger.Name,
-		Timing:     trigger.Timing,
-		Event:      trigger.Event,
-		Table:      trigger.Table,
-		ForEachRow: trigger.ForEachRow,
-		Body:       trigger.Body,
-		BodyText:   trigger.BodyText,
+		Name:          trigger.Name,
+		Timing:        trigger.Timing,
+		Event:         trigger.Event,
+		Events:        trigger.Events,
+		Table:         trigger.Table,
+		ForEachRow:    trigger.ForEachRow,
+		UpdateColumns: trigger.UpdateColumns,
+		ExecRoutine:   trigger.ExecRoutine,
+		ExecSchema:    trigger.ExecSchema,
+		Body:          trigger.Body,
+		BodyText:      trigger.BodyText,
 	}
 	if err := enc.Encode(td); err != nil {
 		return fmt.Errorf("failed to encode trigger %s: %w", trigger.Name, err)
@@ -437,13 +441,17 @@ type ViewData struct {
 }
 
 type TriggerData struct {
-	Name       string
-	Timing     string
-	Event      string
-	Table      string
-	ForEachRow bool
-	Body       []ast.Statement
-	BodyText   string
+	Name          string
+	Timing        string
+	Event         string
+	Events        []string
+	Table         string
+	ForEachRow    bool
+	UpdateColumns []string
+	ExecRoutine   string
+	ExecSchema    string
+	Body          []ast.Statement
+	BodyText      string
 }
 
 type JobData struct {
@@ -1104,7 +1112,19 @@ func (ps *PebbleStorage) loadDatabase(cat *catalog.Catalog) error {
 					log.Printf("[storage] warning: failed to re-parse trigger %s body, using stored AST: %v", td.Name, perr)
 				}
 			}
-			if err := cat.LoadTrigger(td.Name, td.Timing, td.Event, td.Table, td.ForEachRow, tbody, td.BodyText); err != nil {
+			if err := cat.LoadTrigger(&catalog.Trigger{
+				Name:          td.Name,
+				Timing:        td.Timing,
+				Event:         td.Event,
+				Events:        td.Events,
+				Table:         td.Table,
+				ForEachRow:    td.ForEachRow,
+				UpdateColumns: td.UpdateColumns,
+				ExecRoutine:   td.ExecRoutine,
+				ExecSchema:    td.ExecSchema,
+				Body:          tbody,
+				BodyText:      td.BodyText,
+			}); err != nil {
 				log.Printf("[storage] warning: failed to load trigger %s: %v", td.Name, err)
 			}
 		} else if strings.HasPrefix(key, "job:") {

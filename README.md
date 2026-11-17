@@ -129,7 +129,10 @@ postgresql://postgres:4444@localhost:4444/postgres
 - `CREATE DATABASE` nombre [WITH opciones] — nueva base aislada (su propio `public`, procedimientos, triggers y jobs)
 - `DROP DATABASE` nombre — elimina la base con todo su contenido (no la por defecto ni la que está en uso)
 - `CREATE PROCEDURE` nombre [(parámetros)] AS BEGIN sentencias... END
-- `CREATE TRIGGER` nombre [BEFORE|AFTER|INSTEAD OF] [INSERT|UPDATE|DELETE] ON tabla [FOR EACH ROW] BEGIN sentencias... END
+- `CREATE TRIGGER` nombre [BEFORE|AFTER|INSTEAD OF] evento ON [schema.]tabla [FOR EACH ROW|STATEMENT] [WHEN (cond)] { BEGIN sentencias... END | EXECUTE FUNCTION|PROCEDURE rutina() }
+  - **evento** puede ser múltiple: `INSERT OR UPDATE OR DELETE`, y `UPDATE OF col1, col2`.
+  - Forma nativa: cuerpo inline `BEGIN ... END`. Forma **PostgreSQL/DBeaver**: `EXECUTE FUNCTION fn()` / `EXECUTE PROCEDURE fn()` — al dispararse corre el cuerpo de la rutina referenciada si es un `PROCEDURE` existente; si la rutina no existe o es una función de trigger (aún no soportada), el trigger parsea pero queda inerte.
+  - `WHEN (condición)` y `FOR EACH STATEMENT` se parsean (la condición no se evalúa; el disparo es por fila).
 - `CREATE JOB` nombre SCHEDULE EVERY n [MINUTE|HOUR|DAY] BEGIN sentencias... END
 - `CALL` procedimiento [(argumentos)]
 - `DROP TRIGGER` nombre ON tabla
@@ -324,6 +327,7 @@ go run ./cmd/test-procedure-persistence
 go run ./cmd/test-routine-persistence
 go run ./cmd/test-job-persistence
 go run ./cmd/test-trigger-recursion
+go run ./cmd/test-trigger-pg      # triggers PG/DBeaver: multi-evento, UPDATE OF, EXECUTE FUNCTION/PROCEDURE (+ reload)
 go run ./cmd/test-persistence-integration
 
 # Parseo multi-statement

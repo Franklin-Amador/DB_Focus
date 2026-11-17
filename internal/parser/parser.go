@@ -631,7 +631,7 @@ func (p *Parser) parseCreateTrigger() (ast.Statement, error) {
 	stmt := &ast.CreateTrigger{Name: ast.Identifier{Name: p.cur.Literal}}
 	p.next()
 
-	// Parse timing (BEFORE/AFTER/INSTEAD)
+	// Parse timing (BEFORE/AFTER/INSTEAD OF)
 	switch p.cur.Type {
 	case TokenBefore:
 		stmt.Timing = "BEFORE"
@@ -649,44 +649,119 @@ func (p *Parser) parseCreateTrigger() (ast.Statement, error) {
 		return nil, p.errorf("expected BEFORE, AFTER, or INSTEAD OF")
 	}
 
-	// Parse event (INSERT/UPDATE/DELETE)
-	switch p.cur.Type {
-	case TokenInsert:
-		stmt.Event = "INSERT"
-	case TokenUpdate:
-		stmt.Event = "UPDATE"
-	case TokenDelete:
-		stmt.Event = "DELETE"
-	default:
-		return nil, p.errorf("expected INSERT, UPDATE, or DELETE")
+	// Parse one or more events: INSERT [OR UPDATE [OF cols] [OR DELETE]].
+	for {
+		switch p.cur.Type {
+		case TokenInsert:
+			stmt.Events = append(stmt.Events, "INSERT")
+			p.next()
+		case TokenDelete:
+			stmt.Events = append(stmt.Events, "DELETE")
+			p.next()
+		case TokenUpdate:
+			stmt.Events = append(stmt.Events, "UPDATE")
+			p.next()
+			// Optional `UPDATE OF col, col`: the columns that fire the trigger.
+			if p.cur.Type == TokenOf {
+				p.next()
+				for {
+					id, err := p.parseIdentRequired("expected column name after UPDATE OF")
+					if err != nil {
+						return nil, err
+					}
+					stmt.UpdateColumns = append(stmt.UpdateColumns, id.Name)
+					if p.cur.Type == TokenComma {
+						p.next()
+						continue
+					}
+					break
+				}
+			}
+		default:
+			return nil, p.errorf("expected INSERT, UPDATE, or DELETE")
+		}
+		if p.cur.Type == TokenOr {
+			p.next()
+			continue
+		}
+		break
 	}
-	p.next()
+	if len(stmt.Events) > 0 {
+		stmt.Event = stmt.Events[0]
+	}
 
-	// Expect ON
+	// Expect ON [schema.]table
 	if !p.expect(TokenOn) {
 		return nil, p.errorf("expected ON")
 	}
-
-	// Parse table name
 	if p.cur.Type != TokenIdent {
 		return nil, p.errorf("expected table name")
 	}
-	stmt.Table = ast.Identifier{Name: p.cur.Literal}
-	p.next()
+	stmt.Table = p.parseQualifiedIdent()
 
-	// Parse FOR EACH ROW (optional, defaults to true)
+	// Parse FOR EACH ROW | STATEMENT (optional, defaults to row).
 	stmt.ForEachRow = true
 	if p.cur.Type == TokenFor {
 		p.next()
 		if !p.expect(TokenEach) {
 			return nil, p.errorf("expected EACH after FOR")
 		}
-		if !p.expect(TokenRow) {
-			return nil, p.errorf("expected ROW after EACH")
+		switch {
+		case p.cur.Type == TokenRow:
+			p.next()
+		case p.cur.Type == TokenIdent && strings.EqualFold(p.cur.Literal, "STATEMENT"):
+			stmt.ForEachRow = false
+			p.next()
+		default:
+			return nil, p.errorf("expected ROW or STATEMENT after EACH")
 		}
 	}
 
-	// Parse BEGIN ... END body
+	// Optional WHEN (condition): parsed and skipped (not evaluated). WHEN is a
+	// reserved token (also used by CASE), so match the token, not a literal.
+	if p.cur.Type == TokenWhen {
+		p.next()
+		if !p.expect(TokenLParen) {
+			return nil, p.errorf("expected ( after WHEN")
+		}
+		depth := 1
+		for depth > 0 && p.cur.Type != TokenEOF {
+			if p.cur.Type == TokenLParen {
+				depth++
+			} else if p.cur.Type == TokenRParen {
+				depth--
+			}
+			p.next()
+		}
+	}
+
+	// Body: PostgreSQL `EXECUTE FUNCTION|PROCEDURE fn()` or native `BEGIN ... END`.
+	if p.cur.Type == TokenIdent && strings.EqualFold(p.cur.Literal, "EXECUTE") {
+		p.next()
+		if p.cur.Type != TokenFunction && p.cur.Type != TokenProcedure {
+			return nil, p.errorf("expected FUNCTION or PROCEDURE after EXECUTE")
+		}
+		p.next()
+		if p.cur.Type != TokenIdent {
+			return nil, p.errorf("expected routine name after EXECUTE FUNCTION/PROCEDURE")
+		}
+		stmt.ExecRoutine = p.parseQualifiedIdent()
+		// Optional argument list: fn() or fn(arg, ...). Skipped.
+		if p.cur.Type == TokenLParen {
+			depth := 1
+			p.next()
+			for depth > 0 && p.cur.Type != TokenEOF {
+				if p.cur.Type == TokenLParen {
+					depth++
+				} else if p.cur.Type == TokenRParen {
+					depth--
+				}
+				p.next()
+			}
+		}
+		return stmt, nil
+	}
+
 	body, bodyText, err := p.parseBeginEndBlock()
 	if err != nil {
 		return nil, err

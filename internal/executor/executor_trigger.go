@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"dbf/internal/ast"
+	"dbf/internal/catalog"
 	"dbf/internal/constants"
 )
 
@@ -23,25 +24,27 @@ func (e *Executor) executeCreateTrigger(ctx context.Context, stmt *ast.CreateTri
 		return nil, err
 	}
 
-	if err := e.catalog.CreateTrigger(
-		stmt.Name.Name,
-		stmt.Timing,
-		stmt.Event,
-		stmt.Table.Name,
-		stmt.ForEachRow,
-		stmt.Body,
-		stmt.BodyText,
-	); err != nil {
+	trig := &catalog.Trigger{
+		Name:          stmt.Name.Name,
+		Timing:        stmt.Timing,
+		Event:         stmt.Event,
+		Events:        stmt.Events,
+		Table:         stmt.Table.Name,
+		ForEachRow:    stmt.ForEachRow,
+		UpdateColumns: stmt.UpdateColumns,
+		ExecRoutine:   stmt.ExecRoutine.Name,
+		ExecSchema:    stmt.ExecRoutine.Alias,
+		Body:          stmt.Body,
+		BodyText:      stmt.BodyText,
+	}
+	if err := e.catalog.CreateTrigger(trig); err != nil {
 		return nil, fmt.Errorf("failed to create trigger %s: %w", stmt.Name.Name, err)
 	}
 
 	// Persist trigger to storage
 	if e.storage != nil {
-		// Get trigger from catalog to persist
-		if triggers := e.catalog.GetTriggers(stmt.Table.Name, stmt.Timing, stmt.Event); len(triggers) > 0 {
-			if err := e.storage.SaveTrigger(triggers[len(triggers)-1]); err != nil {
-				fmt.Printf("warning: failed to persist trigger %s: %v\n", stmt.Name.Name, err)
-			}
+		if err := e.storage.SaveTrigger(trig); err != nil {
+			fmt.Printf("warning: failed to persist trigger %s: %v\n", stmt.Name.Name, err)
 		}
 	}
 
@@ -110,8 +113,21 @@ func (e *Executor) executeTriggers(ctx context.Context, table, timing, event str
 	rowRefs := e.triggerRowRefs(table, oldRow, newRow)
 
 	for _, trigger := range triggers {
+		// Resolve the statements to run: an inline BEGIN...END body, or the body
+		// of the routine named by a PostgreSQL `EXECUTE FUNCTION/PROCEDURE fn()`
+		// trigger. A referenced routine that is not a runnable procedure (e.g. a
+		// trigger function, not yet supported) leaves the trigger inert.
+		body := trigger.Body
+		if trigger.ExecRoutine != "" {
+			proc, err := e.catalog.GetProcedure(trigger.ExecRoutine)
+			if err != nil {
+				continue // referenced routine not runnable yet — inert, not an error
+			}
+			body = proc.Body
+		}
+
 		// Execute each statement in the trigger body
-		for _, stmt := range trigger.Body {
+		for _, stmt := range body {
 			// Check context before each statement
 			if err := checkCtx(ctx); err != nil {
 				return err

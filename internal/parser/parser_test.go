@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -1233,5 +1234,50 @@ func TestParseProcedureDecorations(t *testing.T) {
 	}
 	if proc.Parameters[1].Name.Name != "total" || proc.Parameters[1].Type != "NUMERIC" {
 		t.Fatalf("unexpected second parameter %+v", proc.Parameters[1])
+	}
+}
+
+func TestParseTriggerPGForms(t *testing.T) {
+	// EXECUTE FUNCTION: stores the referenced routine, no inline body.
+	tr := mustParseStmt(t, "CREATE TRIGGER t AFTER INSERT ON ventas FOR EACH ROW EXECUTE FUNCTION log_fn()").(*ast.CreateTrigger)
+	if tr.ExecRoutine.Name != "log_fn" || len(tr.Body) != 0 {
+		t.Fatalf("EXECUTE FUNCTION: unexpected %+v", tr)
+	}
+	if len(tr.Events) != 1 || tr.Events[0] != "INSERT" || tr.Event != "INSERT" {
+		t.Fatalf("expected single INSERT event, got %+v", tr.Events)
+	}
+
+	// Multi-event.
+	tr = mustParseStmt(t, "CREATE TRIGGER t AFTER INSERT OR UPDATE OR DELETE ON ventas FOR EACH ROW EXECUTE FUNCTION log_fn()").(*ast.CreateTrigger)
+	if fmt.Sprint(tr.Events) != "[INSERT UPDATE DELETE]" {
+		t.Fatalf("expected 3 events, got %+v", tr.Events)
+	}
+
+	// UPDATE OF columns.
+	tr = mustParseStmt(t, "CREATE TRIGGER t BEFORE UPDATE OF precio, stock ON ventas FOR EACH ROW EXECUTE FUNCTION log_fn()").(*ast.CreateTrigger)
+	if fmt.Sprint(tr.UpdateColumns) != "[precio stock]" {
+		t.Fatalf("expected UPDATE OF precio, stock, got %+v", tr.UpdateColumns)
+	}
+
+	// EXECUTE PROCEDURE + schema-qualified routine/table.
+	tr = mustParseStmt(t, "CREATE TRIGGER t AFTER INSERT ON public.ventas FOR EACH ROW EXECUTE PROCEDURE public.log_fn()").(*ast.CreateTrigger)
+	if tr.Table.Name != "ventas" || tr.Table.Alias != "public" {
+		t.Fatalf("expected schema-qualified table, got %+v", tr.Table)
+	}
+	if tr.ExecRoutine.Name != "log_fn" || tr.ExecRoutine.Alias != "public" {
+		t.Fatalf("expected schema-qualified routine, got %+v", tr.ExecRoutine)
+	}
+
+	// WHEN clause and FOR EACH STATEMENT are tolerated.
+	mustParseStmt(t, "CREATE TRIGGER t BEFORE UPDATE ON ventas FOR EACH ROW WHEN (OLD.x <> NEW.x) EXECUTE FUNCTION log_fn()")
+	stTr := mustParseStmt(t, "CREATE TRIGGER t AFTER INSERT ON ventas FOR EACH STATEMENT EXECUTE FUNCTION log_fn()").(*ast.CreateTrigger)
+	if stTr.ForEachRow {
+		t.Fatalf("FOR EACH STATEMENT should set ForEachRow=false")
+	}
+
+	// Native inline body still parses.
+	tr = mustParseStmt(t, "CREATE TRIGGER t AFTER INSERT ON ventas FOR EACH ROW BEGIN INSERT INTO log (msg) VALUES ('h'); END").(*ast.CreateTrigger)
+	if len(tr.Body) != 1 || tr.ExecRoutine.Name != "" {
+		t.Fatalf("native inline: unexpected %+v", tr)
 	}
 }

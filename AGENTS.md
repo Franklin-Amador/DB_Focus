@@ -1892,3 +1892,36 @@ devuelve filas). build/vet/test + **44** integraciones del motor + parser_test.g
 **Pendiente** (próximos pasos, aún no hechos): parser de triggers PG (`EXECUTE FUNCTION/PROCEDURE`,
 multi-evento, `UPDATE OF col`) y funciones de trigger/escalares (`RETURNS trigger`, `RETURN NEW`,
 cuerpos escalares). Decisión abierta: solo-parseo vs parseo+semántica para la forma `EXECUTE FUNCTION`.
+
+### Session: November 17, 2026 - Triggers estilo PostgreSQL/DBeaver (paso 2)
+
+**Objetivo**: parsear (y ejecutar donde sea coherente) las formas de trigger que emite DBeaver/PG.
+
+**Status**: ✅ COMPLETED
+
+**Parser** (`parseCreateTrigger` reescrito): eventos **múltiples** `INSERT OR UPDATE OR DELETE`,
+`UPDATE OF col, col`, tabla `schema.tabla`, `FOR EACH ROW|STATEMENT`, `WHEN (cond)` (se parsea y se
+descarta), y la forma PG `EXECUTE FUNCTION|PROCEDURE rutina()` (args entre paréntesis se saltan) como
+alternativa al `BEGIN … END` nativo. `WHEN` se detecta por token (`TokenWhen`, reservado por CASE),
+no por literal.
+
+**AST/catalog/storage**: `ast.CreateTrigger` y `catalog.Trigger` ganan `Events []string`,
+`UpdateColumns []string`, `ExecRoutine`/`ExecSchema` (Event sigue como el primero, compat).
+`catalog.CreateTrigger`/`LoadTrigger` ahora toman `*Trigger` (antes 7 args sueltos); `normalizeTrigger`
+mantiene Event/Events en sync; `GetTriggers` matchea con `Trigger.MatchesEvent` (cualquiera de Events);
+`registerTriggerInCatalog` OR-ea los bits de tgtype multi-evento en una fila. `storage.TriggerData`
+persiste los campos nuevos; `SaveTrigger`/load actualizados (gob retro-compatible).
+
+**Ejecución**: `executeTriggers` corre el cuerpo inline, o —si `ExecRoutine` está set— el `Body` del
+**procedimiento** referenciado (con binding NEW/OLD), con fallback inerte (sin error) si la rutina no
+existe o no es un procedure (ej. una función de trigger, pendiente del paso 3). Multi-evento dispara
+en cada evento listado. `UPDATE OF` se guarda pero no restringe el disparo (se dispara en cualquier
+UPDATE).
+
+**Tests**: `cmd/test-trigger-pg` (parseo de todas las formas + multi-evento ejecuta + EXECUTE PROCEDURE
+ejecuta + EXECUTE FUNCTION a rutina inexistente inerte + round-trip de persistencia);
+`parser_test.go: TestParseTriggerPGForms`. build/vet/test + **45** integraciones del motor ✅
+(test-trigger-oldnew/recursion siguen pasando con el refactor de CreateTrigger). README actualizado.
+
+**Pendiente (paso 3)**: funciones de trigger (`RETURNS trigger`, `RETURN NEW`, cuerpos escalares) para
+que `EXECUTE FUNCTION fn()` apuntando a una función plpgsql real ejecute (hoy solo procedures).
