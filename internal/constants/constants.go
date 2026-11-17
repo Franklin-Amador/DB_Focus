@@ -8,6 +8,7 @@ const (
 	ConstraintForeignKey = "FOREIGN_KEY"
 	ConstraintUnique     = "UNIQUE"
 	ConstraintNotNull    = "NOT_NULL"
+	ConstraintCheck      = "CHECK"
 )
 
 // Trigger timing

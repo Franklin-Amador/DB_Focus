@@ -20,6 +20,9 @@ type Identifier struct {
 	// (e.g. FROM fn_listar_cursos()); Args carries the call arguments.
 	IsCall bool
 	Args   []Literal
+	// Subquery is set when the reference is a derived table (FROM (SELECT ...) x);
+	// Name is then empty and Alias carries the derived-table alias.
+	Subquery *Select
 }
 
 // WindowFunc is a window-function call: FUNC(arg) OVER (PARTITION BY ... ORDER BY ...).
@@ -73,6 +76,17 @@ type NotNullConstraint struct {
 
 func (NotNullConstraint) constraintNode() {}
 
+// CheckConstraint is a CHECK (predicate) constraint, column- or table-level.
+// Expr is the parsed predicate; Text is its verbatim source, persisted and
+// re-parsed on load (AST-independent, like views). Name is optional.
+type CheckConstraint struct {
+	Name string
+	Expr *WhereClause
+	Text string
+}
+
+func (CheckConstraint) constraintNode() {}
+
 type ColumnDef struct {
 	Name        Identifier
 	Type        string
@@ -94,6 +108,7 @@ type CreateIndex struct {
 	Name    Identifier
 	Table   Identifier
 	Columns []Identifier
+	Unique  bool
 }
 
 func (CreateIndex) stmtNode() {}
@@ -225,6 +240,20 @@ type StarRename struct {
 
 func (Select) stmtNode() {}
 
+// SetOp is a chain of set operations over SELECT operands, folded left to right.
+// All[i] reports whether the operator between Selects[i] and Selects[i+1] is
+// UNION ALL (keep duplicates) rather than UNION (deduplicate). OrderBy/Limit/
+// Offset apply to the combined result. Column names come from the first operand.
+type SetOp struct {
+	Selects []*Select
+	All     []bool
+	OrderBy []OrderByClause
+	Limit   int
+	Offset  int
+}
+
+func (SetOp) stmtNode() {}
+
 type JoinClause struct {
 	Type    string // "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "ASOF"
 	Table   Identifier
@@ -260,6 +289,15 @@ type WhereClause struct {
 	// gob-backward-compatible (old blobs decode it to the zero Literal).
 	Value2 Literal
 
+	// Subquery fields. Sub is the right-hand SELECT for a scalar subquery
+	// (col OP (SELECT ...)), an IN subquery (Operator == "IN") or an EXISTS
+	// predicate (Operator == "EXISTS", Column empty). ValueList is the literal
+	// list of an IN predicate (col IN (v1, v2, ...)). Negate marks NOT IN /
+	// NOT EXISTS.
+	Sub       *Select
+	ValueList []Literal
+	Negate    bool
+
 	// Compound fields (used when Conj != "").
 	Left  *WhereClause
 	Conj  string // "AND" or "OR"
@@ -279,6 +317,11 @@ func (w *WhereClause) LeafColumns() []string {
 		return nil
 	}
 	if w.Conj == "" {
+		// EXISTS predicates have no left column; subquery/IN-list leaves resolve
+		// their inner columns separately. Only validate a real left column name.
+		if w.Column.Name == "" {
+			return nil
+		}
 		return []string{w.Column.Name}
 	}
 	return append(w.Left.LeafColumns(), w.Right.LeafColumns()...)
@@ -296,11 +339,22 @@ func (w *WhereClause) Leaves() []*WhereClause {
 	return append(w.Left.Leaves(), w.Right.Leaves()...)
 }
 
-type Update struct {
-	Table  Identifier
+// Assignment is one `column = value` pair of an UPDATE's SET clause.
+type Assignment struct {
 	Column Identifier
 	Value  Literal
-	Where  *WhereClause
+}
+
+type Update struct {
+	Table Identifier
+	// Column and Value mirror the first assignment, kept for backward
+	// compatibility (gob-decoded statements, single-column callers).
+	Column Identifier
+	Value  Literal
+	// Assignments holds every `col = value` pair (UPDATE t SET a = 1, b = 2).
+	// The parser always fills it and sets Column/Value = Assignments[0].
+	Assignments []Assignment
+	Where       *WhereClause
 }
 
 func (Update) stmtNode() {}

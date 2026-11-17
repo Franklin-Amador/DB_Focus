@@ -106,6 +106,7 @@ type TableData struct {
 type IndexData struct {
 	Name        string   `json:"name"`
 	ColumnNames []string `json:"column_names,omitempty"`
+	Unique      bool     `json:"unique,omitempty"`
 	// ColumnName is kept for backward compatibility with previous persisted format.
 	ColumnName string `json:"column_name,omitempty"`
 }
@@ -129,6 +130,8 @@ type ColumnData struct {
 	NotNull       bool   `json:"not_null"`
 	Identity      bool   `json:"identity"`
 	IdentityValue int    `json:"identity_value"`
+	DefaultKind   string `json:"default_kind,omitempty"`
+	DefaultValue  string `json:"default_value,omitempty"`
 }
 
 type ConstraintData struct {
@@ -138,6 +141,8 @@ type ConstraintData struct {
 	ReferencedCol   string `json:"referenced_col,omitempty"`
 	OnDelete        string `json:"on_delete,omitempty"`
 	OnUpdate        string `json:"on_update,omitempty"`
+	Name            string `json:"name,omitempty"`
+	CheckExpr       string `json:"check_expr,omitempty"`
 }
 
 // syncIdentityValues normalizes a table's IDENTITY columns after a bulk load:

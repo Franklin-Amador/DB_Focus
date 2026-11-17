@@ -1738,3 +1738,75 @@ integración del motor ✅.
 
 **Fuera de alcance / follow-ups**: MAX_BY/MIN_BY como función de ventana (`OVER`); ASOF JOIN con
 MATCH_CONDITION compuesto o múltiples claves ON; `SELECT * REPLACE (expr AS col)`.
+
+### Session: November 17, 2026 - Correcciones de compatibilidad SQL (reporte de pruebas)
+
+**Objetivo**: cerrar las fallas de un informe de compatibilidad del usuario. Primero se
+reprodujo cada ítem contra el motor actual para separar bugs reales de reporte desactualizado.
+
+**Status**: ✅ COMPLETED
+
+**Triage** (reproducido antes de tocar nada): ya funcionaban FK inline/tabla, SERIAL, UNION
+*parseaba*, TRIGGER, FUNCTION (con `AS $$...$$`) y subquery escalar en el SELECT. Bugs reales:
+1. 🔴 **UPDATE multi-columna** silenciosamente descartado — el parser leía un solo `col = val`, la
+   coma hacía que `parseWhereClause` devolviera nil y el resto (`, b = ...`) quedaba sin consumir.
+2. 🔴 **UNION/UNION ALL** parseaba pero devolvía **solo el primer SELECT** (ignoraba el resto).
+3. 🔴 **DEFAULT** (literal y `CURRENT_TIMESTAMP`) parseaba pero el executor no lo aplicaba.
+4. **CHECK** no parseaba (caía como ident → "expected )").
+5. **CONSTRAINT nombre ...** (FK/PK/UNIQUE/CHECK) no parseaba.
+6. **CREATE UNIQUE INDEX** e **INDEX (col DESC)** no parseaban.
+7. **Subconsultas** (IN/EXISTS/escalar en WHERE/derivadas) no parseaban.
+8. **`NULL` literal** en INSERT no parseaba.
+
+**Cambios por feature**:
+- **NULL literal**: `parseLiteral` maneja `TokenNull`/`TRUE`/`FALSE`; `literalCell` (executor) mapea
+  kind `"null"` → `nil` en INSERT/UPDATE.
+- **UPDATE multi-columna**: `ast.Update.Assignments []Assignment` (Column/Value = Assignments[0]
+  para compat). `parseUpdate` loopea `col = val` por comas. `executeUpdate` reescrito: resuelve cada
+  asignación, corre validación/uniqueness/ON UPDATE por columna, y `performUpdate` recibe un
+  `apply func([]interface{})` que setea todas las columnas por fila. Validator recorre Assignments.
+- **DEFAULT**: `catalog.Column.DefaultKind/DefaultValue` (+ `storage.ColumnData`); `executeCreateTable`
+  propaga `col.DefaultVal`; `buildInsertValues` aplica el default a columnas omitidas (con máscara
+  `provided` para no pisar un `NULL` explícito); `defaultCell` evalúa `CURRENT_TIMESTAMP`/`NOW`.
+- **CHECK**: `ast.CheckConstraint{Name, Expr *WhereClause, Text}`; parseo de `CHECK (expr)` reusando
+  `parseWhereOr` (columna-contra-literal, AND/OR), captura de texto verbatim para persistencia
+  (`ParsePredicate` re-parsea al enforcement). `catalog.Constraint.CheckExpr/Name` + `ConstraintCheck`
+  + `storage.ConstraintData`. Enforcement en `executor_check.go` (`enforceRowChecks` en INSERT,
+  `checkRowsAfterUpdate` sobre la imagen post-update), con caché de predicados compilados.
+- **CONSTRAINT nombrado**: `parseTableLevelConstraint` acepta prefijo `CONSTRAINT <nombre>` (el
+  nombre se conserva para CHECK; `isTableConstraintStart` detecta CHECK/CONSTRAINT que lexean como
+  ident). CHECK a nivel de columna también.
+- **UNIQUE INDEX / INDEX DESC**: `ast.CreateIndex.Unique`; `parseCreate` maneja `CREATE UNIQUE INDEX`;
+  `parseCreateIndexBody` acepta `ASC|DESC` por columna (consumido). `catalog.Index.Unique` +
+  `Table.CreateIndex(name, cols, unique)` (chequea duplicados al crear y en cada INSERT vía
+  `checkUniqueIndexesLocked`) + `storage.IndexData.Unique`. `catalog.CreateIndex` ganó el param.
+- **UNION/UNION ALL**: token `UNION`; `ast.SetOp{Selects, All, OrderBy, Limit, Offset}`. `parseSelect`
+  refactorizado: `parseSelectCore` parsea DISTINCT..QUALIFY; el tail detecta `UNION [ALL]` y arma el
+  SetOp, con ORDER BY/LIMIT finales sobre el combinado. `executor_setop.go` hace fold left-assoc
+  (dedup en cada `UNION`, conserva en `UNION ALL`), valida igual cantidad de columnas, aplica
+  ORDER BY/LIMIT. `parseSelectItem` corta en `UNION` a depth 0.
+- **Subconsultas**: `ast.WhereClause.{Sub, ValueList, Negate}` + `ast.Identifier.Subquery` (tabla
+  derivada). Parser: EXISTS/NOT EXISTS, `IN (lista|subquery)`/`NOT IN`, subquery escalar tras operador,
+  y `FROM (SELECT ...) alias`. `evalWhere` maneja `IN (lista)` y rechaza subqueries donde no hay
+  executor (UPDATE/DELETE/HAVING/QUALIFY). `executor_subquery.go`: `evalWhereSub` corre las
+  subconsultas con acceso al executor; **correlación** por binding de referencias identificador del
+  WHERE interno que resuelven contra la fila externa (`x.dept = e.dept`), sin mutar el AST. Tablas
+  derivadas materializadas como tabla in-memory; `joinSourceTable` unifica tabla/vista/función/derivada
+  como fuente de FROM/JOIN. `fetchRows` recibe `ctx` y usa el scan con subqueries cuando aplica.
+
+**Tokens nuevos**: `UNION`, `IN` (keywords).
+
+**Tests**: `cmd/test-constraints` (CHECK/DEFAULT/CONSTRAINT/NULL/UNIQUE INDEX/INDEX DESC/UPDATE
+multi-col + round-trip de persistencia), `cmd/test-union`, `cmd/test-subqueries`; `parser_test.go`
++8 (`TestParseCheckConstraint`, `TestParseNamedConstraintForeignKey`, `TestParseCreateUniqueIndexAndDesc`,
+`TestParseMultiColumnUpdate`, `TestParseInsertNull`, `TestParseUnion`, `TestParseSubqueries`,
+`TestParseCheckMissingParen`).
+
+**Verificación** (CGO_ENABLED=0): `go build ./...` ✅, `go test ./internal/... ./cmd/focusd` ✅,
+**43** programas de integración del motor ✅, smoke E2E por la API GUI (CHECK/UNIQUE/UPDATE/subquery/
+UNION) ✅. Reporte del usuario, README y este log actualizados.
+
+**Follow-ups documentados** (no en el reporte original): literales numéricos negativos (`-5`) no
+parsean; CHECK columna-contra-columna no fiable; subconsultas no soportadas en WHERE de UPDATE/DELETE;
+UNION no soportado como cuerpo de vista ni dentro de `FROM (...)`; `SELECT <literal>` sin FROM proyecta
+NULL. Gaps acotados, sin transacciones (un INSERT multi-fila que falla a mitad no hace rollback).

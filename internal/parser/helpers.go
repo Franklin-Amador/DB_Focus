@@ -51,7 +51,7 @@ func (p *Parser) parseFromAndJoin() (ast.Identifier, []*ast.JoinClause, error) {
 	// consume FROM
 	p.next()
 
-	if p.cur.Type != TokenIdent {
+	if p.cur.Type != TokenIdent && p.cur.Type != TokenLParen {
 		return ast.Identifier{}, nil, p.errorf("expected table name")
 	}
 	table, err := p.parseTableRef()
@@ -131,7 +131,7 @@ func (p *Parser) parseSingleJoin() (*ast.JoinClause, error) {
 		}
 	}
 
-	if p.cur.Type != TokenIdent {
+	if p.cur.Type != TokenIdent && p.cur.Type != TokenLParen {
 		return nil, p.errorf("expected table name after JOIN")
 	}
 	joinTable, err := p.parseTableRef()
@@ -273,6 +273,23 @@ func (p *Parser) parseAsofJoin() (*ast.JoinClause, error) {
 // The current token must be the table identifier. A dotted name is split into
 // Identifier.Schema + Name so that Alias is purely the table alias.
 func (p *Parser) parseTableRef() (ast.Identifier, error) {
+	// Derived table: ( SELECT ... ) [AS] alias.
+	if p.cur.Type == TokenLParen {
+		sub, err := p.parseParenSelect()
+		if err != nil {
+			return ast.Identifier{}, err
+		}
+		id := ast.Identifier{Subquery: sub}
+		if p.cur.Type == TokenAs {
+			p.next()
+		}
+		if p.cur.Type == TokenIdent {
+			id.Alias = p.cur.Literal
+			p.next()
+		}
+		return id, nil
+	}
+
 	id := ast.Identifier{Name: p.cur.Literal}
 	if parts := strings.SplitN(id.Name, ".", 2); len(parts) == 2 && parts[0] != "" && parts[1] != "" {
 		id.Schema, id.Name = parts[0], parts[1]
@@ -313,6 +330,68 @@ func (p *Parser) parseTableRef() (ast.Identifier, error) {
 		p.next()
 	}
 	return id, nil
+}
+
+// parseParenSelect parses `( SELECT ... )` and returns the inner Select. Set
+// operations (UNION) are not supported as a subquery operand.
+func (p *Parser) parseParenSelect() (*ast.Select, error) {
+	if !p.expect(TokenLParen) {
+		return nil, p.errorf("expected ( before subquery")
+	}
+	if p.cur.Type != TokenSelect && p.cur.Type != TokenWith {
+		return nil, p.errorf("expected SELECT in subquery")
+	}
+	node, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	sel, ok := node.(*ast.Select)
+	if !ok {
+		return nil, p.errorf("set operations are not supported in a subquery")
+	}
+	if !p.expect(TokenRParen) {
+		return nil, p.errorf("expected ) after subquery")
+	}
+	return sel, nil
+}
+
+// parseInPredicate parses the remainder of an IN predicate after IN has been
+// consumed: either `( SELECT ... )` or `( v1, v2, ... )`.
+func (p *Parser) parseInPredicate(col ast.Identifier, negate bool) (*ast.WhereClause, error) {
+	if !p.expect(TokenLParen) {
+		return nil, p.errorf("expected ( after IN")
+	}
+	if p.cur.Type == TokenSelect || p.cur.Type == TokenWith {
+		node, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		sel, ok := node.(*ast.Select)
+		if !ok {
+			return nil, p.errorf("set operations are not supported in an IN subquery")
+		}
+		if !p.expect(TokenRParen) {
+			return nil, p.errorf("expected ) after IN subquery")
+		}
+		return &ast.WhereClause{Column: col, Operator: "IN", Negate: negate, Sub: sel}, nil
+	}
+	var list []ast.Literal
+	for {
+		lit, err := p.parseLiteral()
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, lit)
+		if p.cur.Type == TokenComma {
+			p.next()
+			continue
+		}
+		break
+	}
+	if !p.expect(TokenRParen) {
+		return nil, p.errorf("expected ) after IN list")
+	}
+	return &ast.WhereClause{Column: col, Operator: "IN", Negate: negate, ValueList: list}, nil
 }
 
 func (p *Parser) parseWhereClause() (*ast.WhereClause, error) {
@@ -363,6 +442,22 @@ func (p *Parser) parseWhereAnd() (*ast.WhereClause, error) {
 // (ROW_NUMBER() OVER (...)).
 func (p *Parser) parseWherePredicate() (*ast.WhereClause, error) {
 	clause := p.predicateClauseName()
+
+	// EXISTS (subquery) / NOT EXISTS (subquery): a predicate with no left column.
+	if p.cur.Type == TokenExists || (p.cur.Type == TokenNot && p.peek.Type == TokenExists) {
+		negate := false
+		if p.cur.Type == TokenNot {
+			negate = true
+			p.next()
+		}
+		p.next() // EXISTS
+		sub, err := p.parseParenSelect()
+		if err != nil {
+			return nil, err
+		}
+		return &ast.WhereClause{Operator: "EXISTS", Negate: negate, Sub: sub}, nil
+	}
+
 	if p.cur.Type == TokenLParen {
 		p.next()
 		inner, err := p.parseWhereOr()
@@ -396,6 +491,17 @@ func (p *Parser) parseWherePredicate() (*ast.WhereClause, error) {
 	default:
 		return nil, p.errorf("expected column in %s", clause)
 	}
+	// IN (list | subquery) / NOT IN (...).
+	if p.cur.Type == TokenIn || (p.cur.Type == TokenNot && p.peek.Type == TokenIn) {
+		negate := false
+		if p.cur.Type == TokenNot {
+			negate = true
+			p.next()
+		}
+		p.next() // IN
+		return p.parseInPredicate(col, negate)
+	}
+
 	// BETWEEN low AND high (inclusive on both ends).
 	if p.cur.Type == TokenBetween {
 		p.next()
@@ -416,9 +522,17 @@ func (p *Parser) parseWherePredicate() (*ast.WhereClause, error) {
 
 	op, ok := whereOperator(p.cur.Type)
 	if !ok {
-		return nil, p.errorf("expected comparison operator (=, <>, <, >, <=, >=, BETWEEN) in %s", clause)
+		return nil, p.errorf("expected comparison operator (=, <>, <, >, <=, >=, BETWEEN, IN) in %s", clause)
 	}
 	p.next()
+	// Scalar subquery: col OP (SELECT ...).
+	if p.cur.Type == TokenLParen && (p.peek.Type == TokenSelect || p.peek.Type == TokenWith) {
+		sub, err := p.parseParenSelect()
+		if err != nil {
+			return nil, err
+		}
+		return &ast.WhereClause{Column: col, Operator: op, Sub: sub}, nil
+	}
 	lit, err := p.parseLiteral()
 	if err != nil {
 		return nil, err
@@ -917,7 +1031,7 @@ func (p *Parser) parseSelectItem(depth *int, exprIdx int) (ast.Identifier, bool,
 	}
 
 	for {
-		if p.cur.Type == TokenEOF || p.cur.Type == TokenSemicolon || (p.cur.Type == TokenFrom && *depth == 0) {
+		if p.cur.Type == TokenEOF || p.cur.Type == TokenSemicolon || (p.cur.Type == TokenFrom && *depth == 0) || (p.cur.Type == TokenUnion && *depth == 0) {
 			return appendItem(), allowMissingDelta, true, nil
 		}
 
@@ -1086,6 +1200,54 @@ func (p *Parser) parseReferentialAction() (string, error) {
 	}
 }
 
+// parseCheckConstraint parses `CHECK ( predicate )`. The current token is the
+// CHECK identifier. The predicate is parsed into a WhereClause tree and its
+// verbatim text captured for AST-independent persistence (re-parsed on load).
+func (p *Parser) parseCheckConstraint(name string) (*ast.CheckConstraint, error) {
+	p.next() // consume CHECK
+	if !p.expect(TokenLParen) {
+		return nil, p.errorf("expected ( after CHECK")
+	}
+	start := p.cur.Pos
+	expr, err := p.parseWhereOr()
+	if err != nil {
+		return nil, err
+	}
+	text := strings.TrimSpace(p.sliceFrom(start))
+	if !p.expect(TokenRParen) {
+		return nil, p.errorf("expected ) after CHECK expression")
+	}
+	return &ast.CheckConstraint{Name: name, Expr: expr, Text: text}, nil
+}
+
+// isTableConstraintStart reports whether the current token begins a table-level
+// constraint: PRIMARY/FOREIGN/UNIQUE keywords, or the CHECK / CONSTRAINT
+// identifiers (neither is a reserved keyword).
+func (p *Parser) isTableConstraintStart() bool {
+	switch p.cur.Type {
+	case TokenPrimary, TokenForeign, TokenUnique:
+		return true
+	case TokenIdent:
+		return strings.EqualFold(p.cur.Literal, "CHECK") || strings.EqualFold(p.cur.Literal, "CONSTRAINT")
+	}
+	return false
+}
+
+// ParsePredicate parses a standalone boolean predicate (a CHECK expression, or
+// any WHERE body) into a WhereClause tree. Used to re-parse persisted CHECK
+// constraints at enforcement time.
+func ParsePredicate(input string) (*ast.WhereClause, error) {
+	p := NewParser(input)
+	w, err := p.parseWhereOr()
+	if err != nil {
+		return nil, err
+	}
+	if p.cur.Type != TokenEOF && p.cur.Type != TokenSemicolon {
+		return nil, p.errorf("unexpected token %s after predicate", p.cur.Type)
+	}
+	return w, nil
+}
+
 // parseColumnDef parses a column definition inside CREATE TABLE and advances
 // the parser to the next token after the column definition and its
 // constraints.
@@ -1174,15 +1336,22 @@ func (p *Parser) parseColumnDef() (ast.ColumnDef, error) {
 				OnUpdate:        onUpdate,
 			})
 		case TokenIdent:
-			// DEFAULT keyword (not yet a dedicated token)
-			if strings.EqualFold(p.cur.Literal, "DEFAULT") {
+			switch {
+			case strings.EqualFold(p.cur.Literal, "DEFAULT"):
 				p.next()
 				lit, err := p.parseDefaultValue()
 				if err != nil {
 					return ast.ColumnDef{}, err
 				}
 				colDef.DefaultVal = lit
-			} else {
+			case strings.EqualFold(p.cur.Literal, "CHECK"):
+				// Column-level CHECK: col TYPE CHECK (expr).
+				chk, err := p.parseCheckConstraint("")
+				if err != nil {
+					return ast.ColumnDef{}, err
+				}
+				colDef.Constraints = append(colDef.Constraints, chk)
+			default:
 				return colDef, nil
 			}
 		default:

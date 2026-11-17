@@ -112,16 +112,23 @@ func (v *Validator) ValidateUpdate(stmt *ast.Update, table *catalog.Table) error
 		return fmt.Errorf("table not found: %s", stmt.Table.Name)
 	}
 
-	// Validate column being updated exists
-	found := false
-	for _, col := range table.Columns {
-		if col.Name == stmt.Column.Name {
-			found = true
-			break
-		}
+	// Validate every assigned column exists (fall back to the single
+	// Column for gob-decoded statements that predate Assignments).
+	assignments := stmt.Assignments
+	if len(assignments) == 0 {
+		assignments = []ast.Assignment{{Column: stmt.Column, Value: stmt.Value}}
 	}
-	if !found {
-		return fmt.Errorf("column %s does not exist in table %s", stmt.Column.Name, table.Name)
+	for _, a := range assignments {
+		found := false
+		for _, col := range table.Columns {
+			if col.Name == a.Column.Name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("column %s does not exist in table %s", a.Column.Name, table.Name)
+		}
 	}
 
 	// Validate WHERE clause if present

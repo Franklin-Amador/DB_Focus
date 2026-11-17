@@ -151,6 +151,12 @@ func (t *Table) insertRowWithValidation(values []interface{}, catalog *Catalog, 
 		}
 	}
 
+	// UNIQUE index enforcement (CREATE UNIQUE INDEX), in addition to UNIQUE
+	// column constraints handled above.
+	if err := t.checkUniqueIndexesLocked(values); err != nil {
+		return err
+	}
+
 	if validateFK {
 		for _, constraint := range t.Constraints {
 			if constraint.Type == constants.ConstraintForeignKey {
@@ -246,7 +252,7 @@ func (t *Table) RebuildIndexes() {
 	t.rebuildIndexesLocked()
 }
 
-func (t *Table) CreateIndex(name string, columnNames []string) error {
+func (t *Table) CreateIndex(name string, columnNames []string, unique bool) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -278,12 +284,49 @@ func (t *Table) CreateIndex(name string, columnNames []string) error {
 		t.Indexes = make(map[string]*Index)
 	}
 
-	t.Indexes[name] = &Index{
+	newIdx := &Index{
 		Name:        name,
 		ColumnNames: append([]string(nil), columnNames...),
+		Unique:      unique,
 		Values:      make(map[string][]int),
 	}
+
+	// A UNIQUE index cannot be built over data that already contains duplicate
+	// keys. Check before registering it so a failed CREATE leaves no index.
+	if unique {
+		existing := make(map[string]struct{}, len(t.Rows))
+		for _, row := range t.Rows {
+			key, ok := newIdx.keyForRow(t.Columns, row)
+			if !ok {
+				continue
+			}
+			if _, dup := existing[key]; dup {
+				return fmt.Errorf("could not create unique index %s: table contains duplicate values", name)
+			}
+			existing[key] = struct{}{}
+		}
+	}
+
+	t.Indexes[name] = newIdx
 	t.rebuildIndexesLocked()
+	return nil
+}
+
+// checkUniqueIndexesLocked reports an error if inserting the given row would
+// violate any UNIQUE index (a key already present). The table lock must be held.
+func (t *Table) checkUniqueIndexesLocked(row []interface{}) error {
+	for _, idx := range t.Indexes {
+		if !idx.Unique {
+			continue
+		}
+		key, ok := idx.keyForRow(t.Columns, row)
+		if !ok {
+			continue
+		}
+		if len(idx.Values[key]) > 0 {
+			return fmt.Errorf("duplicate value violates unique index %s", idx.Name)
+		}
+	}
 	return nil
 }
 

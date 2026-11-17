@@ -11,6 +11,12 @@ type Column struct {
 	NotNull       bool
 	Identity      bool
 	IdentityValue int
+	// DefaultKind/DefaultValue describe a column DEFAULT. DefaultKind is "" when
+	// there is no default; otherwise it is the literal kind ("string", "number",
+	// "bool", "null") or "ident" for a marker such as CURRENT_TIMESTAMP, with the
+	// text in DefaultValue. Adding these fields is gob/JSON backward-compatible.
+	DefaultKind  string
+	DefaultValue string
 }
 
 type Constraint struct {
@@ -24,11 +30,17 @@ type Constraint struct {
 	// the empty string, i.e. RESTRICT — the prior behavior).
 	OnDelete string
 	OnUpdate string
+	// Name is the optional constraint name (CONSTRAINT fk_x ...), for messages.
+	Name string
+	// CheckExpr holds the raw predicate text of a CHECK constraint
+	// (Type == "CHECK"), e.g. "edad >= 18". It is re-parsed at enforcement time.
+	CheckExpr string
 }
 
 type Index struct {
 	Name        string
 	ColumnNames []string
+	Unique      bool
 	Values      map[string][]int
 	// sortedKeys holds the distinct keys of Values in ascending canonical order
 	// (compareIndexKeys), enabling range lookups by binary search. It is derived

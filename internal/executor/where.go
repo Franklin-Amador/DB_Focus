@@ -29,6 +29,35 @@ func evalWhere(where *ast.WhereClause, row []interface{}, resolve func(string) (
 		return evalWhere(where.Right, row, resolve)
 	}
 
+	// Subquery and EXISTS leaves require executor access; they are handled by
+	// evalWhereSub in the SELECT paths. Reaching here (UPDATE/DELETE/HAVING/
+	// QUALIFY) means they are not supported in that clause.
+	if where.Operator == "EXISTS" || where.Sub != nil {
+		return false, fmt.Errorf("subqueries are not supported in this clause")
+	}
+
+	// IN with a literal list: col IN (v1, v2, ...) / NOT IN (...).
+	if where.Operator == "IN" {
+		idx, ok := resolve(where.Column.Name)
+		if !ok {
+			return false, fmt.Errorf("column %s not found", where.Column.Name)
+		}
+		if idx < 0 || idx >= len(row) {
+			return false, nil
+		}
+		found := false
+		for _, lit := range where.ValueList {
+			if compareCells(row[idx], literalCell(lit)) == 0 {
+				found = true
+				break
+			}
+		}
+		if where.Negate {
+			return !found, nil
+		}
+		return found, nil
+	}
+
 	idx, ok := resolve(where.Column.Name)
 	if !ok {
 		return false, fmt.Errorf("column %s not found", where.Column.Name)

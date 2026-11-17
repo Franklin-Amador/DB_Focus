@@ -473,7 +473,7 @@ func (c *Catalog) AddColumnWithConstraint(tableName string, column *Column, cons
 	return nil
 }
 
-func (c *Catalog) CreateIndex(tableName string, indexName string, columnNames []string, schemaOpt ...string) error {
+func (c *Catalog) CreateIndex(tableName string, indexName string, columnNames []string, unique bool, schemaOpt ...string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -487,7 +487,7 @@ func (c *Catalog) CreateIndex(tableName string, indexName string, columnNames []
 		return err
 	}
 
-	return table.CreateIndex(indexName, columnNames)
+	return table.CreateIndex(indexName, columnNames, unique)
 }
 
 func (c *Catalog) DropIndex(tableName string, indexName string, schemaOpt ...string) error {

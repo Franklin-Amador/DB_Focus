@@ -3,6 +3,8 @@ package executor
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	"dbf/internal/ast"
 	"dbf/internal/catalog"
@@ -65,6 +67,12 @@ func (e *Executor) executeInsert(ctx context.Context, stmt *ast.Insert) (*Result
 			break
 		}
 
+		// Enforce CHECK constraints against the full row before inserting it.
+		if err := e.enforceRowChecks(table, values); err != nil {
+			insertErr = err
+			break
+		}
+
 		if err := table.InsertRow(values, e.catalog); err != nil {
 			insertErr = fmt.Errorf("failed to insert row: %w", err)
 			break
@@ -106,19 +114,29 @@ func (e *Executor) buildInsertValues(table *catalog.Table, columns []ast.Identif
 		if len(rowLits) != len(columns) {
 			return nil, fmt.Errorf("number of values (%d) does not match number of columns (%d)", len(rowLits), len(columns))
 		}
-		// Map specified values to their columns (others stay nil).
+		// Map specified values to their columns; track which were provided so an
+		// explicit NULL is not later overwritten by a column DEFAULT.
+		provided := make([]bool, len(table.Columns))
 		for i, col := range columns {
 			colIdx := findColumnIndex(table.Columns, col.Name)
 			if colIdx == -1 {
 				return nil, fmt.Errorf("column %s not found in table %s", col.Name, table.Name)
 			}
-			values[colIdx] = rowLits[i].Value
+			values[colIdx] = literalCell(rowLits[i])
+			provided[colIdx] = true
 		}
-		// Fill in IDENTITY columns that were not provided.
+		// Fill in IDENTITY columns and DEFAULT values for columns not provided.
 		for i, col := range table.Columns {
-			if col.Identity && values[i] == nil {
+			if provided[i] {
+				continue
+			}
+			if col.Identity {
 				table.Columns[i].IdentityValue++
 				values[i] = table.Columns[i].IdentityValue
+				continue
+			}
+			if col.DefaultKind != "" {
+				values[i] = defaultCell(col)
 			}
 		}
 		return values, nil
@@ -136,7 +154,7 @@ func (e *Executor) buildInsertValues(table *catalog.Table, columns []ast.Identif
 	switch len(rowLits) {
 	case len(table.Columns):
 		for i, lit := range rowLits {
-			values[i] = lit.Value
+			values[i] = literalCell(lit)
 		}
 	case nonIdentityCount:
 		valueIdx := 0
@@ -146,13 +164,32 @@ func (e *Executor) buildInsertValues(table *catalog.Table, columns []ast.Identif
 				values[i] = table.Columns[i].IdentityValue
 				continue
 			}
-			values[i] = rowLits[valueIdx].Value
+			values[i] = literalCell(rowLits[valueIdx])
 			valueIdx++
 		}
 	default:
 		return nil, fmt.Errorf("number of values does not match table schema")
 	}
 	return values, nil
+}
+
+// defaultCell evaluates a column's DEFAULT into the value to store. Literal
+// defaults use their text; the CURRENT_TIMESTAMP / NOW / LOCALTIMESTAMP markers
+// evaluate to the current time at insert.
+func defaultCell(col catalog.Column) interface{} {
+	switch col.DefaultKind {
+	case "null":
+		return nil
+	case "ident":
+		switch strings.ToUpper(col.DefaultValue) {
+		case "CURRENT_TIMESTAMP", "NOW", "LOCALTIMESTAMP", "CURRENT_DATE", "CURRENT_TIME":
+			return time.Now().Format("2006-01-02 15:04:05")
+		default:
+			return col.DefaultValue
+		}
+	default:
+		return col.DefaultValue
+	}
 }
 
 // executeUpdate handles UPDATE statements
@@ -187,46 +224,74 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 		}
 	}
 
-	// Find column index
-	colIdx := findColumnIndex(table.Columns, stmt.Column.Name)
-	if colIdx == -1 {
-		return nil, fmt.Errorf("column %s not found", stmt.Column.Name)
+	// Resolve every SET assignment to (column index, value). An UPDATE may set
+	// several columns at once (SET a = 1, b = 2); gob-decoded statements that
+	// predate Assignments fall back to the single Column/Value pair.
+	assignments := stmt.Assignments
+	if len(assignments) == 0 {
+		assignments = []ast.Assignment{{Column: stmt.Column, Value: stmt.Value}}
+	}
+	type setOp struct {
+		colIdx int
+		value  interface{}
+	}
+	setOps := make([]setOp, 0, len(assignments))
+	for _, a := range assignments {
+		colIdx := findColumnIndex(table.Columns, a.Column.Name)
+		if colIdx == -1 {
+			return nil, fmt.Errorf("column %s not found", a.Column.Name)
+		}
+		newVal := literalCell(a.Value)
+
+		// Per-column constraint, uniqueness and referential-action checks.
+		if err := e.validateUpdateConstraints(table, a.Column.Name, colIdx, newVal); err != nil {
+			return nil, err
+		}
+		if err := e.validateUpdateUniqueness(table, stmt.Where, a.Column.Name, colIdx, newVal); err != nil {
+			return nil, err
+		}
+		if err := e.enforceUpdateReferences(schema, stmt.Table.Name, table, stmt.Where, a.Column.Name, newVal); err != nil {
+			return nil, err
+		}
+		setOps = append(setOps, setOp{colIdx: colIdx, value: newVal})
 	}
 
-	// Validate constraints
-	if err := e.validateUpdateConstraints(table, stmt, colIdx); err != nil {
-		return nil, err
-	}
-
-	// Reject updates that would create a duplicate PRIMARY KEY / UNIQUE value.
-	if err := e.validateUpdateUniqueness(table, stmt, colIdx); err != nil {
-		return nil, err
-	}
-
-	// Enforce ON UPDATE referential actions when the updated column is referenced
-	// by child foreign keys and its value changes. With the default (RESTRICT)
-	// this blocks the update instead of silently orphaning child rows.
-	if err := e.enforceUpdateReferences(schema, stmt.Table.Name, table, stmt.Where, stmt.Column.Name, stmt.Value.Value); err != nil {
+	// Enforce CHECK constraints against the post-update image of each affected row.
+	if err := e.checkRowsAfterUpdate(table, stmt.Where, func(row []interface{}) {
+		for _, op := range setOps {
+			if op.colIdx >= 0 && op.colIdx < len(row) {
+				row[op.colIdx] = op.value
+			}
+		}
+	}); err != nil {
 		return nil, err
 	}
 
 	// Snapshot the affected rows before mutating so AFTER triggers can see the
 	// OLD (pre-update) and NEW (post-update) images. NEW mirrors what
-	// performUpdate writes: the target column set to the new value.
+	// performUpdate writes: every assigned column set to its new value.
 	var oldRows, newRows [][]interface{}
 	if e.triggersEnabled {
 		oldRows, _ = e.snapshotMatchedRows(table, stmt.Where)
 		for _, r := range oldRows {
 			nr := append([]interface{}(nil), r...)
-			if colIdx >= 0 && colIdx < len(nr) {
-				nr[colIdx] = stmt.Value.Value
+			for _, op := range setOps {
+				if op.colIdx >= 0 && op.colIdx < len(nr) {
+					nr[op.colIdx] = op.value
+				}
 			}
 			newRows = append(newRows, nr)
 		}
 	}
 
-	// Perform update
-	updateCount, err := e.performUpdate(table, stmt, colIdx)
+	// Perform update (all assignments applied to each matched row).
+	updateCount, err := e.performUpdate(table, stmt.Where, func(row []interface{}) {
+		for _, op := range setOps {
+			if op.colIdx >= 0 && op.colIdx < len(row) {
+				row[op.colIdx] = op.value
+			}
+		}
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -328,19 +393,29 @@ func findColumnIndex(columns []catalog.Column, name string) int {
 	return -1
 }
 
-func (e *Executor) validateUpdateConstraints(table *catalog.Table, stmt *ast.Update, colIdx int) error {
+// literalCell maps a parsed literal to the Go value stored in a cell. A SQL NULL
+// literal becomes a Go nil (not the empty string), so NULL round-trips and is
+// distinguishable from an empty text value.
+func literalCell(lit ast.Literal) interface{} {
+	if lit.Kind == "null" {
+		return nil
+	}
+	return lit.Value
+}
+
+func (e *Executor) validateUpdateConstraints(table *catalog.Table, colName string, colIdx int, newVal interface{}) error {
 	updatingCol := table.Columns[colIdx]
 
 	// NOT NULL validation
-	if updatingCol.NotNull && stmt.Value.Value == "" {
-		return fmt.Errorf("column %s cannot be NULL", stmt.Column.Name)
+	if updatingCol.NotNull && (newVal == nil || newVal == "") {
+		return fmt.Errorf("column %s cannot be NULL", colName)
 	}
 
 	// Foreign key validation
 	for _, constraint := range table.Constraints {
-		if constraint.Type == constants.ConstraintForeignKey && constraint.ColumnName == stmt.Column.Name {
-			if stmt.Value.Value != "" {
-				if err := e.validateForeignKey(constraint.ReferencedTable, constraint.ReferencedCol, stmt.Value.Value); err != nil {
+		if constraint.Type == constants.ConstraintForeignKey && constraint.ColumnName == colName {
+			if newVal != nil && newVal != "" {
+				if err := e.validateForeignKey(constraint.ReferencedTable, constraint.ReferencedCol, newVal); err != nil {
 					return err
 				}
 			}
@@ -357,8 +432,7 @@ func (e *Executor) validateUpdateConstraints(table *catalog.Table, stmt *ast.Upd
 // performs, which UPDATE previously skipped (so `UPDATE t SET id = 2 WHERE id = 1`
 // could create two rows with id = 2). It must run before performUpdate and takes
 // only a read lock, so it does not nest with the write lock there.
-func (e *Executor) validateUpdateUniqueness(table *catalog.Table, stmt *ast.Update, colIdx int) error {
-	colName := stmt.Column.Name
+func (e *Executor) validateUpdateUniqueness(table *catalog.Table, where *ast.WhereClause, colName string, colIdx int, newVal interface{}) error {
 	kind := ""
 	for _, c := range table.Constraints {
 		if c.ColumnName != colName {
@@ -377,7 +451,6 @@ func (e *Executor) validateUpdateUniqueness(table *catalog.Table, stmt *ast.Upda
 	}
 
 	resolve := columnResolver(table)
-	newVal := stmt.Value.Value
 
 	table.Mu().RLock()
 	defer table.Mu().RUnlock()
@@ -388,7 +461,7 @@ func (e *Executor) validateUpdateUniqueness(table *catalog.Table, stmt *ast.Upda
 			continue
 		}
 		val := row[colIdx]
-		matched, err := evalWhere(stmt.Where, row, resolve)
+		matched, err := evalWhere(where, row, resolve)
 		if err != nil {
 			return err
 		}
@@ -430,21 +503,24 @@ func (e *Executor) validateForeignKey(refTable, refCol string, value interface{}
 	return fmt.Errorf("foreign key violation: value %v not found in %s(%s)", value, refTable, refCol)
 }
 
-func (e *Executor) performUpdate(table *catalog.Table, stmt *ast.Update, colIdx int) (int, error) {
+// performUpdate applies `apply` to every row selected by `where` (or all rows
+// when there is none), returning the number of rows changed. `apply` mutates a
+// row in place, setting each assigned column to its new value.
+func (e *Executor) performUpdate(table *catalog.Table, where *ast.WhereClause, apply func([]interface{})) (int, error) {
 	table.Mu().Lock()
 	defer table.Mu().Unlock()
 
 	updateCount := 0
 
-	if stmt.Where != nil {
+	if where != nil {
 		resolve := columnResolver(table)
-		for i, row := range table.Rows {
-			ok, err := evalWhere(stmt.Where, row, resolve)
+		for i := range table.Rows {
+			ok, err := evalWhere(where, table.Rows[i], resolve)
 			if err != nil {
 				return 0, err
 			}
 			if ok {
-				table.Rows[i][colIdx] = stmt.Value.Value
+				apply(table.Rows[i])
 				updateCount++
 			}
 		}
@@ -452,7 +528,7 @@ func (e *Executor) performUpdate(table *catalog.Table, stmt *ast.Update, colIdx 
 		// Update all rows
 		updateCount = len(table.Rows)
 		for i := range table.Rows {
-			table.Rows[i][colIdx] = stmt.Value.Value
+			apply(table.Rows[i])
 		}
 	}
 

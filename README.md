@@ -110,16 +110,20 @@ postgresql://postgres:4444@localhost:4444/postgres
   - `MAX_BY(valor, orden)` / `MIN_BY(valor, orden)` — el `valor` de la fila con el mayor/menor `orden` (sin subquery). Escalar, con `GROUP BY` y con `GROUP BY ALL`.
   - `FROM izq ASOF JOIN der MATCH_CONDITION (izq.c op der.c) [ON izq.k = der.k]` — por cada fila izquierda, la fila derecha más cercana que cumple la desigualdad (`>=`/`>` toma la mayor; `<=`/`<` la menor), con clave `ON` opcional; semántica LEFT (derecha `NULL` si no hay match).
 - `WITH` cte_name AS (SELECT ...) [, cte_name2 AS (SELECT ...)] SELECT ...
-- `CREATE TABLE` tabla (columna tipo [IDENTITY] [PRIMARY KEY] [UNIQUE] [NOT NULL] [REFERENCES tabla(columna) [ON DELETE acción] [ON UPDATE acción]], ..., [FOREIGN KEY (columna) REFERENCES tabla(columna) [ON DELETE acción] [ON UPDATE acción]])
-  - La clave foránea se puede declarar **inline en la columna** (`padre_id INT REFERENCES padre(id)`) o a nivel de tabla (`FOREIGN KEY (padre_id) REFERENCES padre(id)`), ambas en una sola línea.
+- `CREATE TABLE` tabla (columna tipo [IDENTITY|SERIAL] [PRIMARY KEY] [UNIQUE] [NOT NULL] [DEFAULT valor] [CHECK (expr)] [REFERENCES tabla(columna) [ON DELETE acción] [ON UPDATE acción]], ..., [CONSTRAINT nombre] {PRIMARY KEY (col) | UNIQUE (col) | FOREIGN KEY (col) REFERENCES ... | CHECK (expr)})
+  - La clave foránea se puede declarar **inline en la columna** (`padre_id INT REFERENCES padre(id)`), a nivel de tabla (`FOREIGN KEY (padre_id) REFERENCES padre(id)`) o con nombre (`CONSTRAINT fk_padre FOREIGN KEY (padre_id) REFERENCES padre(id)`), todas en una sola línea.
   - **Acciones referenciales** `ON DELETE` / `ON UPDATE`: `RESTRICT` (default) · `NO ACTION` (= RESTRICT, no hay diferido sin transacciones) · `CASCADE` · `SET NULL`. Se pueden combinar y van en cualquier orden: `REFERENCES padre(id) ON DELETE CASCADE ON UPDATE RESTRICT`.
+  - **CHECK** (de columna o de tabla, con o sin `CONSTRAINT nombre`): se valida en cada `INSERT` y `UPDATE` (`edad INTEGER CHECK (edad >= 18)`, `CONSTRAINT chk CHECK (precio > 0)`). Soporta `AND`/`OR` y comparación columna-contra-literal.
+  - **DEFAULT** (literal o `CURRENT_TIMESTAMP`/`NOW`): se aplica cuando la columna se omite en el `INSERT` (`estado TEXT DEFAULT 'activo'`, `creado TIMESTAMP DEFAULT CURRENT_TIMESTAMP`).
+  - **SERIAL** es equivalente a `INTEGER IDENTITY` (autoincremento).
 - `CREATE VIEW` vista AS SELECT ...
 - `CREATE VIEW IF NOT EXISTS` vista AS SELECT ...
 - `CREATE VIEW` vista (columna1, columna2, ...) AS SELECT ...
 - `CREATE OR REPLACE VIEW` vista AS SELECT ...
 - `CREATE OR REPLACE VIEW` vista (columna1, columna2, ...) AS SELECT ...
-- `CREATE INDEX` indice ON tabla (columna)
+- `CREATE INDEX` indice ON tabla (columna [ASC|DESC])
 - `CREATE INDEX` indice ON tabla (columna1 [, columna2, ...])
+- `CREATE UNIQUE INDEX` indice ON tabla (columna [, ...]) — rechaza valores duplicados en el/los columna(s) indexadas
 - `DROP INDEX` indice ON tabla
 - `CREATE SCHEMA` [IF NOT EXISTS] esquema — dentro de la base de datos actual
 - `CREATE DATABASE` nombre [WITH opciones] — nueva base aislada (su propio `public`, procedimientos, triggers y jobs)
@@ -139,14 +143,22 @@ postgresql://postgres:4444@localhost:4444/postgres
 - `ALTER TABLE` tabla DROP COLUMN columna
 - `ALTER TABLE` tabla ALTER COLUMN columna TYPE nuevo_tipo
 - `ALTER TABLE` tabla RENAME COLUMN nombre_viejo TO nombre_nuevo
-- `INSERT INTO` tabla [(columna, ...)] VALUES (literal, ...) [, (literal, ...), ...] — admite **múltiples filas** en un solo statement (estilo PostgreSQL)
-- `UPDATE` tabla SET columna = valor [WHERE columna = literal]
-- `DELETE FROM` tabla [WHERE columna = literal]
+- `INSERT INTO` tabla [(columna, ...)] VALUES (literal, ...) [, (literal, ...), ...] — admite **múltiples filas** en un solo statement (estilo PostgreSQL) y el literal `NULL`
+- `UPDATE` tabla SET columna = valor [, columna2 = valor2, ...] [WHERE ...] — admite **asignar varias columnas** a la vez
+- `DELETE FROM` tabla [WHERE ...]
+- `SELECT ... UNION [ALL] SELECT ...` — operaciones de conjunto; `UNION` deduplica, `UNION ALL` conserva duplicados. Un `ORDER BY` / `LIMIT` final aplica al resultado combinado. Encadenable (`a UNION ALL b UNION c`).
 - `DESCRIBE` tabla (o `DESC` tabla) — lista las columnas de una tabla (nombre, tipo, nullabilidad, rol de clave y si es IDENTITY)
 
 **Notas:**
 - `WHERE` soporta operadores de comparación: `=`, `<>`/`!=`, `<`, `>`, `<=`, `>=` y `BETWEEN min AND max` (en SELECT, UPDATE y DELETE). La igualdad (`=`) y los rangos (`<`, `>`, `<=`, `>=`, `BETWEEN`) usan índice cuando existe uno de una sola columna sobre la columna filtrada (ver sección Indices); `BETWEEN` es un rango acotado (una sola búsqueda por índice, inclusivo en ambos extremos). **Todos** los operadores comparan por forma canónica: numéricamente si ambos lados son números, lexicográficamente en caso contrario. Esto hace que `WHERE id = 1` funcione igual sobre una columna `IDENTITY` (valor `int`) que sobre una columna con valores literales (`string`) — importante en `UPDATE`/`DELETE`, que recorren la tabla en vez de usar el índice.
 - `WHERE` soporta predicados compuestos con `AND` y `OR`, precedencia estándar (`AND` liga más fuerte que `OR`) y paréntesis para agrupar: `WHERE a > 10 AND (b = 'x' OR c <= 5)`. Funciona también sobre JOINs (columnas calificadas, ej. `pedidos.total > 80`).
+- **Subconsultas** (en `SELECT ... WHERE`, incluyendo JOINs):
+  - Escalar: `WHERE salario = (SELECT MAX(salario) FROM emp)`.
+  - `IN` / `NOT IN` con subconsulta o lista: `WHERE dept IN (SELECT dept FROM ...)`, `WHERE dept NOT IN (1, 2)`.
+  - `EXISTS` / `NOT EXISTS`, incluso **correlacionadas**: `WHERE EXISTS (SELECT 1 FROM emp x WHERE x.dept = e.dept)`.
+  - Subconsulta escalar en el `SELECT`: `SELECT id, (SELECT MAX(sal) FROM emp) AS tope FROM emp`.
+  - **Tablas derivadas**: `FROM (SELECT ...) alias`, usables también como lado de un JOIN.
+  - Límites: no soportadas en la cláusula `WHERE` de `UPDATE`/`DELETE`, ni como cuerpo de vista o dentro de `UNION`.
 - **Funciones de ventana**: dentro de cada partición (`PARTITION BY`, o toda la tabla si se omite) las filas se ordenan por el `ORDER BY` de la ventana; las filas iguales en todas las claves son *pares*. `ROW_NUMBER` numera 1..n; `RANK` deja huecos tras un empate (1,1,3); `DENSE_RANK` no (1,1,2). Los agregados `OVER` sin `ORDER BY` cubren toda la partición; con `ORDER BY` usan el frame por defecto del estándar (`RANGE UNBOUNDED PRECEDING → CURRENT ROW`): acumulado hasta la fila actual incluyendo sus pares. No hay frames explícitos (`ROWS BETWEEN ...`) ni `LAG/LEAD`.
 - `QUALIFY` se evalúa después de las ventanas y antes de `ORDER BY`/`LIMIT`, así que `QUALIFY rn <= 3 ORDER BY monto DESC LIMIT 5` filtra primero y recorta después. Si la consulta no tiene ventanas, `QUALIFY` actúa como un filtro sobre alias/columnas de salida (extensión permisiva). Una ventana usada solo en `QUALIFY` no aparece en el resultado (tampoco con `SELECT *`).
 - `ORDER BY` acepta alias del `SELECT` y agregados (`ORDER BY total DESC`, `ORDER BY SUM(monto) DESC`) y ahora falla con `ORDER BY: column X not found` si la columna no existe (antes se ignoraba en silencio). Un agregado en `ORDER BY`/`QUALIFY`/`OVER` exige `GROUP BY` o un agregado en el `SELECT`; en consultas agrupadas, una columna referenciada fuera del `SELECT` debe ser clave de `GROUP BY` o ir dentro de un agregado (`column X must appear in GROUP BY ...`).
@@ -283,6 +295,11 @@ go run ./cmd/test-aggregates
 go run ./cmd/test-multi-join
 go run ./cmd/test-natural-join
 go run ./cmd/test-qualify
+
+# Restricciones/DEFAULT, UNION y subconsultas
+go run ./cmd/test-constraints   # CHECK, DEFAULT, CONSTRAINT nombrado, NULL, UNIQUE INDEX, INDEX DESC, UPDATE multi-col (+ reload)
+go run ./cmd/test-union         # UNION / UNION ALL, dedup, ORDER BY sobre el combinado
+go run ./cmd/test-subqueries    # escalar, IN/NOT IN, EXISTS correlacionado, tablas derivadas
 
 # Atajos estilo Snowflake
 go run ./cmd/test-snowflake-select  # SELECT * EXCLUDE/RENAME/ILIKE, GROUP BY ALL

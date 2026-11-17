@@ -126,9 +126,69 @@ func (p *Parser) parseSelect() (ast.Statement, error) {
 		return &ast.SelectFunction{Name: name}, nil
 	}
 
+	first, err := p.parseSelectCore(ctes)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set operations: SELECT ... UNION [ALL] SELECT ... (folded left to right).
+	// ORDER BY / LIMIT after the last operand apply to the whole result.
+	if p.cur.Type == TokenUnion {
+		setop := &ast.SetOp{Selects: []*ast.Select{first}}
+		for p.cur.Type == TokenUnion {
+			p.next()
+			all := false
+			if p.cur.Type == TokenIdent && strings.EqualFold(p.cur.Literal, "ALL") {
+				all = true
+				p.next()
+			}
+			if p.cur.Type != TokenSelect {
+				return nil, p.errorf("expected SELECT after UNION")
+			}
+			p.next() // consume SELECT
+			operand, err := p.parseSelectCore(nil)
+			if err != nil {
+				return nil, err
+			}
+			setop.Selects = append(setop.Selects, operand)
+			setop.All = append(setop.All, all)
+		}
+		ob, err := p.parseOrderByClause()
+		if err != nil {
+			return nil, err
+		}
+		setop.OrderBy = ob
+		lim, off, err := p.parseLimitOffset()
+		if err != nil {
+			return nil, err
+		}
+		setop.Limit = lim
+		setop.Offset = off
+		return setop, nil
+	}
+
+	// Single SELECT: parse its own ORDER BY / LIMIT / OFFSET.
+	ob, err := p.parseOrderByClause()
+	if err != nil {
+		return nil, err
+	}
+	first.OrderBy = ob
+	lim, off, err := p.parseLimitOffset()
+	if err != nil {
+		return nil, err
+	}
+	first.Limit = lim
+	first.Offset = off
+	return first, nil
+}
+
+// parseSelectCore parses a SELECT body (after the SELECT keyword) through the
+// QUALIFY clause: DISTINCT, the select list or *, FROM/JOIN, WHERE, GROUP BY,
+// HAVING and QUALIFY. It does NOT parse ORDER BY, LIMIT/OFFSET or set operators,
+// which belong to the enclosing query. ctes are attached to the returned Select.
+func (p *Parser) parseSelectCore(ctes []ast.CTE) (*ast.Select, error) {
 	stmt := &ast.Select{With: ctes}
 
-	// Check for DISTINCT
 	if p.cur.Type == TokenDistinct {
 		stmt.Distinct = true
 		p.next()
@@ -189,19 +249,6 @@ func (p *Parser) parseSelect() (ast.Statement, error) {
 		return nil, err
 	}
 	stmt.Qualify = qual
-
-	ob, err := p.parseOrderByClause()
-	if err != nil {
-		return nil, err
-	}
-	stmt.OrderBy = ob
-
-	lim, off, err := p.parseLimitOffset()
-	if err != nil {
-		return nil, err
-	}
-	stmt.Limit = lim
-	stmt.Offset = off
 
 	return stmt, nil
 }
@@ -798,6 +845,15 @@ func (p *Parser) parseCreate() (ast.Statement, error) {
 		}
 	}
 
+	// CREATE UNIQUE INDEX ...
+	if p.cur.Type == TokenUnique {
+		p.next()
+		if p.cur.Type != TokenIndex {
+			return nil, p.errorf("expected INDEX after CREATE UNIQUE")
+		}
+		return p.parseCreateIndexBody(true)
+	}
+
 	if parse, ok := createParsers[p.cur.Type]; ok {
 		return parse(p)
 	}
@@ -877,7 +933,14 @@ func (p *Parser) parseCreateView(replace bool) (ast.Statement, error) {
 }
 
 func (p *Parser) parseCreateIndex() (ast.Statement, error) {
-	p.next()
+	return p.parseCreateIndexBody(false)
+}
+
+// parseCreateIndexBody parses `[UNIQUE] INDEX name ON table(col [ASC|DESC], ...)`.
+// The current token is INDEX. A per-column ASC/DESC direction is accepted and
+// consumed (the index is maintained in ascending canonical order regardless).
+func (p *Parser) parseCreateIndexBody(unique bool) (ast.Statement, error) {
+	p.next() // consume INDEX
 	idxName, err := p.parseIdentRequired("expected index name")
 	if err != nil {
 		return nil, err
@@ -904,6 +967,11 @@ func (p *Parser) parseCreateIndex() (ast.Statement, error) {
 		columns = append(columns, ast.Identifier{Name: p.cur.Literal})
 		p.next()
 
+		// Optional per-column sort direction (accepted for compatibility).
+		if p.cur.Type == TokenAsc || p.cur.Type == TokenDesc {
+			p.next()
+		}
+
 		if p.cur.Type == TokenComma {
 			p.next()
 			continue
@@ -915,7 +983,7 @@ func (p *Parser) parseCreateIndex() (ast.Statement, error) {
 		return nil, p.errorf("expected ) after indexed column")
 	}
 
-	return &ast.CreateIndex{Name: idxName, Table: table, Columns: columns}, nil
+	return &ast.CreateIndex{Name: idxName, Table: table, Columns: columns, Unique: unique}, nil
 }
 
 // CREATE SCHEMA schema
@@ -956,8 +1024,9 @@ func (p *Parser) parseCreateTable() (ast.Statement, error) {
 	}
 
 	for {
-		// Check for table-level constraints (FOREIGN KEY, PRIMARY KEY, UNIQUE, etc.)
-		if p.cur.Type == TokenPrimary || p.cur.Type == TokenForeign || p.cur.Type == TokenUnique {
+		// Check for table-level constraints (FOREIGN KEY, PRIMARY KEY, UNIQUE,
+		// CHECK, or a named CONSTRAINT ...).
+		if p.isTableConstraintStart() {
 			constraint, err := p.parseTableLevelConstraint()
 			if err != nil {
 				return nil, err
@@ -992,7 +1061,24 @@ func (p *Parser) parseCreateTable() (ast.Statement, error) {
 }
 
 func (p *Parser) parseTableLevelConstraint() (ast.Constraint, error) {
+	// Optional CONSTRAINT <name> prefix. The name is retained for CHECK
+	// constraints (used in error messages); for PK/FK/UNIQUE it is consumed.
+	name := ""
+	if p.cur.Type == TokenIdent && strings.EqualFold(p.cur.Literal, "CONSTRAINT") {
+		p.next()
+		id, err := p.parseIdentRequired("expected constraint name after CONSTRAINT")
+		if err != nil {
+			return nil, err
+		}
+		name = id.Name
+	}
+
 	switch p.cur.Type {
+	case TokenIdent:
+		if strings.EqualFold(p.cur.Literal, "CHECK") {
+			return p.parseCheckConstraint(name)
+		}
+		return nil, p.errorf("unexpected constraint %q", p.cur.Literal)
 	case TokenPrimary:
 		p.next()
 		if err := p.expectOrError(TokenKey, "expected KEY after PRIMARY"); err != nil {
@@ -1169,6 +1255,17 @@ func (p *Parser) parseLiteral() (ast.Literal, error) {
 		lit := ast.Literal{Kind: "number", Value: p.cur.Literal}
 		p.next()
 		return lit, nil
+	case TokenNull:
+		// SQL NULL literal: stored as the "null" kind so the executor can map it
+		// to a Go nil cell rather than the empty string.
+		p.next()
+		return ast.Literal{Kind: "null", Value: ""}, nil
+	case TokenTrue:
+		p.next()
+		return ast.Literal{Kind: "bool", Value: "true"}, nil
+	case TokenFalse:
+		p.next()
+		return ast.Literal{Kind: "bool", Value: "false"}, nil
 	case TokenIdent:
 		// Allow identifiers for procedure parameters
 		lit := ast.Literal{Kind: "identifier", Value: p.cur.Literal}
@@ -1273,21 +1370,29 @@ func (p *Parser) parseUpdate() (ast.Statement, error) {
 		return nil, p.errorf("expected SET")
 	}
 
-	col, err := p.parseIdentRequired("expected column name")
-	if err != nil {
-		return nil, err
+	// Parse one or more comma-separated assignments: col = value, col = value ...
+	for {
+		col, err := p.parseIdentRequired("expected column name")
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOrError(TokenEq, "expected ="); err != nil {
+			return nil, err
+		}
+		lit, err := p.parseLiteral()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Assignments = append(stmt.Assignments, ast.Assignment{Column: col, Value: lit})
+		if p.cur.Type == TokenComma {
+			p.next()
+			continue
+		}
+		break
 	}
-
-	if err := p.expectOrError(TokenEq, "expected ="); err != nil {
-		return nil, err
-	}
-
-	lit, err := p.parseLiteral()
-	if err != nil {
-		return nil, err
-	}
-	stmt.Column = col
-	stmt.Value = lit
+	// Mirror the first assignment for backward compatibility.
+	stmt.Column = stmt.Assignments[0].Column
+	stmt.Value = stmt.Assignments[0].Value
 
 	where, err := p.parseWhereClause()
 	if err != nil {

@@ -1056,3 +1056,130 @@ func TestParseSetKeepsPayload(t *testing.T) {
 		t.Fatalf("unexpected SET payload %+v", stmt)
 	}
 }
+
+func mustParseStmt(t *testing.T, sql string) ast.Statement {
+	t.Helper()
+	stmt, err := NewParser(sql).ParseStatement()
+	if err != nil {
+		t.Fatalf("parse %q: %v", sql, err)
+	}
+	return stmt
+}
+
+func mustFailParse(t *testing.T, sql string) {
+	t.Helper()
+	if _, err := NewParser(sql).ParseStatement(); err == nil {
+		t.Fatalf("expected parse error for %q", sql)
+	}
+}
+
+func findCheck(cs []ast.Constraint) *ast.CheckConstraint {
+	for _, c := range cs {
+		if chk, ok := c.(*ast.CheckConstraint); ok {
+			return chk
+		}
+	}
+	return nil
+}
+
+func TestParseCheckConstraint(t *testing.T) {
+	// Column-level CHECK.
+	ct := mustParseStmt(t, "CREATE TABLE t (id INT, edad INTEGER CHECK (edad >= 18))").(*ast.CreateTable)
+	chk := findCheck(ct.Columns[1].Constraints)
+	if chk == nil {
+		t.Fatal("expected a column-level CHECK constraint")
+	}
+	if chk.Expr == nil || chk.Expr.Column.Name != "edad" || chk.Expr.Operator != ">=" {
+		t.Fatalf("unexpected CHECK expr %+v", chk.Expr)
+	}
+
+	// Table-level named CHECK.
+	ct = mustParseStmt(t, "CREATE TABLE t (id INT, precio INT, CONSTRAINT chk_p CHECK (precio > 0))").(*ast.CreateTable)
+	chk = findCheck(ct.Constraints)
+	if chk == nil || chk.Name != "chk_p" {
+		t.Fatalf("expected a named table-level CHECK, got %+v", chk)
+	}
+}
+
+func TestParseNamedConstraintForeignKey(t *testing.T) {
+	ct := mustParseStmt(t, "CREATE TABLE hijo (id INT, pid INT, CONSTRAINT fk FOREIGN KEY (pid) REFERENCES padre(id))").(*ast.CreateTable)
+	fk, ok := ct.Constraints[0].(*ast.ForeignKeyConstraint)
+	if !ok || fk.ReferencedTable != "padre" || fk.ReferencedCol != "id" || fk.ColumnName != "pid" {
+		t.Fatalf("unexpected FK constraint %+v", ct.Constraints[0])
+	}
+}
+
+func TestParseCreateUniqueIndexAndDesc(t *testing.T) {
+	ci := mustParseStmt(t, "CREATE UNIQUE INDEX ix ON t(email)").(*ast.CreateIndex)
+	if !ci.Unique || ci.Name.Name != "ix" || ci.Columns[0].Name != "email" {
+		t.Fatalf("unexpected unique index %+v", ci)
+	}
+	ci = mustParseStmt(t, "CREATE INDEX ix ON t(n DESC)").(*ast.CreateIndex)
+	if ci.Unique || ci.Columns[0].Name != "n" {
+		t.Fatalf("unexpected index with DESC %+v", ci)
+	}
+}
+
+func TestParseMultiColumnUpdate(t *testing.T) {
+	up := mustParseStmt(t, "UPDATE t SET a = 1, b = 'x', c = NULL WHERE id = 1").(*ast.Update)
+	if len(up.Assignments) != 3 {
+		t.Fatalf("expected 3 assignments, got %d", len(up.Assignments))
+	}
+	if up.Assignments[0].Column.Name != "a" || up.Assignments[1].Column.Name != "b" || up.Assignments[2].Column.Name != "c" {
+		t.Fatalf("unexpected assignment columns %+v", up.Assignments)
+	}
+	if up.Assignments[2].Value.Kind != "null" {
+		t.Fatalf("expected NULL literal, got %+v", up.Assignments[2].Value)
+	}
+}
+
+func TestParseInsertNull(t *testing.T) {
+	ins := mustParseStmt(t, "INSERT INTO t (x) VALUES (NULL)").(*ast.Insert)
+	if ins.Rows[0][0].Kind != "null" {
+		t.Fatalf("expected null literal, got %+v", ins.Rows[0][0])
+	}
+}
+
+func TestParseUnion(t *testing.T) {
+	so := mustParseStmt(t, "SELECT v FROM a UNION SELECT v FROM b UNION ALL SELECT v FROM c ORDER BY v").(*ast.SetOp)
+	if len(so.Selects) != 3 {
+		t.Fatalf("expected 3 operands, got %d", len(so.Selects))
+	}
+	if len(so.All) != 2 || so.All[0] != false || so.All[1] != true {
+		t.Fatalf("unexpected UNION ALL flags %+v", so.All)
+	}
+	if len(so.OrderBy) != 1 || so.OrderBy[0].Column.Name != "v" {
+		t.Fatalf("expected trailing ORDER BY v, got %+v", so.OrderBy)
+	}
+}
+
+func TestParseSubqueries(t *testing.T) {
+	// Scalar subquery in WHERE.
+	sel := parseSelectT(t, "SELECT x FROM t WHERE x = (SELECT MAX(y) FROM u)")
+	if sel.Where == nil || sel.Where.Sub == nil || sel.Where.Operator != "=" {
+		t.Fatalf("expected scalar subquery, got %+v", sel.Where)
+	}
+	// IN subquery and IN list.
+	sel = parseSelectT(t, "SELECT x FROM t WHERE x IN (SELECT y FROM u)")
+	if sel.Where.Operator != "IN" || sel.Where.Sub == nil {
+		t.Fatalf("expected IN subquery, got %+v", sel.Where)
+	}
+	sel = parseSelectT(t, "SELECT x FROM t WHERE x NOT IN (1, 2, 3)")
+	if sel.Where.Operator != "IN" || !sel.Where.Negate || len(sel.Where.ValueList) != 3 {
+		t.Fatalf("expected NOT IN list, got %+v", sel.Where)
+	}
+	// EXISTS.
+	sel = parseSelectT(t, "SELECT x FROM t e WHERE EXISTS (SELECT 1 FROM u x WHERE x.id = e.id)")
+	if sel.Where.Operator != "EXISTS" || sel.Where.Sub == nil {
+		t.Fatalf("expected EXISTS, got %+v", sel.Where)
+	}
+	// Derived table.
+	sel = parseSelectT(t, "SELECT s.x FROM (SELECT x FROM t) s")
+	if sel.Table.Subquery == nil || sel.Table.Alias != "s" {
+		t.Fatalf("expected derived table, got %+v", sel.Table)
+	}
+}
+
+func TestParseCheckMissingParen(t *testing.T) {
+	mustFailParse(t, "CREATE TABLE t (id INT, edad INT CHECK edad >= 18)")
+}

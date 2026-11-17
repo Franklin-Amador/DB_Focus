@@ -46,6 +46,10 @@ func (e *Executor) executeCreateTable(ctx context.Context, stmt *ast.CreateTable
 			Identity:      col.Identity,
 			IdentityValue: 0,
 		}
+		if col.DefaultVal != nil {
+			columns[i].DefaultKind = col.DefaultVal.Kind
+			columns[i].DefaultValue = col.DefaultVal.Value
+		}
 	}
 
 	// Convert AST constraints to catalog constraints
@@ -74,6 +78,13 @@ func (e *Executor) executeCreateTable(ctx context.Context, stmt *ast.CreateTable
 					OnDelete:        c.OnDelete,
 					OnUpdate:        c.OnUpdate,
 				})
+			case *ast.CheckConstraint:
+				constraints = append(constraints, catalog.Constraint{
+					Type:       constants.ConstraintCheck,
+					ColumnName: col.Name.Name,
+					Name:       c.Name,
+					CheckExpr:  c.Text,
+				})
 			}
 		}
 	}
@@ -99,6 +110,12 @@ func (e *Executor) executeCreateTable(ctx context.Context, stmt *ast.CreateTable
 				ReferencedCol:   c.ReferencedCol,
 				OnDelete:        c.OnDelete,
 				OnUpdate:        c.OnUpdate,
+			})
+		case *ast.CheckConstraint:
+			constraints = append(constraints, catalog.Constraint{
+				Type:      constants.ConstraintCheck,
+				Name:      c.Name,
+				CheckExpr: c.Text,
 			})
 		}
 	}
@@ -137,7 +154,7 @@ func (e *Executor) executeCreateIndex(ctx context.Context, stmt *ast.CreateIndex
 		columnNames = append(columnNames, col.Name)
 	}
 
-	if err := e.catalog.CreateIndex(stmt.Table.Name, stmt.Name.Name, columnNames, schema); err != nil {
+	if err := e.catalog.CreateIndex(stmt.Table.Name, stmt.Name.Name, columnNames, stmt.Unique, schema); err != nil {
 		return nil, fmt.Errorf("failed to create index: %w", err)
 	}
 

@@ -128,6 +128,8 @@ const (
 	TokenOver       TokenType = "OVER"
 	TokenPartition  TokenType = "PARTITION"
 	TokenDescribe   TokenType = "DESCRIBE"
+	TokenUnion      TokenType = "UNION"
+	TokenIn         TokenType = "IN"
 )
 
 type Token struct {
@@ -243,4 +245,6 @@ var keywords = map[string]TokenType{
 	"OVER":       TokenOver,
 	"PARTITION":  TokenPartition,
 	"DESCRIBE":   TokenDescribe,
+	"UNION":      TokenUnion,
+	"IN":         TokenIn,
 }

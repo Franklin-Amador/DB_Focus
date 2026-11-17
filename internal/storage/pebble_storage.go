@@ -941,6 +941,8 @@ func (ps *PebbleStorage) loadTableLocked(cat *catalog.Catalog, name string, sche
 			NotNull:       c.NotNull,
 			Identity:      c.Identity,
 			IdentityValue: c.IdentityValue,
+			DefaultKind:   c.DefaultKind,
+			DefaultValue:  c.DefaultValue,
 		}
 	}
 
@@ -953,6 +955,8 @@ func (ps *PebbleStorage) loadTableLocked(cat *catalog.Catalog, name string, sche
 			ReferencedCol:   c.ReferencedCol,
 			OnDelete:        c.OnDelete,
 			OnUpdate:        c.OnUpdate,
+			Name:            c.Name,
+			CheckExpr:       c.CheckExpr,
 		}
 	}
 
@@ -964,7 +968,7 @@ func (ps *PebbleStorage) loadTableLocked(cat *catalog.Catalog, name string, sche
 	// Load rows
 	if table, err := cat.GetTable(td.Name, schema); err == nil {
 		for _, idx := range td.Indexes {
-			if err := table.CreateIndex(idx.Name, indexColumnsFromData(idx)); err != nil {
+			if err := table.CreateIndex(idx.Name, indexColumnsFromData(idx), idx.Unique); err != nil {
 				return fmt.Errorf("failed to create index %s on table %s.%s: %w", idx.Name, schema, td.Name, err)
 			}
 		}
@@ -1246,6 +1250,8 @@ func convertColumns(cols []catalog.Column) []ColumnData {
 			NotNull:       c.NotNull,
 			Identity:      c.Identity,
 			IdentityValue: c.IdentityValue,
+			DefaultKind:   c.DefaultKind,
+			DefaultValue:  c.DefaultValue,
 		}
 	}
 	return result
@@ -1261,6 +1267,8 @@ func convertConstraints(constraints []catalog.Constraint) []ConstraintData {
 			ReferencedCol:   c.ReferencedCol,
 			OnDelete:        c.OnDelete,
 			OnUpdate:        c.OnUpdate,
+			Name:            c.Name,
+			CheckExpr:       c.CheckExpr,
 		}
 	}
 	return result
@@ -1275,6 +1283,7 @@ func convertIndexes(indexes map[string]*catalog.Index) []IndexData {
 		result = append(result, IndexData{
 			Name:        idx.Name,
 			ColumnNames: append([]string(nil), idx.ColumnNames...),
+			Unique:      idx.Unique,
 		})
 	}
 	return result

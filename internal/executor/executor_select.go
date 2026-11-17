@@ -67,8 +67,17 @@ func (e *Executor) executeSelectMain(ctx context.Context, stmt *ast.Select) (*Re
 		return nil, err
 	}
 
+	// Handle a derived table as the row source: FROM (SELECT ...) alias.
+	if stmt.Table.Subquery != nil && stmt.Join == nil {
+		dt, err := e.derivedTable(ctx, stmt.Table)
+		if err != nil {
+			return nil, err
+		}
+		return e.executeSelectFromTable(ctx, stmt, dt)
+	}
+
 	// Handle SELECT without FROM clause
-	if stmt.Table.Name == "" {
+	if stmt.Table.Name == "" && stmt.Table.Subquery == nil {
 		return e.executeSelectNoTable(stmt)
 	}
 
@@ -115,7 +124,7 @@ func (e *Executor) executeSelectFromTable(ctx context.Context, stmt *ast.Select,
 	}
 
 	// FROM + WHERE (index fast-path for single equality predicates).
-	rows, err := e.fetchRows(table, stmt)
+	rows, err := e.fetchRows(ctx, table, stmt)
 	if err != nil {
 		return nil, err
 	}
@@ -174,19 +183,19 @@ func (e *Executor) executeJoinSelect(ctx context.Context, stmt *ast.Select) (*Re
 		joins = []*ast.JoinClause{stmt.Join} // gob-loaded views carry only Join
 	}
 
-	// Base (left-most) table.
-	baseTable, err := e.catalog.GetTable(stmt.Table.Name, stmt.Table.Schema)
+	// Base (left-most) table (which may itself be a derived table or function).
+	baseTable, err := e.joinSourceTable(ctx, stmt.Table)
 	if err != nil {
-		return nil, fmt.Errorf("table %s not found: %w", stmt.Table.Name, err)
+		return nil, err
 	}
 	accRows := baseTable.SelectAll()
 	accCols := joinColsFor(refName(stmt.Table), stmt.Table.Schema, baseTable.Columns)
 
 	// Fold each JOIN into the accumulated result.
 	for _, j := range joins {
-		rightTable, err := e.catalog.GetTable(j.Table.Name, j.Table.Schema)
+		rightTable, err := e.joinSourceTable(ctx, j.Table)
 		if err != nil {
-			return nil, fmt.Errorf("joined table %s not found: %w", j.Table.Name, err)
+			return nil, err
 		}
 		accRows, accCols, err = e.foldJoin(j, accRows, accCols,
 			rightTable.SelectAll(), joinColsFor(refName(j.Table), j.Table.Schema, rightTable.Columns))
@@ -204,9 +213,16 @@ func (e *Executor) executeJoinSelect(ctx context.Context, stmt *ast.Select) (*Re
 			}
 			return idx, true
 		}
+		useSub := whereHasSubquery(stmt.Where)
 		filtered := make([][]interface{}, 0, len(accRows))
 		for _, row := range accRows {
-			ok, err := evalWhere(stmt.Where, row, resolve)
+			var ok bool
+			var err error
+			if useSub {
+				ok, err = e.evalWhereSub(ctx, stmt.Where, row, resolve)
+			} else {
+				ok, err = evalWhere(stmt.Where, row, resolve)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -218,6 +234,33 @@ func (e *Executor) executeJoinSelect(ctx context.Context, stmt *ast.Select) (*Re
 	}
 
 	return e.finishSelect(ctx, stmt, &rowset{cols: accCols, rows: accRows, qualified: true})
+}
+
+// joinSourceTable resolves a FROM/JOIN table reference to an in-memory table:
+// a derived table (subquery), a set-returning function call, a base table, or a
+// view (materialized by running its query).
+func (e *Executor) joinSourceTable(ctx context.Context, id ast.Identifier) (*catalog.Table, error) {
+	if id.Subquery != nil {
+		return e.derivedTable(ctx, id)
+	}
+	if id.IsCall {
+		return e.resolveFunctionTable(ctx, id)
+	}
+	table, err := e.catalog.GetTable(id.Name, id.Schema)
+	if err == nil {
+		return table, nil
+	}
+	view, vErr := e.catalog.GetView(id.Name, id.Schema)
+	if vErr != nil {
+		return nil, fmt.Errorf("table %s not found: %w", id.Name, err)
+	}
+	vres, execErr := e.executeSelect(ctx, view.Query)
+	if execErr != nil {
+		return nil, fmt.Errorf("failed to resolve view %s: %w", view.Name, execErr)
+	}
+	vcols := make([]catalog.Column, len(view.Columns))
+	copy(vcols, view.Columns)
+	return &catalog.Table{Name: view.Name, Columns: vcols, Rows: vres.Rows}, nil
 }
 
 // stripTableQualifier removes a "qualifier." prefix from a column reference
@@ -580,10 +623,30 @@ func (e *Executor) createCTETable(name string, result *Result) error {
 // clause. Column references may be qualified with the table's alias, name or
 // "schema.name" (WHERE v.monto > 1); other qualifiers are left as-is so they
 // fail with "column x.y not found".
-func (e *Executor) fetchRows(table *catalog.Table, stmt *ast.Select) ([][]interface{}, error) {
+func (e *Executor) fetchRows(ctx context.Context, table *catalog.Table, stmt *ast.Select) ([][]interface{}, error) {
 	where := stmt.Where
 	if where == nil {
 		return table.SelectAll(), nil
+	}
+	// Subquery / EXISTS / IN-subquery predicates need executor-backed evaluation
+	// (and possible per-row correlation), so scan and evaluate with evalWhereSub.
+	if whereHasSubquery(where) {
+		resolve := func(name string) (int, bool) {
+			i := findColumnIndex(table.Columns, stripTableQualifier(name, stmt.Table))
+			return i, i != -1
+		}
+		all := table.SelectAll()
+		filtered := make([][]interface{}, 0, len(all))
+		for _, row := range all {
+			ok, err := e.evalWhereSub(ctx, where, row, resolve)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				filtered = append(filtered, row)
+			}
+		}
+		return filtered, nil
 	}
 	// Fast path: a single leaf predicate can use an index when present. Equality
 	// goes through SelectWhere (which scans when there is no index); range and
