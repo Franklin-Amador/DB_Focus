@@ -146,6 +146,80 @@ func bindWhereRefs(w *ast.WhereClause, row []interface{}, resolve func(string) (
 	return &nw
 }
 
+// resolveSubqueries returns a copy of a predicate tree with every subquery leaf
+// replaced by concrete values, by running each subquery once (standalone). It is
+// used to support subqueries in UPDATE/DELETE WHERE without running inner SELECTs
+// while the table write lock is held (which could deadlock on a self-reference):
+//
+//	scalar `col OP (SELECT v)`  -> `col OP v`
+//	`col IN (SELECT v, ...)`    -> `col IN (v, ...)` (literal list)
+//	`EXISTS (SELECT ...)`       -> constant TRUE / FALSE
+//
+// Only non-correlated subqueries are supported here (they are run without outer
+// bindings); a correlated subquery in UPDATE/DELETE would not resolve its outer
+// references and is not supported.
+func (e *Executor) resolveSubqueries(ctx context.Context, where *ast.WhereClause) (*ast.WhereClause, error) {
+	if where == nil {
+		return nil, nil
+	}
+	if where.Conj != "" {
+		left, err := e.resolveSubqueries(ctx, where.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := e.resolveSubqueries(ctx, where.Right)
+		if err != nil {
+			return nil, err
+		}
+		return &ast.WhereClause{Conj: where.Conj, Left: left, Right: right}, nil
+	}
+
+	switch {
+	case where.Operator == "EXISTS":
+		res, err := e.executeSelect(ctx, where.Sub)
+		if err != nil {
+			return nil, err
+		}
+		exists := len(res.Rows) > 0
+		if where.Negate {
+			exists = !exists
+		}
+		op := "FALSE"
+		if exists {
+			op = "TRUE"
+		}
+		return &ast.WhereClause{Operator: op}, nil
+
+	case where.Operator == "IN" && where.Sub != nil:
+		res, err := e.executeSelect(ctx, where.Sub)
+		if err != nil {
+			return nil, err
+		}
+		list := make([]ast.Literal, 0, len(res.Rows))
+		for _, r := range res.Rows {
+			if len(r) > 0 {
+				list = append(list, ast.Literal{Kind: "value", Value: fmt.Sprintf("%v", r[0])})
+			}
+		}
+		return &ast.WhereClause{Column: where.Column, Operator: "IN", Negate: where.Negate, ValueList: list}, nil
+
+	case where.Sub != nil:
+		res, err := e.executeSelect(ctx, where.Sub)
+		if err != nil {
+			return nil, err
+		}
+		v := ""
+		if len(res.Rows) > 0 && len(res.Rows[0]) > 0 {
+			v = fmt.Sprintf("%v", res.Rows[0][0])
+		}
+		return &ast.WhereClause{Column: where.Column, Operator: where.Operator, Value: ast.Literal{Kind: "value", Value: v}}, nil
+
+	default:
+		cp := *where
+		return &cp, nil
+	}
+}
+
 // derivedTable runs a derived-table subquery (FROM (SELECT ...) alias) and wraps
 // its result as an in-memory table whose name is the alias.
 func (e *Executor) derivedTable(ctx context.Context, id ast.Identifier) (*catalog.Table, error) {

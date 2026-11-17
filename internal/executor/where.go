@@ -29,9 +29,19 @@ func evalWhere(where *ast.WhereClause, row []interface{}, resolve func(string) (
 		return evalWhere(where.Right, row, resolve)
 	}
 
+	// Constant leaves produced by subquery pre-resolution (resolveSubqueries):
+	// a non-correlated EXISTS collapses to a constant truth value.
+	switch where.Operator {
+	case "TRUE":
+		return true, nil
+	case "FALSE":
+		return false, nil
+	}
+
 	// Subquery and EXISTS leaves require executor access; they are handled by
-	// evalWhereSub in the SELECT paths. Reaching here (UPDATE/DELETE/HAVING/
-	// QUALIFY) means they are not supported in that clause.
+	// evalWhereSub in the SELECT paths, or pre-resolved by resolveSubqueries for
+	// UPDATE/DELETE. Reaching here with one unresolved means it is not supported
+	// in that clause.
 	if where.Operator == "EXISTS" || where.Sub != nil {
 		return false, fmt.Errorf("subqueries are not supported in this clause")
 	}

@@ -1183,3 +1183,22 @@ func TestParseSubqueries(t *testing.T) {
 func TestParseCheckMissingParen(t *testing.T) {
 	mustFailParse(t, "CREATE TABLE t (id INT, edad INT CHECK edad >= 18)")
 }
+
+func TestParseNegativeNumberLiteral(t *testing.T) {
+	// In a VALUES tuple.
+	ins := mustParseStmt(t, "INSERT INTO t (x) VALUES (-5)").(*ast.Insert)
+	if ins.Rows[0][0].Kind != "number" || ins.Rows[0][0].Value != "-5" {
+		t.Fatalf("expected number -5, got %+v", ins.Rows[0][0])
+	}
+	// In a WHERE comparison.
+	sel := parseSelectT(t, "SELECT x FROM t WHERE x < -40")
+	if sel.Where == nil || sel.Where.Value.Value != "-40" {
+		t.Fatalf("expected WHERE x < -40, got %+v", sel.Where)
+	}
+	// In a CHECK expression.
+	ct := mustParseStmt(t, "CREATE TABLE t (id INT, temp INT CHECK (temp >= -40))").(*ast.CreateTable)
+	chk := findCheck(ct.Columns[1].Constraints)
+	if chk == nil || chk.Expr.Value.Value != "-40" {
+		t.Fatalf("expected CHECK temp >= -40, got %+v", chk)
+	}
+}

@@ -132,6 +132,23 @@ func (l *Lexer) NextToken() Token {
 		tok.Type = TokenIdent
 		tok.Literal = l.readQuotedIdent()
 		return tok
+	case '-':
+		// A '-' immediately before a digit is a negative numeric literal
+		// (e.g. -5). The engine has no arithmetic operators, so a bare '-' in
+		// any other position is not meaningful and is skipped. ('--' line
+		// comments are already consumed by skipWhitespace.)
+		if isDigit(l.peekChar()) {
+			start := l.pos
+			l.readChar() // consume '-'
+			for isDigit(l.ch) {
+				l.readChar()
+			}
+			tok.Type = TokenNumber
+			tok.Literal = l.input[start:l.pos]
+			return tok
+		}
+		l.readChar()
+		return l.NextToken()
 	default:
 		if isLetter(l.ch) {
 			literal := l.readIdentifier()

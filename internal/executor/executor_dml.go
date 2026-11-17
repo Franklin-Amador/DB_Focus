@@ -224,6 +224,18 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 		}
 	}
 
+	// Pre-resolve any (non-correlated) subqueries in the WHERE into concrete
+	// values before touching the table, so the rest of the UPDATE path evaluates
+	// a subquery-free predicate (no inner SELECT runs while the write lock is held).
+	where := stmt.Where
+	if whereHasSubquery(where) {
+		resolved, err := e.resolveSubqueries(ctx, where)
+		if err != nil {
+			return nil, err
+		}
+		where = resolved
+	}
+
 	// Resolve every SET assignment to (column index, value). An UPDATE may set
 	// several columns at once (SET a = 1, b = 2); gob-decoded statements that
 	// predate Assignments fall back to the single Column/Value pair.
@@ -247,10 +259,10 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 		if err := e.validateUpdateConstraints(table, a.Column.Name, colIdx, newVal); err != nil {
 			return nil, err
 		}
-		if err := e.validateUpdateUniqueness(table, stmt.Where, a.Column.Name, colIdx, newVal); err != nil {
+		if err := e.validateUpdateUniqueness(table, where, a.Column.Name, colIdx, newVal); err != nil {
 			return nil, err
 		}
-		if err := e.enforceUpdateReferences(schema, stmt.Table.Name, table, stmt.Where, a.Column.Name, newVal); err != nil {
+		if err := e.enforceUpdateReferences(schema, stmt.Table.Name, table, where, a.Column.Name, newVal); err != nil {
 			return nil, err
 		}
 		setOps = append(setOps, setOp{colIdx: colIdx, value: newVal})
@@ -263,12 +275,12 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 	for _, op := range setOps {
 		newVals[op.colIdx] = op.value
 	}
-	if err := e.validateUpdateUniqueIndexes(table, stmt.Where, newVals); err != nil {
+	if err := e.validateUpdateUniqueIndexes(table, where, newVals); err != nil {
 		return nil, err
 	}
 
 	// Enforce CHECK constraints against the post-update image of each affected row.
-	if err := e.checkRowsAfterUpdate(table, stmt.Where, func(row []interface{}) {
+	if err := e.checkRowsAfterUpdate(table, where, func(row []interface{}) {
 		for _, op := range setOps {
 			if op.colIdx >= 0 && op.colIdx < len(row) {
 				row[op.colIdx] = op.value
@@ -283,7 +295,7 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 	// performUpdate writes: every assigned column set to its new value.
 	var oldRows, newRows [][]interface{}
 	if e.triggersEnabled {
-		oldRows, _ = e.snapshotMatchedRows(table, stmt.Where)
+		oldRows, _ = e.snapshotMatchedRows(table, where)
 		for _, r := range oldRows {
 			nr := append([]interface{}(nil), r...)
 			for _, op := range setOps {
@@ -296,7 +308,7 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 	}
 
 	// Perform update (all assignments applied to each matched row).
-	updateCount, err := e.performUpdate(table, stmt.Where, func(row []interface{}) {
+	updateCount, err := e.performUpdate(table, where, func(row []interface{}) {
 		for _, op := range setOps {
 			if op.colIdx >= 0 && op.colIdx < len(row) {
 				row[op.colIdx] = op.value
@@ -356,10 +368,21 @@ func (e *Executor) executeDelete(ctx context.Context, stmt *ast.Delete) (*Result
 		}
 	}
 
+	// Pre-resolve any (non-correlated) subqueries in the WHERE into concrete
+	// values so no inner SELECT runs while the table lock is held.
+	where := stmt.Where
+	if whereHasSubquery(where) {
+		resolved, err := e.resolveSubqueries(ctx, where)
+		if err != nil {
+			return nil, err
+		}
+		where = resolved
+	}
+
 	// Enforce ON DELETE referential actions (RESTRICT by default) before removing
 	// any parent rows. This runs without holding the table lock, so it works for
 	// self-referencing tables and can cascade / set null across children.
-	if err := e.enforceDeleteReferences(schema, stmt.Table.Name, table, stmt.Where); err != nil {
+	if err := e.enforceDeleteReferences(schema, stmt.Table.Name, table, where); err != nil {
 		return nil, err
 	}
 
@@ -367,11 +390,11 @@ func (e *Executor) executeDelete(ctx context.Context, stmt *ast.Delete) (*Result
 	// image (NEW is nil for DELETE).
 	var oldRows [][]interface{}
 	if e.triggersEnabled {
-		oldRows, _ = e.snapshotMatchedRows(table, stmt.Where)
+		oldRows, _ = e.snapshotMatchedRows(table, where)
 	}
 
 	// Perform deletion
-	deleteCount, err := e.performDelete(table, stmt)
+	deleteCount, err := e.performDelete(table, where)
 	if err != nil {
 		return nil, err
 	}
@@ -620,11 +643,11 @@ func columnResolver(table *catalog.Table) func(string) (int, bool) {
 // performDelete removes the rows selected by the statement's WHERE clause (or
 // all rows when there is none). Referential integrity is enforced beforehand by
 // enforceDeleteReferences, so this does pure row removal under the table lock.
-func (e *Executor) performDelete(table *catalog.Table, stmt *ast.Delete) (int, error) {
+func (e *Executor) performDelete(table *catalog.Table, where *ast.WhereClause) (int, error) {
 	table.Mu().Lock()
 	defer table.Mu().Unlock()
 
-	if stmt.Where == nil {
+	if where == nil {
 		deleteCount := len(table.Rows)
 		table.Rows = [][]interface{}{}
 		return deleteCount, nil
@@ -634,7 +657,7 @@ func (e *Executor) performDelete(table *catalog.Table, stmt *ast.Delete) (int, e
 	deleteCount := 0
 	newRows := [][]interface{}{}
 	for _, row := range table.Rows {
-		matched, err := evalWhere(stmt.Where, row, resolve)
+		matched, err := evalWhere(where, row, resolve)
 		if err != nil {
 			return 0, err
 		}

@@ -1827,3 +1827,37 @@ NULL. Gaps acotados, sin transacciones (un INSERT multi-fila que falla a mitad n
   `validateUpdateConstraints`/`validateUpdateUniqueness`/`enforceUpdateReferences` y que el FK fuera del
   lock (movido así a propósito para evitar el deadlock self-FK). TOCTOU solo bajo concurrencia entre
   conexiones; el motor no se defiende de eso de forma general (no hay transacciones).
+
+### Session: November 17, 2026 - Follow-ups de compatibilidad (2ª ronda)
+
+**Objetivo**: cerrar los follow-ups documentados de la ronda anterior.
+
+**Status**: ✅ COMPLETED (3 de 5; UNION-en-vistas y SELECT-literal-sin-FROM quedan como follow-up).
+
+- **Literales numéricos negativos** (`-5`): el lexer emitía `TokenEOF` ante un `-` suelto. Nuevo
+  `case '-'` en `lexer.go`: si el siguiente char es dígito, emite `TokenNumber` con el signo
+  (`-5`). Seguro porque el motor no tiene operadores aritméticos y los comentarios `--` ya los
+  consume `skipWhitespace`. Funciona en VALUES/WHERE/CHECK/DEFAULT sin tocar el parser (el literal
+  llega como number "-5"). Sin literales decimales aún (gap preexistente de `readNumber`).
+- **CHECK columna-contra-columna** (`CHECK (fin > inicio)`): aislado al enforcement de CHECK para no
+  cambiar la semántica general de WHERE. `evalCheckPredicate` + `checkOperand` (`executor_check.go`):
+  el operando derecho que es identificador y resuelve a una columna de la fila se lee de la fila; si
+  no, se trata como literal. `enforceRowChecks` usa el nuevo evaluador. Soporta `=`,`<>`,`<`,`>`,
+  `<=`,`>=`,`BETWEEN`,`AND`/`OR`; IN/EXISTS delegan a `evalWhere`.
+- **Subconsultas en `UPDATE`/`DELETE ... WHERE`** (no correlacionadas): `resolveSubqueries`
+  (`executor_subquery.go`) corre cada subconsulta **una vez** (standalone) y reescribe el árbol WHERE
+  a valores concretos antes de mutar — escalar → literal, `IN (SELECT)` → lista literal, `EXISTS` →
+  hoja constante `TRUE`/`FALSE` (nuevos operadores constantes en `evalWhere`). Así ningún SELECT
+  interno corre con el write lock tomado (evita deadlock en self-reference). `executeUpdate`/
+  `executeDelete` pre-resuelven el WHERE tras la validación y usan el `where` resuelto en todo el
+  camino de mutación; `performDelete(table, where)` (antes `(table, stmt)`). Correlacionadas en
+  UPDATE/DELETE siguen sin soportarse (se pre-resolverían sin binding externo).
+
+**Tests**: `cmd/test-followups` (negativos, CHECK col-vs-col incl. UPDATE, subqueries en UPDATE/DELETE
+con IN/escalar/lista); `parser_test.go: TestParseNegativeNumberLiteral`. Verificación
+(CGO_ENABLED=0): build/vet/test ✅, **44** integraciones del motor ✅. Reporte del usuario, README y
+este log actualizados.
+
+**Follow-ups restantes**: subconsultas correlacionadas en UPDATE/DELETE; UNION como cuerpo de vista o
+dentro de `FROM (...)`; `SELECT <literal>` sin FROM (proyecta NULL); literales decimales. Más los dos
+hallazgos de seguridad reconocidos (cascadas sin re-validar CHECK/unicidad; TOCTOU de los pre-checks).

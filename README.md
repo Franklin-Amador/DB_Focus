@@ -113,7 +113,7 @@ postgresql://postgres:4444@localhost:4444/postgres
 - `CREATE TABLE` tabla (columna tipo [IDENTITY|SERIAL] [PRIMARY KEY] [UNIQUE] [NOT NULL] [DEFAULT valor] [CHECK (expr)] [REFERENCES tabla(columna) [ON DELETE acción] [ON UPDATE acción]], ..., [CONSTRAINT nombre] {PRIMARY KEY (col) | UNIQUE (col) | FOREIGN KEY (col) REFERENCES ... | CHECK (expr)})
   - La clave foránea se puede declarar **inline en la columna** (`padre_id INT REFERENCES padre(id)`), a nivel de tabla (`FOREIGN KEY (padre_id) REFERENCES padre(id)`) o con nombre (`CONSTRAINT fk_padre FOREIGN KEY (padre_id) REFERENCES padre(id)`), todas en una sola línea.
   - **Acciones referenciales** `ON DELETE` / `ON UPDATE`: `RESTRICT` (default) · `NO ACTION` (= RESTRICT, no hay diferido sin transacciones) · `CASCADE` · `SET NULL`. Se pueden combinar y van en cualquier orden: `REFERENCES padre(id) ON DELETE CASCADE ON UPDATE RESTRICT`.
-  - **CHECK** (de columna o de tabla, con o sin `CONSTRAINT nombre`): se valida en cada `INSERT` y `UPDATE` (`edad INTEGER CHECK (edad >= 18)`, `CONSTRAINT chk CHECK (precio > 0)`). Soporta `AND`/`OR` y comparación columna-contra-literal.
+  - **CHECK** (de columna o de tabla, con o sin `CONSTRAINT nombre`): se valida en cada `INSERT` y `UPDATE` (`edad INTEGER CHECK (edad >= 18)`, `CONSTRAINT chk CHECK (precio > 0)`). Soporta `AND`/`OR`, comparación columna-contra-literal y **columna-contra-columna** (`CHECK (fin > inicio)`).
   - **DEFAULT** (literal o `CURRENT_TIMESTAMP`/`NOW`): se aplica cuando la columna se omite en el `INSERT` (`estado TEXT DEFAULT 'activo'`, `creado TIMESTAMP DEFAULT CURRENT_TIMESTAMP`).
   - **SERIAL** es equivalente a `INTEGER IDENTITY` (autoincremento).
 - `CREATE VIEW` vista AS SELECT ...
@@ -158,12 +158,14 @@ postgresql://postgres:4444@localhost:4444/postgres
   - `EXISTS` / `NOT EXISTS`, incluso **correlacionadas**: `WHERE EXISTS (SELECT 1 FROM emp x WHERE x.dept = e.dept)`.
   - Subconsulta escalar en el `SELECT`: `SELECT id, (SELECT MAX(sal) FROM emp) AS tope FROM emp`.
   - **Tablas derivadas**: `FROM (SELECT ...) alias`, usables también como lado de un JOIN.
-  - Límites: no soportadas en la cláusula `WHERE` de `UPDATE`/`DELETE`, ni como cuerpo de vista o dentro de `UNION`.
+  - En `UPDATE`/`DELETE ... WHERE` se soportan subconsultas **no correlacionadas** (escalar, `IN`, `EXISTS`): se pre-resuelven a valores antes de mutar. Las correlacionadas solo en `SELECT`.
+  - Límites: no soportadas como cuerpo de vista ni dentro de `UNION`.
 - **Funciones de ventana**: dentro de cada partición (`PARTITION BY`, o toda la tabla si se omite) las filas se ordenan por el `ORDER BY` de la ventana; las filas iguales en todas las claves son *pares*. `ROW_NUMBER` numera 1..n; `RANK` deja huecos tras un empate (1,1,3); `DENSE_RANK` no (1,1,2). Los agregados `OVER` sin `ORDER BY` cubren toda la partición; con `ORDER BY` usan el frame por defecto del estándar (`RANGE UNBOUNDED PRECEDING → CURRENT ROW`): acumulado hasta la fila actual incluyendo sus pares. No hay frames explícitos (`ROWS BETWEEN ...`) ni `LAG/LEAD`.
 - `QUALIFY` se evalúa después de las ventanas y antes de `ORDER BY`/`LIMIT`, así que `QUALIFY rn <= 3 ORDER BY monto DESC LIMIT 5` filtra primero y recorta después. Si la consulta no tiene ventanas, `QUALIFY` actúa como un filtro sobre alias/columnas de salida (extensión permisiva). Una ventana usada solo en `QUALIFY` no aparece en el resultado (tampoco con `SELECT *`).
 - `ORDER BY` acepta alias del `SELECT` y agregados (`ORDER BY total DESC`, `ORDER BY SUM(monto) DESC`) y ahora falla con `ORDER BY: column X not found` si la columna no existe (antes se ignoraba en silencio). Un agregado en `ORDER BY`/`QUALIFY`/`OVER` exige `GROUP BY` o un agregado en el `SELECT`; en consultas agrupadas, una columna referenciada fuera del `SELECT` debe ser clave de `GROUP BY` o ir dentro de un agregado (`column X must appear in GROUP BY ...`).
 - `QUALIFY`, `OVER` y `PARTITION` son palabras reservadas desde esta versión (igual que `ORDER`, `LIMIT`, etc.). Una columna o tabla con ese nombre debe escribirse entre comillas dobles: `SELECT "partition" FROM logs`.
 - Un agregado con argumento que no sea `*`, una columna o un agregado anidado (`COUNT(DISTINCT x)`, `SUM(a * 2)`) es un error de sintaxis explícito; antes parseaba y devolvía `NULL`. Una ventana envuelta en una expresión (`ROW_NUMBER() OVER () * 2`) se proyecta como `NULL`, como cualquier otra expresión no soportada.
+- Literales numéricos **negativos** (`-5`) se aceptan en `VALUES`, `WHERE`, `CHECK`, `DEFAULT`, etc. (no hay operadores aritméticos ni literales decimales).
 - Columnas con `IDENTITY` se auto-incrementan automáticamente en cada INSERT.
 - `INSERT` sin lista de columnas ahora soporta correctamente tablas con `IDENTITY`: si envías solo los valores de columnas no-IDENTITY, el motor autogenera el ID y preserva el resto de valores en su columna correcta.
 - Los procedimientos almacenados pueden tener parámetros y ejecutar múltiples sentencias.
@@ -300,6 +302,7 @@ go run ./cmd/test-qualify
 go run ./cmd/test-constraints   # CHECK, DEFAULT, CONSTRAINT nombrado, NULL, UNIQUE INDEX, INDEX DESC, UPDATE multi-col (+ reload)
 go run ./cmd/test-union         # UNION / UNION ALL, dedup, ORDER BY sobre el combinado
 go run ./cmd/test-subqueries    # escalar, IN/NOT IN, EXISTS correlacionado, tablas derivadas
+go run ./cmd/test-followups     # literales negativos, CHECK columna-vs-columna, subqueries en UPDATE/DELETE
 
 # Atajos estilo Snowflake
 go run ./cmd/test-snowflake-select  # SELECT * EXCLUDE/RENAME/ILIKE, GROUP BY ALL
