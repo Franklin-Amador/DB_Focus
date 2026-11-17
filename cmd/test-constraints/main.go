@@ -104,7 +104,10 @@ func main() {
 	run(ctx, e, "INSERT INTO usuarios (email) VALUES ('a@x.com')")
 	mustFail(ctx, e, "INSERT INTO usuarios (email) VALUES ('a@x.com')", "duplicate unique index")
 	run(ctx, e, "INSERT INTO usuarios (email) VALUES ('b@x.com')")
-	fmt.Println("  ok: UNIQUE INDEX rejects duplicates")
+	// UPDATE must also respect the unique index, not only INSERT.
+	mustFail(ctx, e, "UPDATE usuarios SET email = 'a@x.com' WHERE email = 'b@x.com'", "update into duplicate unique index key")
+	run(ctx, e, "UPDATE usuarios SET email = 'c@x.com' WHERE email = 'b@x.com'") // free value is allowed
+	fmt.Println("  ok: UNIQUE INDEX rejects duplicates on INSERT and UPDATE")
 
 	fmt.Println("=== INDEX DESC ===")
 	run(ctx, e, "CREATE TABLE ordenado (id INT IDENTITY PRIMARY KEY, n INT)")
@@ -146,8 +149,8 @@ func main() {
 	if cell(res, 0, 0) != "activo" {
 		log.Fatalf("DEFAULT after reload: expected 'activo', got %q", cell(res, 0, 0))
 	}
-	// UNIQUE INDEX survives restart.
-	mustFail(ctx, e2, "INSERT INTO usuarios (email) VALUES ('b@x.com')", "unique index after reload")
+	// UNIQUE INDEX survives restart (a@x.com still exists after the updates above).
+	mustFail(ctx, e2, "INSERT INTO usuarios (email) VALUES ('a@x.com')", "unique index after reload")
 	st2.Close()
 	fmt.Println("  ok: CHECK, DEFAULT and UNIQUE INDEX survive restart")
 

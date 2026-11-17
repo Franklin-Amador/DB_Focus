@@ -55,6 +55,13 @@ func (idx *Index) keyForRow(columns []Column, row []interface{}) (string, bool) 
 	return makeCompositeIndexKey(vals), true
 }
 
+// KeyForRow builds this index's composite key for a row, reporting ok=false when
+// a referenced column is missing. Exported wrapper over keyForRow so the executor
+// can validate projected post-UPDATE rows against a UNIQUE index.
+func (idx *Index) KeyForRow(columns []Column, row []interface{}) (string, bool) {
+	return idx.keyForRow(columns, row)
+}
+
 // insertSortedKey inserts a new distinct key into sortedKeys, preserving order.
 func (idx *Index) insertSortedKey(key string) {
 	pos := sort.Search(len(idx.sortedKeys), func(i int) bool {

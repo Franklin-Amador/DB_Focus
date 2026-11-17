@@ -256,6 +256,17 @@ func (e *Executor) executeUpdate(ctx context.Context, stmt *ast.Update) (*Result
 		setOps = append(setOps, setOp{colIdx: colIdx, value: newVal})
 	}
 
+	// Reject updates that would create a duplicate key in a UNIQUE INDEX (covers
+	// single- and multi-column unique indexes, which the PK/UNIQUE constraint
+	// check above does not reach).
+	newVals := make(map[int]interface{}, len(setOps))
+	for _, op := range setOps {
+		newVals[op.colIdx] = op.value
+	}
+	if err := e.validateUpdateUniqueIndexes(table, stmt.Where, newVals); err != nil {
+		return nil, err
+	}
+
 	// Enforce CHECK constraints against the post-update image of each affected row.
 	if err := e.checkRowsAfterUpdate(table, stmt.Where, func(row []interface{}) {
 		for _, op := range setOps {
@@ -476,6 +487,68 @@ func (e *Executor) validateUpdateUniqueness(table *catalog.Table, where *ast.Whe
 			return fmt.Errorf("duplicate value %v for unique column %s", val, colName)
 		}
 		seen[key] = true
+	}
+	return nil
+}
+
+// validateUpdateUniqueIndexes rejects an UPDATE that would leave two rows with
+// the same key in any UNIQUE index covering an assigned column. It projects the
+// post-update key of every row (rows matched by WHERE take the new values, the
+// rest keep theirs) and fails on the first collision. newVals maps a column
+// index to its new value. Multi-column unique indexes are handled. It takes only
+// a read lock, matching the engine's other UPDATE pre-checks.
+func (e *Executor) validateUpdateUniqueIndexes(table *catalog.Table, where *ast.WhereClause, newVals map[int]interface{}) error {
+	if len(table.Indexes) == 0 {
+		return nil
+	}
+	resolve := columnResolver(table)
+
+	table.Mu().RLock()
+	defer table.Mu().RUnlock()
+
+	for _, idx := range table.Indexes {
+		if !idx.Unique {
+			continue
+		}
+		// Only indexes that cover at least one assigned column can be affected.
+		covers := false
+		for _, cn := range idx.ColumnNames {
+			if ci := findColumnIndex(table.Columns, cn); ci >= 0 {
+				if _, ok := newVals[ci]; ok {
+					covers = true
+					break
+				}
+			}
+		}
+		if !covers {
+			continue
+		}
+
+		seen := make(map[string]bool, len(table.Rows))
+		for _, row := range table.Rows {
+			matched, err := evalWhere(where, row, resolve)
+			if err != nil {
+				return err
+			}
+			proj := row
+			if matched {
+				proj = make([]interface{}, len(row))
+				copy(proj, row)
+				for ci, v := range newVals {
+					if ci >= 0 && ci < len(proj) {
+						proj[ci] = v
+					}
+				}
+			}
+			key, ok := idx.KeyForRow(table.Columns, proj)
+			if !ok {
+				continue
+			}
+			if seen[key] {
+				return fmt.Errorf("update would create a duplicate value in unique index %s", idx.Name)
+			}
+			seen[key] = true
+		}
 	}
 	return nil
 }

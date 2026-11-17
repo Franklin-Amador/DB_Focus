@@ -1810,3 +1810,20 @@ UNION) ✅. Reporte del usuario, README y este log actualizados.
 parsean; CHECK columna-contra-columna no fiable; subconsultas no soportadas en WHERE de UPDATE/DELETE;
 UNION no soportado como cuerpo de vista ni dentro de `FROM (...)`; `SELECT <literal>` sin FROM proyecta
 NULL. Gaps acotados, sin transacciones (un INSERT multi-fila que falla a mitad no hace rollback).
+
+**Revisión de seguridad automática (3 hallazgos)**:
+- ✅ **Corregido**: `UPDATE` no re-validaba los **UNIQUE INDEX** (solo las restricciones UNIQUE/PK),
+  así que `UPDATE t SET email = 'dup'` podía duplicar la clave del índice. Nueva
+  `validateUpdateUniqueIndexes` (`executor_dml.go`) proyecta la clave post-update de cada índice único
+  que cubra una columna asignada (single y multi-columna) y falla ante la primera colisión; usa el
+  wrapper exportado `catalog.Index.KeyForRow`. Caso agregado a `cmd/test-constraints`.
+- 🔸 **Reconocido (modelo sin transacciones)**: las escrituras por acción referencial
+  (`ON UPDATE CASCADE` / `SET NULL` en `executor_fk.go`) no corren CHECK ni unicidad sobre la imagen
+  resultante de las hijas. Edge angosto (columna hija a la vez cascadeada y con CHECK/único); ya se
+  había aceptado para UNIQUE en una revisión previa. Cerrarlo requiere validar la post-imagen dentro
+  del cascade de dos fases.
+- 🔸 **Reconocido (posture establecida del motor)**: el enforcement de CHECK en UPDATE es check-then-act
+  (snapshot bajo RLock, luego `performUpdate` bajo write lock) — el mismo patrón que
+  `validateUpdateConstraints`/`validateUpdateUniqueness`/`enforceUpdateReferences` y que el FK fuera del
+  lock (movido así a propósito para evitar el deadlock self-FK). TOCTOU solo bajo concurrencia entre
+  conexiones; el motor no se defiende de eso de forma general (no hay transacciones).
