@@ -14,6 +14,14 @@ import (
 func init() {
 	registerExec((*Executor).executeCreateFunction)
 	registerExec((*Executor).executeDropFunction)
+	registerExec((*Executor).executeReturn)
+}
+
+// executeReturn is a no-op: the engine does not use a routine's return value
+// (triggers ignore it, scalar returns are not evaluated). It exists so that a
+// function/trigger body containing RETURN executes rather than erroring.
+func (e *Executor) executeReturn(ctx context.Context, stmt *ast.Return) (*Result, error) {
+	return &Result{Tag: "RETURN"}, nil
 }
 
 // executeCreateFunction stores a (subset) SQL function in the catalog and
@@ -22,8 +30,8 @@ func (e *Executor) executeCreateFunction(ctx context.Context, stmt *ast.CreateFu
 	if err := checkCtx(ctx); err != nil {
 		return nil, err
 	}
-	if stmt.Query == nil {
-		return nil, fmt.Errorf("CREATE FUNCTION body must contain a SELECT")
+	if stmt.Query == nil && len(stmt.Body) == 0 {
+		return nil, fmt.Errorf("CREATE FUNCTION body must contain a SELECT or statements")
 	}
 
 	schema := stmt.Name.Alias // DDL convention: schema carried in Alias
@@ -32,8 +40,11 @@ func (e *Executor) executeCreateFunction(ctx context.Context, stmt *ast.CreateFu
 	}
 
 	// Validate the body SELECT runs (surfaces bad column/table references now).
-	if _, err := e.executeSelect(ctx, stmt.Query); err != nil {
-		return nil, fmt.Errorf("failed to validate function body: %w", err)
+	// A statement body (trigger / side-effecting function) is not run here.
+	if stmt.Query != nil {
+		if _, err := e.executeSelect(ctx, stmt.Query); err != nil {
+			return nil, fmt.Errorf("failed to validate function body: %w", err)
+		}
 	}
 
 	returns := make([]catalog.Column, len(stmt.Returns))
@@ -50,6 +61,8 @@ func (e *Executor) executeCreateFunction(ctx context.Context, stmt *ast.CreateFu
 		ReturnsType: stmt.ReturnsType,
 		Query:       stmt.Query,
 		QueryText:   stmt.QueryText,
+		Body:        stmt.Body,
+		BodyText:    stmt.BodyText,
 	}
 
 	if err := e.catalog.CreateFunction(fn, stmt.Replace, stmt.IfNotExists); err != nil {

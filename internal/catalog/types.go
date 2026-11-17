@@ -131,6 +131,10 @@ type Function struct {
 	ReturnsType string
 	Query       *ast.Select
 	QueryText   string // canonical SELECT SQL, re-parsed on load
+	// Body / BodyText hold a statement body for a trigger or side-effecting
+	// function (mutually exclusive with Query). Re-parsed from BodyText on load.
+	Body     []ast.Statement
+	BodyText string
 }
 
 type Catalog struct {

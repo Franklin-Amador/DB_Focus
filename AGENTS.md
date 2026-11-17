@@ -1925,3 +1925,39 @@ ejecuta + EXECUTE FUNCTION a rutina inexistente inerte + round-trip de persisten
 
 **Pendiente (paso 3)**: funciones de trigger (`RETURNS trigger`, `RETURN NEW`, cuerpos escalares) para
 que `EXECUTE FUNCTION fn()` apuntando a una función plpgsql real ejecute (hoy solo procedures).
+
+### Session: November 17, 2026 - Funciones de trigger / escalares (paso 3)
+
+**Objetivo**: cerrar el flujo DBeaver — que `CREATE FUNCTION ... RETURNS trigger ... RETURN NEW` y los
+cuerpos escalares parseen, y que un trigger `EXECUTE FUNCTION fn()` apuntando a una función de trigger
+ejecute su cuerpo.
+
+**Status**: ✅ COMPLETED
+
+**Modelo de funciones extendido a cuerpos de sentencias**:
+- `ast.Return{Value}` (nuevo): statement `RETURN [expr]`, registrado en `topLevelParsers`
+  (`parseReturn` captura el texto hasta `;`/END) y en el executor como **no-op** (`executeReturn`) —
+  el motor no usa el valor de retorno. Hace que cualquier cuerpo con `RETURN` parsee y corra.
+- `ast.CreateFunction` y `catalog.Function` ganan `Body []ast.Statement` + `BodyText` (mutuamente
+  excluyente con `Query`). `parseCreateFunction`: si `RETURNS trigger` → cuerpo de sentencias
+  (`parseFunctionStatementBody`, tolera BEGIN/END); si no, intenta el `RETURN QUERY <SELECT>` existente
+  y cae al cuerpo de sentencias si falla. `RETURNS trigger`/escalar ya setean `ReturnsType` por el
+  parseo existente.
+- `executeCreateFunction` acepta Query **o** Body (valida con SELECT solo si hay Query).
+- Trigger: `triggerRoutineBody` resuelve el cuerpo ejecutable de un `EXECUTE FUNCTION/PROCEDURE` —
+  procedure, o función con Body — y `executeTriggers` lo corre con binding NEW/OLD (una función
+  set-returning o inexistente deja el trigger inerte).
+- Persistencia: `storage.FunctionData` + `Body`/`BodyText` (SaveFunction + re-parse de BodyText con
+  `parseBody` en el load). `gob.Register(&ast.Return{})` (+ Check/CreateFunction/DropFunction/Describe/
+  SetOp/AlterTable/DropIndex/DropView/DropDatabase, defensivo para bodies gob-encoded).
+
+**Verificación**: flujo completo DBeaver E2E — función `RETURNS trigger` con `INSERT ...(NEW.x); RETURN
+NEW` + trigger `EXECUTE FUNCTION` → el INSERT en la tabla dispara la auditoría; sobrevive reinicio.
+Escalar parsea/persiste; set-returning sin cambios (regresión). Tests: `cmd/test-trigger-function`
+(+persistencia), `parser_test.go` (`TestParseTriggerFunction`, `TestParseReturnStatement`).
+build/vet/test + **46** integraciones ✅. README/AGENTS actualizados.
+
+**Fuera de alcance**: evaluación del valor escalar de retorno (`RETURN x+1` no computa); plpgsql de
+control de flujo (IF/LOOP/variables); `NEW`/`OLD` en funciones de trigger solo por substitución de
+texto (igual que los triggers inline). Con esto, el parseo de triggers/procedures/funciones para la
+GUI y DBeaver queda cubierto.

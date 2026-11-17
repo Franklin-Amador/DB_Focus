@@ -570,13 +570,69 @@ func (p *Parser) parseCreateFunction(replace bool) (ast.Statement, error) {
 		return nil, p.errorf("expected $$...$$ or '...' function body after AS")
 	}
 
+	// A trigger function (RETURNS trigger) or any body that is not a single
+	// RETURN QUERY <SELECT> is parsed as a statement body (INSERT/UPDATE/...;
+	// RETURN NEW; ...). Otherwise the body is the SELECT the function returns.
+	if strings.EqualFold(stmt.ReturnsType, "trigger") {
+		body, bodyText, err := parseFunctionStatementBody(content)
+		if err != nil {
+			return nil, err
+		}
+		stmt.Body = body
+		stmt.BodyText = bodyText
+		return stmt, nil
+	}
+
 	sel, selText, err := parseFunctionBody(content)
 	if err != nil {
-		return nil, err
+		// Fall back to a statement body (a side-effecting function whose body is
+		// not a RETURN QUERY <SELECT>). Report the original SELECT error if the
+		// statement body also fails to parse.
+		body, bodyText, berr := parseFunctionStatementBody(content)
+		if berr != nil {
+			return nil, err
+		}
+		stmt.Body = body
+		stmt.BodyText = bodyText
+		return stmt, nil
 	}
 	stmt.Query = sel
 	stmt.QueryText = selText
 	return stmt, nil
+}
+
+// parseFunctionStatementBody parses a function/trigger-function body as a
+// sequence of statements, tolerating a leading BEGIN and a trailing END. The
+// returned text is the verbatim body (for AST-independent persistence).
+func parseFunctionStatementBody(content string) ([]ast.Statement, string, error) {
+	inner := NewParser(content)
+	if inner.cur.Type == TokenBegin {
+		inner.next()
+	}
+	start := inner.cur.Pos
+	var stmts []ast.Statement
+	for inner.cur.Type != TokenEnd && inner.cur.Type != TokenEOF {
+		s, err := inner.ParseStatement()
+		if err != nil {
+			return nil, "", err
+		}
+		if s != nil {
+			stmts = append(stmts, s)
+		}
+	}
+	text := strings.TrimSpace(inner.sliceFrom(start))
+	return stmts, text, nil
+}
+
+// parseReturn parses a `RETURN [expression]` statement inside a routine body.
+// The expression text is captured but not evaluated (see ast.Return).
+func (p *Parser) parseReturn() (ast.Statement, error) {
+	p.next() // consume RETURN
+	start := p.cur.Pos
+	for p.cur.Type != TokenSemicolon && p.cur.Type != TokenEnd && p.cur.Type != TokenEOF {
+		p.next()
+	}
+	return &ast.Return{Value: strings.TrimSpace(p.sliceFrom(start))}, nil
 }
 
 // parseFunctionBody extracts the SELECT the function returns from its body

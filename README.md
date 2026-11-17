@@ -131,7 +131,7 @@ postgresql://postgres:4444@localhost:4444/postgres
 - `CREATE PROCEDURE` nombre [(parámetros)] AS BEGIN sentencias... END
 - `CREATE TRIGGER` nombre [BEFORE|AFTER|INSTEAD OF] evento ON [schema.]tabla [FOR EACH ROW|STATEMENT] [WHEN (cond)] { BEGIN sentencias... END | EXECUTE FUNCTION|PROCEDURE rutina() }
   - **evento** puede ser múltiple: `INSERT OR UPDATE OR DELETE`, y `UPDATE OF col1, col2`.
-  - Forma nativa: cuerpo inline `BEGIN ... END`. Forma **PostgreSQL/DBeaver**: `EXECUTE FUNCTION fn()` / `EXECUTE PROCEDURE fn()` — al dispararse corre el cuerpo de la rutina referenciada si es un `PROCEDURE` existente; si la rutina no existe o es una función de trigger (aún no soportada), el trigger parsea pero queda inerte.
+  - Forma nativa: cuerpo inline `BEGIN ... END`. Forma **PostgreSQL/DBeaver**: `EXECUTE FUNCTION fn()` / `EXECUTE PROCEDURE fn()` — al dispararse corre el cuerpo de la rutina referenciada, que puede ser un `PROCEDURE` o una **función de trigger** (`CREATE FUNCTION fn() RETURNS trigger ... BEGIN ...; RETURN NEW; END`); si la rutina no existe o es una función set-returning, el trigger parsea pero queda inerte.
   - `WHEN (condición)` y `FOR EACH STATEMENT` se parsean (la condición no se evalúa; el disparo es por fila).
 - `CREATE JOB` nombre SCHEDULE EVERY n [MINUTE|HOUR|DAY] BEGIN sentencias... END
 - `CALL` procedimiento [(argumentos)]
@@ -174,6 +174,7 @@ postgresql://postgres:4444@localhost:4444/postgres
 - Los procedimientos almacenados pueden tener parámetros y ejecutar múltiples sentencias.
 - **Dollar-quoting con etiqueta** (`$body$ ... $body$`, `$function$ ... $function$`, `$BODY$`), además del `$$ ... $$` sin etiqueta — compatibilidad con PostgreSQL/DBeaver/pgAdmin para cuerpos de procedimientos y funciones.
 - `CREATE PROCEDURE` tolera la sintaxis de PostgreSQL: decoraciones entre los parámetros y el cuerpo (`LANGUAGE plpgsql`, etc.), el modo de parámetro `IN`/`OUT`/`INOUT`, y longitudes de tipo (`VARCHAR(50)`, `NUMERIC(10,2)`).
+- `CREATE FUNCTION` admite: set-returning (`RETURNS TABLE (...)` / `SETOF`, cuerpo `RETURN QUERY <SELECT>`, usable en `FROM fn(args)`); **función de trigger** (`RETURNS trigger`, cuerpo de sentencias con `RETURN NEW`, ejecutada por un trigger `EXECUTE FUNCTION`); y escalar (`RETURNS INT`, cuerpo `RETURN expr`) que parsea y persiste, aunque el valor escalar no se evalúa. `RETURN` dentro de cualquier cuerpo es válido (el motor no usa el valor de retorno).
 - Los triggers se ejecutan automáticamente en respuesta a eventos INSERT, UPDATE o DELETE.
 - Los triggers pueden ejecutarse recursivamente, con límite de profundidad para evitar loops infinitos (profundidad máxima actual: 16).
 - Los jobs (trabajos) se ejecutan automáticamente en intervalos programados (cada N minutos/horas/días).
@@ -327,7 +328,8 @@ go run ./cmd/test-procedure-persistence
 go run ./cmd/test-routine-persistence
 go run ./cmd/test-job-persistence
 go run ./cmd/test-trigger-recursion
-go run ./cmd/test-trigger-pg      # triggers PG/DBeaver: multi-evento, UPDATE OF, EXECUTE FUNCTION/PROCEDURE (+ reload)
+go run ./cmd/test-trigger-pg        # triggers PG/DBeaver: multi-evento, UPDATE OF, EXECUTE FUNCTION/PROCEDURE (+ reload)
+go run ./cmd/test-trigger-function  # función de trigger (RETURNS trigger, RETURN NEW) vía EXECUTE FUNCTION (+ reload)
 go run ./cmd/test-persistence-integration
 
 # Parseo multi-statement

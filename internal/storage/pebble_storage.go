@@ -230,6 +230,8 @@ func (ps *PebbleStorage) SaveFunction(fn *catalog.Function, schema string) error
 		ReturnsType: fn.ReturnsType,
 		Query:       fn.Query,
 		QueryText:   fn.QueryText,
+		Body:        fn.Body,
+		BodyText:    fn.BodyText,
 	}
 	fd.Returns = make([]ColumnData, len(fn.Returns))
 	for i, col := range fn.Returns {
@@ -427,6 +429,10 @@ type FunctionData struct {
 	// QueryText is the canonical SELECT SQL, re-parsed on load so AST shape
 	// changes do not invalidate persisted functions.
 	QueryText string
+	// Body / BodyText hold a statement body for a trigger/side-effecting
+	// function (re-parsed from BodyText on load).
+	Body     []ast.Statement
+	BodyText string
 }
 
 type ViewData struct {
@@ -489,6 +495,16 @@ func registerGobTypes() {
 	gob.Register(&ast.ForeignKeyConstraint{})
 	gob.Register(&ast.UniqueConstraint{})
 	gob.Register(&ast.NotNullConstraint{})
+	gob.Register(&ast.CheckConstraint{})
+	gob.Register(&ast.CreateFunction{})
+	gob.Register(&ast.DropFunction{})
+	gob.Register(&ast.Return{})
+	gob.Register(&ast.Describe{})
+	gob.Register(&ast.SetOp{})
+	gob.Register(&ast.AlterTable{})
+	gob.Register(&ast.DropIndex{})
+	gob.Register(&ast.DropView{})
+	gob.Register(&ast.DropDatabase{})
 }
 
 // NewPebbleStorage creates a new Pebble-backed storage engine
@@ -1192,6 +1208,16 @@ func (ps *PebbleStorage) loadDatabase(cat *catalog.Catalog) error {
 					log.Printf("[storage] warning: failed to re-parse function %s.%s text, using stored AST: %v", fd.Schema, fd.Name, perr)
 				}
 			}
+			// Prefer re-parsing the stored statement-body text (trigger / side-
+			// effecting functions), falling back to the serialized AST.
+			fbody := fd.Body
+			if fd.BodyText != "" {
+				if reparsed, perr := parseBody(fd.BodyText); perr == nil {
+					fbody = reparsed
+				} else {
+					log.Printf("[storage] warning: failed to re-parse function %s.%s body, using stored AST: %v", fd.Schema, fd.Name, perr)
+				}
+			}
 			if err := cat.LoadFunction(&catalog.Function{
 				Name:        fd.Name,
 				Schema:      fd.Schema,
@@ -1201,6 +1227,8 @@ func (ps *PebbleStorage) loadDatabase(cat *catalog.Catalog) error {
 				ReturnsType: fd.ReturnsType,
 				Query:       query,
 				QueryText:   fd.QueryText,
+				Body:        fbody,
+				BodyText:    fd.BodyText,
 			}); err != nil {
 				log.Printf("[storage] warning: failed to load function %s.%s: %v", fd.Schema, fd.Name, err)
 			}

@@ -1281,3 +1281,39 @@ func TestParseTriggerPGForms(t *testing.T) {
 		t.Fatalf("native inline: unexpected %+v", tr)
 	}
 }
+
+func TestParseTriggerFunction(t *testing.T) {
+	// RETURNS trigger with a statement body (INSERT + RETURN NEW) parses into Body.
+	fn := mustParseStmt(t, "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN INSERT INTO audit (msg) VALUES (NEW.id); RETURN NEW; END; $function$").(*ast.CreateFunction)
+	if fn.Query != nil {
+		t.Fatalf("trigger function should have no Query, got %+v", fn.Query)
+	}
+	if len(fn.Body) != 2 {
+		t.Fatalf("expected 2 body statements (INSERT, RETURN), got %d: %+v", len(fn.Body), fn.Body)
+	}
+	if _, ok := fn.Body[0].(*ast.Insert); !ok {
+		t.Fatalf("expected first body statement INSERT, got %T", fn.Body[0])
+	}
+	if ret, ok := fn.Body[1].(*ast.Return); !ok || ret.Value != "NEW" {
+		t.Fatalf("expected RETURN NEW, got %T %+v", fn.Body[1], fn.Body[1])
+	}
+
+	// Scalar body (RETURN expr) parses into Body too.
+	fn = mustParseStmt(t, "CREATE FUNCTION inc(x INT) RETURNS INT LANGUAGE plpgsql AS $$ BEGIN RETURN x + 1; END; $$").(*ast.CreateFunction)
+	if len(fn.Body) != 1 {
+		t.Fatalf("scalar function: expected 1 body statement, got %d", len(fn.Body))
+	}
+
+	// Set-returning function keeps the Query path.
+	fn = mustParseStmt(t, "CREATE FUNCTION g() RETURNS TABLE (id INTEGER) AS $$ BEGIN RETURN QUERY SELECT c.id FROM cursos c; END; $$").(*ast.CreateFunction)
+	if fn.Query == nil || len(fn.Body) != 0 {
+		t.Fatalf("set-returning function should use Query, got Query=%v Body=%+v", fn.Query, fn.Body)
+	}
+}
+
+func TestParseReturnStatement(t *testing.T) {
+	ret := mustParseStmt(t, "RETURN NEW").(*ast.Return)
+	if ret.Value != "NEW" {
+		t.Fatalf("expected RETURN NEW, got %q", ret.Value)
+	}
+}

@@ -401,14 +401,29 @@ type CreateFunction struct {
 	Returns     []Parameter // columns of RETURNS TABLE(...); empty for scalar/SETOF
 	ReturnsType string      // RETURNS <type> / SETOF <type> (when not TABLE)
 	SetOf       bool
-	Query       *Select // the SELECT the function returns
+	Query       *Select // the SELECT the function returns (set-returning functions)
 	QueryText   string  // verbatim SELECT text, for stable persistence
+	// Body / BodyText hold a statement body for a trigger or side-effecting
+	// function (BEGIN INSERT ...; RETURN NEW; END) when it is not a single
+	// RETURN QUERY <SELECT>. Query and Body are mutually exclusive.
+	Body        []Statement
+	BodyText    string
 	Replace     bool
 	IfNotExists bool
 	Language    string
 }
 
 func (CreateFunction) stmtNode() {}
+
+// Return is a `RETURN [expression]` statement inside a function/trigger body.
+// The engine does not use the returned value (triggers ignore it; scalar return
+// values are not evaluated), so Value holds the raw expression text and the
+// statement executes as a no-op. It exists so bodies containing RETURN parse.
+type Return struct {
+	Value string
+}
+
+func (Return) stmtNode() {}
 
 type DropFunction struct {
 	Name     Identifier // schema in Alias

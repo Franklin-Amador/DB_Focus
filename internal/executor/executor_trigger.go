@@ -119,11 +119,11 @@ func (e *Executor) executeTriggers(ctx context.Context, table, timing, event str
 		// trigger function, not yet supported) leaves the trigger inert.
 		body := trigger.Body
 		if trigger.ExecRoutine != "" {
-			proc, err := e.catalog.GetProcedure(trigger.ExecRoutine)
-			if err != nil {
-				continue // referenced routine not runnable yet — inert, not an error
+			runnable, ok := e.triggerRoutineBody(trigger.ExecRoutine, trigger.ExecSchema)
+			if !ok {
+				continue // referenced routine not runnable (missing, or set-returning) — inert
 			}
-			body = proc.Body
+			body = runnable
 		}
 
 		// Execute each statement in the trigger body
@@ -144,6 +144,20 @@ func (e *Executor) executeTriggers(ctx context.Context, table, timing, event str
 	}
 
 	return nil
+}
+
+// triggerRoutineBody resolves the runnable statement body of a routine named by
+// a `EXECUTE FUNCTION/PROCEDURE` trigger: a stored procedure's body, or a
+// trigger/statement function's body. It reports ok=false when the routine does
+// not exist or has no runnable body (e.g. a set-returning SELECT function).
+func (e *Executor) triggerRoutineBody(name, schema string) ([]ast.Statement, bool) {
+	if proc, err := e.catalog.GetProcedure(name); err == nil {
+		return proc.Body, true
+	}
+	if fn, err := e.catalog.GetFunction(name, schema); err == nil && len(fn.Body) > 0 {
+		return fn.Body, true
+	}
+	return nil, false
 }
 
 // triggerRowRefs builds the NEW.<col>/OLD.<col> substitution map for a trigger
