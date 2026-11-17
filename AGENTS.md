@@ -1861,3 +1861,34 @@ este log actualizados.
 **Follow-ups restantes**: subconsultas correlacionadas en UPDATE/DELETE; UNION como cuerpo de vista o
 dentro de `FROM (...)`; `SELECT <literal>` sin FROM (proyecta NULL); literales decimales. Más los dos
 hallazgos de seguridad reconocidos (cascadas sin re-validar CHECK/unicidad; TOCTOU de los pre-checks).
+
+### Session: November 17, 2026 - Parsing de triggers/procedures para GUI/DBeaver (cimientos)
+
+**Objetivo**: verificar que triggers/procedures/functions parseen bien, de cara a la GUI web y a
+DBeaver (que emite SQL PostgreSQL estándar). Primero se reprodujo el estado (solo parseo) de un
+abanico de sintaxis nativas y estilo DBeaver/PG.
+
+**Triage** (parse-only): la sintaxis nativa de FocusDB parsea; la de DBeaver/PG falla en: dollar-quoting
+con etiqueta (`$function$`/`$body$`), `PROCEDURE ... LANGUAGE plpgsql`, modo `IN/OUT/INOUT`, longitudes
+de tipo `VARCHAR(n)`, triggers `EXECUTE FUNCTION/PROCEDURE fn()`, multi-evento `INSERT OR UPDATE OR
+DELETE`, `UPDATE OF col`, y funciones `RETURNS trigger` / escalares (`RETURN NEW`/`RETURN expr`).
+
+**Cimientos implementados** (paso 1, puro parser, bajo riesgo):
+- **Dollar-quoting con etiqueta** (`lexer.go`): `readDollarString` reemplazado por `readDollarQuoted`,
+  que acepta `$$...$$` y `$tag$...$tag$` (tag = identificador; delimitador de apertura y cierre deben
+  coincidir). Usa `strings.Index` sobre el delimitador. Habilita los cuerpos de procs/funcs que emite
+  DBeaver/pgAdmin.
+- **Decoraciones de `PROCEDURE`** (`parser.go: parseCreateProcedure`): el loop de parámetros salta un
+  modo `IN/OUT/INOUT` opcional y una longitud/precisión de tipo (`VARCHAR(50)`, `NUMERIC(10,2)`); tras
+  el `)` se saltan decoraciones (`LANGUAGE x`, `SECURITY DEFINER`, …) hasta `AS`/cuerpo, igual que ya
+  hacía `parseCreateFunction`.
+
+**Verificación**: parse OK de todas las variantes de procedure (LANGUAGE, tagged dollar, IN mode,
+VARCHAR(n)/NUMERIC(10,2)) y de funciones set-returning con `$function$`; **ejecución** verificada
+(CALL de un proc con `IN ... VARCHAR(50) LANGUAGE plpgsql $body$` inserta; función `$function$`
+devuelve filas). build/vet/test + **44** integraciones del motor + parser_test.go
+(`TestLexerTaggedDollarQuote`, `TestParseProcedureDecorations`) ✅. README actualizado.
+
+**Pendiente** (próximos pasos, aún no hechos): parser de triggers PG (`EXECUTE FUNCTION/PROCEDURE`,
+multi-evento, `UPDATE OF col`) y funciones de trigger/escalares (`RETURNS trigger`, `RETURN NEW`,
+cuerpos escalares). Decisión abierta: solo-parseo vs parseo+semántica para la forma `EXECUTE FUNCTION`.

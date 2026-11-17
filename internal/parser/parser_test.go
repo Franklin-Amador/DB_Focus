@@ -1202,3 +1202,36 @@ func TestParseNegativeNumberLiteral(t *testing.T) {
 		t.Fatalf("expected CHECK temp >= -40, got %+v", chk)
 	}
 }
+
+func TestLexerTaggedDollarQuote(t *testing.T) {
+	// Tagged dollar-quoting ($body$...$body$) must parse like $$...$$.
+	proc := mustParseStmt(t, "CREATE PROCEDURE p() AS $body$ BEGIN INSERT INTO log (msg) VALUES ('x'); END; $body$").(*ast.CreateProcedure)
+	if len(proc.Body) != 1 {
+		t.Fatalf("expected 1 body statement, got %d", len(proc.Body))
+	}
+	if _, ok := proc.Body[0].(*ast.Insert); !ok {
+		t.Fatalf("expected body INSERT, got %T", proc.Body[0])
+	}
+	// A different tag and the untagged form both work.
+	mustParseStmt(t, "CREATE FUNCTION f() RETURNS TABLE (id INTEGER) AS $function$ BEGIN RETURN QUERY SELECT c.id FROM cursos c; END; $function$")
+	mustParseStmt(t, "CREATE PROCEDURE p() AS $$ BEGIN INSERT INTO log (msg) VALUES ('x'); END; $$")
+}
+
+func TestParseProcedureDecorations(t *testing.T) {
+	// LANGUAGE between the parameter list and the body.
+	proc := mustParseStmt(t, "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN INSERT INTO log (msg) VALUES ('x'); END; $$").(*ast.CreateProcedure)
+	if len(proc.Body) != 1 {
+		t.Fatalf("LANGUAGE decoration: expected 1 body statement, got %d", len(proc.Body))
+	}
+	// IN/OUT/INOUT parameter mode and a type length are tolerated.
+	proc = mustParseStmt(t, "CREATE PROCEDURE p(IN nombre VARCHAR(50), OUT total NUMERIC(10,2)) AS BEGIN INSERT INTO log (msg) VALUES (nombre); END").(*ast.CreateProcedure)
+	if len(proc.Parameters) != 2 {
+		t.Fatalf("expected 2 parameters, got %d", len(proc.Parameters))
+	}
+	if proc.Parameters[0].Name.Name != "nombre" || proc.Parameters[0].Type != "VARCHAR" {
+		t.Fatalf("unexpected first parameter %+v", proc.Parameters[0])
+	}
+	if proc.Parameters[1].Name.Name != "total" || proc.Parameters[1].Type != "NUMERIC" {
+		t.Fatalf("unexpected second parameter %+v", proc.Parameters[1])
+	}
+}

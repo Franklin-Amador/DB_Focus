@@ -63,13 +63,13 @@ func (l *Lexer) NextToken() Token {
 		tok.Literal = "="
 		l.readChar()
 	case '$':
-		// Support simple dollar-quoting using $$...$$ (no tag support yet)
-		if l.peekChar() == '$' {
+		// Dollar-quoting: $$...$$ or tagged $tag$...$tag$ (PostgreSQL / DBeaver).
+		if lit, ok := l.readDollarQuoted(); ok {
 			tok.Type = TokenDollarString
-			tok.Literal = l.readDollarString()
+			tok.Literal = lit
 			return tok
 		}
-		// Single $ is not valid - skip it and get next token
+		// Not a valid dollar-quote (e.g. a lone $): skip it and get next token.
 		l.readChar()
 		return l.NextToken()
 	case '\'':
@@ -234,28 +234,48 @@ func (l *Lexer) readString() string {
 	return s
 }
 
-// readDollarString reads a $$...$$ quoted string (no tag support).
-func (l *Lexer) readDollarString() string {
-	// consume the opening $$
-	l.readChar() // consume first $
-	l.readChar() // consume second $
-	start := l.pos
-	for {
-		if l.ch == 0 {
-			// unterminated
-			break
+// readDollarQuoted reads a dollar-quoted string. The current char is '$'. It
+// supports both the untagged form ($$...$$) and the PostgreSQL/DBeaver tagged
+// form ($tag$...$tag$), where tag is an identifier (letters, digits, underscore;
+// not starting with a digit). The returned literal is the content between the
+// opening and matching closing delimiter. It reports ok=false when the '$' does
+// not begin a valid dollar-quote delimiter, leaving the lexer position unchanged
+// so the caller can skip the lone '$'.
+func (l *Lexer) readDollarQuoted() (string, bool) {
+	// Scan the opening delimiter: '$' [tag] '$'. The tag, if present, must be a
+	// valid identifier (so "$5" is not treated as a delimiter).
+	i := l.pos + 1
+	if i < len(l.input) && l.input[i] != '$' {
+		if !isLetter(l.input[i]) {
+			return "", false
 		}
-		if l.ch == '$' && l.peekChar() == '$' {
-			// end found
-			end := l.pos
-			// consume closing $$
-			l.readChar()
-			l.readChar()
-			return l.input[start:end]
+		for i < len(l.input) && (isLetter(l.input[i]) || isDigit(l.input[i]) || l.input[i] == '_') {
+			i++
 		}
-		l.readChar()
 	}
-	return l.input[start:l.pos]
+	if i >= len(l.input) || l.input[i] != '$' {
+		return "", false
+	}
+	delim := l.input[l.pos : i+1] // "$$" or "$tag$"
+	contentStart := i + 1
+
+	idx := strings.Index(l.input[contentStart:], delim)
+	if idx < 0 {
+		// Unterminated: take the remainder and advance to EOF.
+		content := l.input[contentStart:]
+		l.pos = len(l.input)
+		l.ch = 0
+		return content, true
+	}
+	contentEnd := contentStart + idx
+	content := l.input[contentStart:contentEnd]
+	l.pos = contentEnd + len(delim)
+	if l.pos < len(l.input) {
+		l.ch = l.input[l.pos]
+	} else {
+		l.ch = 0
+	}
+	return content, true
 }
 
 func isLetter(ch byte) bool {

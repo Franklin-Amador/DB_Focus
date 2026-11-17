@@ -355,8 +355,12 @@ func (p *Parser) parseCreateProcedure() (ast.Statement, error) {
 		return nil, p.errorf("expected ( after procedure name")
 	}
 
-	// Parse parameter list (name TYPE, name TYPE, ...)
+	// Parse parameter list (name TYPE, name TYPE, ...). Tolerates an optional
+	// IN/OUT/INOUT mode and a type length/precision (VARCHAR(50), NUMERIC(10,2)).
 	for p.cur.Type != TokenRParen && p.cur.Type != TokenEOF {
+		if up := strings.ToUpper(p.cur.Literal); up == "IN" || up == "OUT" || up == "INOUT" {
+			p.next()
+		}
 		if p.cur.Type != TokenIdent {
 			return nil, p.errorf("expected parameter name")
 		}
@@ -368,6 +372,20 @@ func (p *Parser) parseCreateProcedure() (ast.Statement, error) {
 		}
 		paramType := p.cur.Literal
 		p.next()
+
+		// Skip an optional type length/precision: VARCHAR(50), NUMERIC(10,2).
+		if p.cur.Type == TokenLParen {
+			depth := 1
+			p.next()
+			for depth > 0 && p.cur.Type != TokenEOF {
+				if p.cur.Type == TokenLParen {
+					depth++
+				} else if p.cur.Type == TokenRParen {
+					depth--
+				}
+				p.next()
+			}
+		}
 
 		stmt.Parameters = append(stmt.Parameters, ast.Parameter{
 			Name: paramName,
@@ -385,8 +403,13 @@ func (p *Parser) parseCreateProcedure() (ast.Statement, error) {
 		return nil, p.errorf("expected ) after parameters")
 	}
 
-	if !p.expect(TokenAs) {
-		return nil, p.errorf("expected AS after parameters")
+	// Skip decorations between the parameter list and the body (LANGUAGE x,
+	// SECURITY DEFINER, etc.), as PostgreSQL / DBeaver emit, until AS or the body.
+	for p.cur.Type != TokenAs && p.cur.Type != TokenDollarString && p.cur.Type != TokenBegin && p.cur.Type != TokenEOF {
+		p.next()
+	}
+	if p.cur.Type == TokenAs {
+		p.next()
 	}
 
 	// Support two body styles:

@@ -169,6 +169,8 @@ postgresql://postgres:4444@localhost:4444/postgres
 - Columnas con `IDENTITY` se auto-incrementan automáticamente en cada INSERT.
 - `INSERT` sin lista de columnas ahora soporta correctamente tablas con `IDENTITY`: si envías solo los valores de columnas no-IDENTITY, el motor autogenera el ID y preserva el resto de valores en su columna correcta.
 - Los procedimientos almacenados pueden tener parámetros y ejecutar múltiples sentencias.
+- **Dollar-quoting con etiqueta** (`$body$ ... $body$`, `$function$ ... $function$`, `$BODY$`), además del `$$ ... $$` sin etiqueta — compatibilidad con PostgreSQL/DBeaver/pgAdmin para cuerpos de procedimientos y funciones.
+- `CREATE PROCEDURE` tolera la sintaxis de PostgreSQL: decoraciones entre los parámetros y el cuerpo (`LANGUAGE plpgsql`, etc.), el modo de parámetro `IN`/`OUT`/`INOUT`, y longitudes de tipo (`VARCHAR(50)`, `NUMERIC(10,2)`).
 - Los triggers se ejecutan automáticamente en respuesta a eventos INSERT, UPDATE o DELETE.
 - Los triggers pueden ejecutarse recursivamente, con límite de profundidad para evitar loops infinitos (profundidad máxima actual: 16).
 - Los jobs (trabajos) se ejecutan automáticamente en intervalos programados (cada N minutos/horas/días).
