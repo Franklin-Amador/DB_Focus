@@ -1961,3 +1961,39 @@ build/vet/test + **46** integraciones ✅. README/AGENTS actualizados.
 control de flujo (IF/LOOP/variables); `NEW`/`OLD` en funciones de trigger solo por substitución de
 texto (igual que los triggers inline). Con esto, el parseo de triggers/procedures/funciones para la
 GUI y DBeaver queda cubierto.
+
+### Session: November 17, 2026 - Validación con psql/DBeaver real + proyección en pg_catalog
+
+**Objetivo**: probar el trabajo de triggers/procedures/funciones contra un cliente wire real (psql 17,
+el mismo protocolo que DBeaver) y mejorar la introspección.
+
+**Hallazgos y fixes**:
+- 🔴 **splitStatements rompía cuerpos dollar-quoted** (commit aparte, 21c6375): el split del protocolo
+  simple-query partía un `CREATE FUNCTION ... $function$ ...; ... $function$` en los `;` internos
+  (solo rastreaba comillas simples), emitiendo tags espurios. Ahora rastrea `$$` y `$tag$`. Era el
+  bloqueador real para el DDL que envían psql/DBeaver. Verificado E2E con psql 17: tabla + función
+  `RETURNS trigger $function$` + `CREATE TRIGGER EXECUTE FUNCTION` + INSERT cargan con tags limpios y
+  el trigger dispara la función.
+- 🟡 **Proyección en consultas de catálogo**: `SELECT nspname FROM pg_namespace` devolvía TODAS las
+  columnas (las rutas de `system_handler` devuelven resultados canned de forma fija). Nuevo
+  `projectSystemResult` (catalog/system_handler.go): para un `SELECT col, col FROM ...` simple (sin
+  `*`, funciones, expresiones ni alias implícitos) recorta el resultado canned a las columnas pedidas,
+  respetando alias y calificadores (`n.nspname AS name`); cualquier otra cosa devuelve el resultado
+  completo (fallback seguro, preserva los probes y las consultas posicionales de psql). Es más
+  PG-correcto (PG siempre proyecta) y además arregla la 1ª consulta posicional de `\d`.
+  Dos tests internos leían el resultado canned por posición (sobre-leían columnas no seleccionadas) →
+  reescritos a lectura por nombre.
+
+**Fuera de alcance (documentado)**: la paridad con `\d`/`\df` de psql (consultas multi-paso, 15
+columnas, `OPERATOR(~)`, `pg_table_is_visible()`) es version-específica y frágil — la capa que ya se
+había decidido no tocar. DBeaver lee por NOMBRE (JDBC), así que tolera columnas extra: con el fix del
+dollar-quoting su DDL carga y su introspección por nombre funciona; las consultas posicionales de psql
+(`\d`/`\df` detalle) siguen sin forma exacta.
+
+**Verificación**: psql 17 contra el server (DDL estilo DBeaver, `\dt`, `\dn`, proyección 1 y 2
+columnas); 5 clientes wire (test-client, test-information-schema, test-simple-query, test-multi-client,
+test-users) ✅; build/vet/test + 46 integraciones ✅; nuevos tests
+`internal/server/split_test.go` y `catalog TestProjectSystemResultHonorsSelectList`.
+
+**Cómo probar con DBeaver**: `go run ./cmd/focusd -addr :4444 -gui :9011 -data ./data`; conectar a
+localhost:4444, base `postgres`, usuario `postgres`, password `4444`.

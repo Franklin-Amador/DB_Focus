@@ -57,17 +57,31 @@ func TestPgClassResolvesSchemaByNamespaceOID(t *testing.T) {
 
 	nsOID := schemaOID("ventas")
 	// Session schema is public, but the query asks for the ventas namespace.
-	query := "SELECT c.oid, c.relname FROM pg_catalog.pg_class c WHERE c.relnamespace = " + itoa(nsOID)
+	// Columns are read by name (the result is now projected to the SELECT list,
+	// as PostgreSQL does), so the query selects relnamespace explicitly.
+	query := "SELECT c.relname, c.relnamespace FROM pg_catalog.pg_class c WHERE c.relnamespace = " + itoa(nsOID)
 	res, ok := c.HandleSystemQueryForDatabase(query, "public")
 	if !ok {
 		t.Fatalf("pg_class query should be handled")
 	}
+	relnameIdx, nsIdx := -1, -1
+	for i, col := range res.Columns {
+		switch col {
+		case "relname":
+			relnameIdx = i
+		case "relnamespace":
+			nsIdx = i
+		}
+	}
+	if relnameIdx == -1 || nsIdx == -1 {
+		t.Fatalf("expected relname and relnamespace columns, got %v", res.Columns)
+	}
 	found := false
 	for _, row := range res.Rows {
-		if row[2] == "facturas" {
+		if row[relnameIdx] == "facturas" {
 			found = true
-			if row[3] != nsOID {
-				t.Fatalf("expected relnamespace %d for facturas, got %v", nsOID, row[3])
+			if row[nsIdx] != nsOID {
+				t.Fatalf("expected relnamespace %d for facturas, got %v", nsOID, row[nsIdx])
 			}
 		}
 	}
@@ -171,7 +185,17 @@ func TestHandleSystemQueryForDatabaseFiltersTables(t *testing.T) {
 	if len(classA.Rows) != 1 {
 		t.Fatalf("expected 1 pg_class row for db_a, got %d", len(classA.Rows))
 	}
-	if got := classA.Rows[0][2]; got != "orders_a" {
+	// The result is projected to the selected column (relname).
+	relIdx := -1
+	for i, col := range classA.Columns {
+		if col == "relname" {
+			relIdx = i
+		}
+	}
+	if relIdx == -1 {
+		t.Fatalf("expected a relname column, got %v", classA.Columns)
+	}
+	if got := classA.Rows[0][relIdx]; got != "orders_a" {
 		t.Fatalf("expected relname orders_a, got %v", got)
 	}
 }
@@ -362,5 +386,46 @@ func TestDatabaseExistsOnlyForClusterDatabases(t *testing.T) {
 	}
 	if c.DatabaseExists("justaschema") || c.DatabaseExists("pg_catalog") {
 		t.Fatalf("schemas must not be reported as databases")
+	}
+}
+
+// TestProjectSystemResultHonorsSelectList guards that a simple column-list query
+// against a system catalog returns only the selected columns (as PostgreSQL
+// does), while a *, an expression/function, or an aggregate falls back to the
+// full canned result so probe-style responses are preserved.
+func TestProjectSystemResultHonorsSelectList(t *testing.T) {
+	c := New()
+
+	// Projected: only nspname.
+	res, ok := c.HandleSystemQueryForDatabase("SELECT nspname FROM pg_catalog.pg_namespace", "public")
+	if !ok {
+		t.Fatalf("pg_namespace query not handled")
+	}
+	if len(res.Columns) != 1 || res.Columns[0] != "nspname" {
+		t.Fatalf("expected only [nspname], got %v", res.Columns)
+	}
+
+	// Projected with alias and qualifier.
+	res, _ = c.HandleSystemQueryForDatabase("SELECT n.nspname AS name, n.nspowner FROM pg_catalog.pg_namespace n", "public")
+	if len(res.Columns) != 2 || res.Columns[0] != "name" || res.Columns[1] != "nspowner" {
+		t.Fatalf("expected [name nspowner], got %v", res.Columns)
+	}
+
+	// SELECT * is not projected (full canned shape preserved).
+	res, _ = c.HandleSystemQueryForDatabase("SELECT * FROM pg_catalog.pg_namespace", "public")
+	if len(res.Columns) < 4 {
+		t.Fatalf("SELECT * should keep the full shape, got %v", res.Columns)
+	}
+
+	// A function in the list is not projected (full shape preserved).
+	res, _ = c.HandleSystemQueryForDatabase("SELECT nspname, pg_catalog.pg_get_userbyid(nspowner) FROM pg_catalog.pg_namespace", "public")
+	if len(res.Columns) < 4 {
+		t.Fatalf("expression in list should keep the full shape, got %v", res.Columns)
+	}
+
+	// A requested column not present in the canned result keeps the full shape.
+	res, _ = c.HandleSystemQueryForDatabase("SELECT nspname, nonexistent FROM pg_catalog.pg_namespace", "public")
+	if len(res.Columns) < 4 {
+		t.Fatalf("unknown column should keep the full shape, got %v", res.Columns)
 	}
 }

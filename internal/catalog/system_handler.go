@@ -147,10 +147,197 @@ func (c *Catalog) HandleSystemQueryForDatabase(query string, currentDatabase str
 	upper := strings.ToUpper(strings.TrimSpace(query))
 	for _, route := range systemRoutes {
 		if route.match(upper) {
-			return route.handle(c, upper, currentDatabase), true
+			result := route.handle(c, upper, currentDatabase)
+			return projectSystemResult(query, result), true
 		}
 	}
 	return nil, false
+}
+
+// projCol is one projected column: the source column to read from the canned
+// result (lookup) and the output column name (out).
+type projCol struct {
+	lookup string
+	out    string
+}
+
+// projectSystemResult narrows a canned system-catalog result to the columns a
+// simple `SELECT col, col FROM ...` requested, so e.g. `SELECT nspname FROM
+// pg_namespace` returns only nspname instead of every column. It applies ONLY to
+// a plain column list (no *, no expressions/functions, no implicit aliases) whose
+// every column exists in the canned result; anything else returns the result
+// unchanged, preserving the exact shape the probe-style canned responses — and
+// psql's positional `\d`/`\df` queries — depend on.
+func projectSystemResult(query string, result *SystemResult) *SystemResult {
+	if result == nil || len(result.Columns) == 0 {
+		return result
+	}
+	cols, ok := simpleSelectColumns(query)
+	if !ok {
+		return result
+	}
+	idx := make([]int, len(cols))
+	out := make([]string, len(cols))
+	for i, col := range cols {
+		pos := -1
+		for j, rc := range result.Columns {
+			if strings.EqualFold(rc, col.lookup) {
+				pos = j
+				break
+			}
+		}
+		if pos == -1 {
+			return result // a requested column is not in the canned result: keep it all
+		}
+		idx[i] = pos
+		out[i] = col.out
+	}
+	rows := make([][]interface{}, len(result.Rows))
+	for r, row := range result.Rows {
+		nr := make([]interface{}, len(idx))
+		for i, p := range idx {
+			if p < len(row) {
+				nr[i] = row[p]
+			}
+		}
+		rows[r] = nr
+	}
+	return &SystemResult{Columns: out, Rows: rows, Tag: result.Tag}
+}
+
+// simpleSelectColumns extracts the column list of a plain `SELECT a, b.c AS d
+// FROM ...` query. It returns ok=false for `SELECT *`, expressions/functions,
+// implicit aliases, or anything it cannot read as a simple list of column
+// references — so projection is applied only where it is unambiguous.
+func simpleSelectColumns(query string) ([]projCol, bool) {
+	q := strings.TrimSpace(query)
+	if len(q) < 7 || !strings.EqualFold(q[:7], "SELECT ") {
+		return nil, false
+	}
+	rest := q[7:]
+	fromIdx := topLevelKeyword(rest, "FROM")
+	if fromIdx < 0 {
+		return nil, false
+	}
+	list := rest[:fromIdx]
+	items := splitTopLevelCommas(list)
+	if len(items) == 0 {
+		return nil, false
+	}
+	cols := make([]projCol, 0, len(items))
+	for _, it := range items {
+		it = strings.TrimSpace(it)
+		if it == "" || it == "*" || strings.ContainsAny(it, "(*") {
+			return nil, false
+		}
+		lookup, out := it, ""
+		if a := topLevelKeyword(it, "AS"); a >= 0 {
+			lookup = strings.TrimSpace(it[:a])
+			out = strings.Trim(strings.TrimSpace(it[a+2:]), `"`)
+		}
+		if strings.ContainsAny(lookup, " \t") { // implicit alias (col alias): bail
+			return nil, false
+		}
+		bare := lookup
+		if d := strings.LastIndex(bare, "."); d >= 0 {
+			bare = bare[d+1:]
+		}
+		bare = strings.Trim(bare, `"`)
+		if !isPlainCatalogName(bare) {
+			return nil, false
+		}
+		if out == "" {
+			out = bare
+		}
+		cols = append(cols, projCol{lookup: bare, out: out})
+	}
+	return cols, true
+}
+
+// topLevelKeyword returns the byte index of the standalone keyword kw (matched
+// case-insensitively, surrounded by spaces/boundaries) at parenthesis depth 0
+// and outside single-quoted strings, or -1.
+func topLevelKeyword(s, kw string) int {
+	depth := 0
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\'' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		switch c {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		}
+		if depth != 0 {
+			continue
+		}
+		if i+len(kw) <= len(s) && strings.EqualFold(s[i:i+len(kw)], kw) {
+			before := i == 0 || s[i-1] == ' ' || s[i-1] == '\t' || s[i-1] == '\n' || s[i-1] == '\r'
+			afterPos := i + len(kw)
+			after := afterPos >= len(s) || s[afterPos] == ' ' || s[afterPos] == '\t' || s[afterPos] == '\n' || s[afterPos] == '\r'
+			if before && after {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// splitTopLevelCommas splits on commas at parenthesis depth 0, outside strings.
+func splitTopLevelCommas(s string) []string {
+	var parts []string
+	depth := 0
+	inStr := false
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\'' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		switch c {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				parts = append(parts, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
+}
+
+// isPlainCatalogName reports whether s is a bare column identifier.
+func isPlainCatalogName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // systemRoute maps a predicate over the upper-cased query to a handler that
