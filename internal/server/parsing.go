@@ -235,13 +235,41 @@ func isStrictNumeric(s string) bool {
 	return s != "."
 }
 
+// stripLeadingSQLNoise removes leading whitespace, opening parentheses, and SQL
+// comments ("-- …" line comments and "/* … */" block comments) from the front of
+// a query, so the first real keyword can be inspected. Clients like DBeaver/pgjdbc
+// routinely prepend a comment to a statement; without stripping it, a commented
+// SELECT was misclassified as non-read-only, so Describe sent NoData instead of a
+// RowDescription and Execute then sent tuples with no field structure.
+func stripLeadingSQLNoise(q string) string {
+	for {
+		q = strings.TrimLeft(q, " \t\r\n(")
+		switch {
+		case strings.HasPrefix(q, "--"):
+			i := strings.IndexAny(q, "\r\n")
+			if i < 0 {
+				return ""
+			}
+			q = q[i:]
+		case strings.HasPrefix(q, "/*"):
+			i := strings.Index(q, "*/")
+			if i < 0 {
+				return ""
+			}
+			q = q[i+2:]
+		default:
+			return q
+		}
+	}
+}
+
 // isReadOnlyQuery reports whether a query only reads (so running it twice — once
 // to resolve the Describe field structure, once at Execute — cannot change data).
 // Used to keep Describe from executing a state-changing statement (INSERT/UPDATE/
 // DELETE/DDL/CALL): those are skipped at Describe and run exactly once at Execute.
 // The engine has no data-modifying CTEs, so WITH is read-only here.
 func isReadOnlyQuery(query string) bool {
-	q := strings.TrimLeft(query, " \t\r\n(")
+	q := stripLeadingSQLNoise(query)
 	end := 0
 	for end < len(q) {
 		c := q[end]
